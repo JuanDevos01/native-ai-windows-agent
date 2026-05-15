@@ -138,6 +138,9 @@ fn migrate_config(raw: &mut serde_json::Value) {
 /// - `metis_providers__<NAME>__API_BASE` → `providers.<name>.api_base`
 /// - `METIS_GATEWAY__HOST` → `gateway.host`
 /// - `METIS_GATEWAY__PORT` → `gateway.port`
+/// - `METIS_HTTP_SERVER__HOST` → `http_server.host`
+/// - `METIS_HTTP_SERVER__PORT` → `http_server.port`
+/// - `METIS_HTTP_SERVER__API_KEY` → `http_server.api_key`
 /// - `METIS_TOOLS__RESTRICT_TO_WORKSPACE` → `tools.restrict_to_workspace`
 /// - `METIS_TOOLS__EXEC__TIMEOUT` → `tools.exec.timeout`
 /// - `METIS_TOOLS__EXEC__SHELL` → `tools.exec.shell`
@@ -149,6 +152,8 @@ fn migrate_config(raw: &mut serde_json::Value) {
 /// - `METIS_TRANSCRIPTION__ENABLED` → `transcription.enabled` (`true` / `1`)
 /// - `METIS_TRANSCRIPTION__WHISPER_CPP__EXE_PATH` → `transcription.whisper_cpp.exe_path`
 /// - `METIS_TRANSCRIPTION__WHISPER_CPP__MODEL_PATH` → `transcription.whisper_cpp.model_path`
+/// - `METIS_AGENTS__DEFAULTS__LOG_THINKING_JSON` → `agents.defaults.log_thinking_json` (`true` / `1`)
+/// - `METIS_AGENTS__DEFAULTS__INCLUDE_FENCED_CODE_IN_CHAT_APPS` → `agents.defaults.include_fenced_code_in_chat_apps`
 fn apply_env_overrides(mut config: Config) -> Config {
     // Agent defaults
     if let Ok(val) = std::env::var("metis_agentS__DEFAULTS__MODEL") {
@@ -171,6 +176,12 @@ fn apply_env_overrides(mut config: Config) -> Config {
     }
     if let Ok(val) = std::env::var("metis_agentS__DEFAULTS__WORKSPACE") {
         config.agents.defaults.workspace = val;
+    }
+    if let Ok(val) = std::env::var("METIS_AGENTS__DEFAULTS__LOG_THINKING_JSON") {
+        config.agents.defaults.log_thinking_json = val == "true" || val == "1";
+    }
+    if let Ok(val) = std::env::var("METIS_AGENTS__DEFAULTS__INCLUDE_FENCED_CODE_IN_CHAT_APPS") {
+        config.agents.defaults.include_fenced_code_in_chat_apps = val == "true" || val == "1";
     }
 
     // Provider API keys (by provider name)
@@ -195,6 +206,21 @@ fn apply_env_overrides(mut config: Config) -> Config {
         if let Ok(p) = val.parse::<u16>() {
             config.gateway.port = p;
         }
+    }
+
+    // HTTP agent API (`metis serve`)
+    if let Ok(val) = std::env::var("METIS_HTTP_SERVER__HOST") {
+        if !val.trim().is_empty() {
+            config.http_server.host = val;
+        }
+    }
+    if let Ok(val) = std::env::var("METIS_HTTP_SERVER__PORT") {
+        if let Ok(p) = val.parse::<u16>() {
+            config.http_server.port = p;
+        }
+    }
+    if let Ok(val) = std::env::var("METIS_HTTP_SERVER__API_KEY") {
+        config.http_server.api_key = val;
     }
 
     // Tools

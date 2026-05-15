@@ -1,7 +1,7 @@
 //! Configuration schema — typed replacements for nanobot's Pydantic models.
 //!
 //! Hierarchy: `Config` → `AgentsConfig`, `ProvidersConfig`, `ChannelsConfig`,
-//! `ToolsConfig`, `GatewayConfig`.
+//! `ToolsConfig`, `GatewayConfig`, `HttpServerConfig`.
 //!
 //! JSON on disk uses **camelCase** keys; Rust uses snake_case.
 //! We use `#[serde(rename_all = "camelCase")]` to handle the conversion.
@@ -26,6 +26,9 @@ pub struct Config {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub transcription: TranscriptionConfig,
+    /// Local HTTP API for the agent (`metis serve`).
+    #[serde(default)]
+    pub http_server: HttpServerConfig,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             gateway: GatewayConfig::default(),
             transcription: TranscriptionConfig::default(),
+            http_server: HttpServerConfig::default(),
         }
     }
 }
@@ -76,6 +80,23 @@ pub struct AgentDefaults {
     pub temperature: f64,
     /// Maximum tool-calling loop iterations before forcing a response.
     pub max_tool_iterations: u32,
+    /// When true, each LLM turn that includes `reasoning_content` is logged as JSON at DEBUG
+    /// with tracing target `metis_thinking` (enable with `metis gateway --logs` or `RUST_LOG=metis_thinking=debug`).
+    #[serde(default = "default_true")]
+    pub log_thinking_json: bool,
+    /// When true, assistant replies sent to Telegram, Discord, or WhatsApp may include fenced
+    /// markdown code blocks (``` ... ```). When false (default), those blocks are replaced with
+    /// a short placeholder in outbound messages only; session history still stores the full text.
+    #[serde(default = "default_false")]
+    pub include_fenced_code_in_chat_apps: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 impl Default for AgentDefaults {
@@ -86,6 +107,8 @@ impl Default for AgentDefaults {
             max_tokens: 8192,
             temperature: 0.7,
             max_tool_iterations: 20,
+            log_thinking_json: true,
+            include_fenced_code_in_chat_apps: false,
         }
     }
 }
@@ -321,10 +344,6 @@ pub struct SlackDMConfig {
     /// User IDs allowed when `policy = "allowlist"`.
     #[serde(default)]
     pub allow_from: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_dm_policy() -> String {
@@ -676,6 +695,31 @@ impl Default for GatewayConfig {
     }
 }
 
+/// Local HTTP agent API (`metis serve`) — Axum on Windows/Linux/macOS.
+///
+/// Defaults bind to **loopback** so the agent is not exposed on the LAN unless configured.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HttpServerConfig {
+    /// Bind address (e.g. `127.0.0.1` or `0.0.0.0`).
+    pub host: String,
+    /// TCP port (default does not collide with `gateway.port`).
+    pub port: u16,
+    /// If non-empty, require `Authorization: Bearer <apiKey>` on `/v1/*`.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 18791,
+            api_key: String::new(),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────
@@ -690,7 +734,11 @@ mod tests {
         assert_eq!(config.agents.defaults.max_tokens, 8192);
         assert_eq!(config.agents.defaults.temperature, 0.7);
         assert_eq!(config.agents.defaults.max_tool_iterations, 20);
+        assert!(config.agents.defaults.log_thinking_json);
+        assert!(!config.agents.defaults.include_fenced_code_in_chat_apps);
         assert_eq!(config.gateway.port, 18790);
+        assert_eq!(config.http_server.port, 18791);
+        assert_eq!(config.http_server.host, "127.0.0.1");
         assert!(!config.tools.restrict_to_workspace);
     }
 
@@ -718,6 +766,8 @@ mod tests {
         assert_eq!(config.agents.defaults.max_tool_iterations, 10);
         assert_eq!(config.gateway.host, "127.0.0.1");
         assert_eq!(config.gateway.port, 9090);
+        assert!(config.agents.defaults.log_thinking_json);
+        assert!(!config.agents.defaults.include_fenced_code_in_chat_apps);
         // Defaults preserved for missing fields
         assert!(!config.tools.restrict_to_workspace);
         assert_eq!(config.tools.exec.timeout, 60);
@@ -739,6 +789,8 @@ mod tests {
         // Should use camelCase keys
         assert!(json["agents"]["defaults"].get("maxTokens").is_some());
         assert!(json["agents"]["defaults"].get("maxToolIterations").is_some());
+        assert!(json["agents"]["defaults"].get("logThinkingJson").is_some());
+        assert!(json["agents"]["defaults"].get("includeFencedCodeInChatApps").is_some());
         assert!(json["tools"].get("restrictToWorkspace").is_some());
         // Should NOT have snake_case keys
         assert!(json["agents"]["defaults"].get("max_tokens").is_none());

@@ -740,33 +740,9 @@ impl DiscordChannel {
     }
 }
 
-/// Split a message into chunks respecting Discord's 2000 char limit.
-/// Tries to split at newline boundaries.
+/// Split a message into chunks respecting Discord's 2000 character limit.
 pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.to_string());
-            break;
-        }
-
-        // Find last newline within max_len
-        let split_at = remaining[..max_len]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(max_len);
-
-        chunks.push(remaining[..split_at].to_string());
-        remaining = &remaining[split_at..];
-    }
-
-    chunks
+    crate::formatting::split_message(text, max_len)
 }
 
 /// Simple jitter: a random fraction between 0.0 and 1.0 for heartbeat.

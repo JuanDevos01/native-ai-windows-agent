@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::info;
 
-use metis_agent::{AgentLoop, ExecToolConfig};
+use metis_agent::{AgentLoop, ExecToolConfig, OutboundFormatting};
 use metis_channels::ChannelManager;
 use metis_core::bus::queue::MessageBus;
 use metis_core::config::load_config;
@@ -150,6 +150,10 @@ pub async fn run() -> Result<()> {
         shell: config.tools.exec.shell.clone(),
         permission_mode: config.tools.exec.permission_mode.clone(),
     };
+    let outbound = OutboundFormatting {
+        log_thinking_json: defaults.log_thinking_json,
+        include_fenced_code_in_chat_apps: defaults.include_fenced_code_in_chat_apps,
+    };
     let agent_loop = Arc::new(AgentLoop::new(
         bus.clone(),
         Arc::new(provider),
@@ -162,6 +166,7 @@ pub async fn run() -> Result<()> {
         config.tools.restrict_to_workspace,
         Some(session_manager),
         agent_name,
+        Some(outbound),
     ));
 
     // 8. Create cron service

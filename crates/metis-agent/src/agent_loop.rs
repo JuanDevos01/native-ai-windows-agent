@@ -9,12 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde_json::json;
 use tracing::{debug, error, info};
 
 use metis_core::bus::queue::MessageBus;
 use metis_core::bus::types::{InboundMessage, OutboundMessage};
 use metis_core::session::manager::SessionManager;
-use metis_core::types::{Message, ToolCall};
+use metis_core::types::{Message, ToolCall, LlmResponse};
 use metis_providers::traits::{LlmProvider, LlmRequestConfig};
 
 use crate::context::ContextBuilder;
@@ -27,11 +28,65 @@ use crate::tools::shell::ExecTool;
 use crate::tools::spawn::SpawnTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 /// Default maximum LLM ↔ tool iterations per user message.
 const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// Substring present in every real `exec` tool result (`tools/shell.rs`).
 const EXEC_RESULT_MARKER: &str = "<<<EXEC_RESULT>>>";
+
+/// Tracing target for model `reasoning_content` JSON lines (see `OutboundFormatting::log_thinking_json`).
+pub const THINKING_LOG_TARGET: &str = "metis_thinking";
+
+// ─────────────────────────────────────────────
+// Outbound text (Telegram / Discord / WhatsApp)
+// ─────────────────────────────────────────────
+
+/// Controls optional model-reasoning logs and fenced-code stripping for chat apps.
+#[derive(Clone, Debug)]
+pub struct OutboundFormatting {
+    /// Log each LLM response's `reasoning_content` as one JSON line at DEBUG (`target: metis_thinking`).
+    pub log_thinking_json: bool,
+    /// When false (default), outbound replies on Telegram, Discord, and WhatsApp have markdown
+    /// fenced code blocks replaced by a short placeholder (session history is unchanged).
+    pub include_fenced_code_in_chat_apps: bool,
+}
+
+impl Default for OutboundFormatting {
+    fn default() -> Self {
+        Self {
+            log_thinking_json: true,
+            include_fenced_code_in_chat_apps: false,
+        }
+    }
+}
+
+fn is_chat_app_channel(channel: &str) -> bool {
+    channel.eq_ignore_ascii_case("telegram")
+        || channel.eq_ignore_ascii_case("discord")
+        || channel.eq_ignore_ascii_case("whatsapp")
+}
+
+static FENCED_CODE_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+
+fn fenced_code_block_re() -> &'static Regex {
+    FENCED_CODE_BLOCK_RE.get_or_init(|| Regex::new(r"(?s)```.*?```").expect("fenced code block regex"))
+}
+
+/// Remove ``` ... ``` blocks (non-greedy). Used for chat-app outbound messages.
+pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
+    let re = fenced_code_block_re();
+    let replaced = re.replace_all(text, "\n_[code omitted]_\n");
+    let trimmed = replaced.trim();
+    if trimmed.is_empty() {
+        "(Assistant reply was only fenced code; set `agents.defaults.includeFencedCodeInChatApps` to show it.)"
+            .to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// The outbound message is often only the model's final text; it may omit tool output.
 /// If `exec` ran this turn but the reply has no `EXEC_RESULT` block, append raw results
@@ -373,6 +428,8 @@ pub struct AgentLoop {
     /// Subagent manager (also held by SpawnTool; kept for direct access).
     #[allow(dead_code)]
     subagent_manager: Arc<SubagentManager>,
+    /// Outbound formatting (thinking logs, fenced-code stripping for chat apps).
+    outbound: OutboundFormatting,
 }
 
 impl AgentLoop {
@@ -390,12 +447,14 @@ impl AgentLoop {
         restrict_to_workspace: bool,
         session_manager: Option<SessionManager>,
         agent_name: Option<String>,
+        outbound_formatting: Option<OutboundFormatting>,
     ) -> Self {
         let model = model.unwrap_or_else(|| provider.default_model().to_string());
         let max_iterations = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
         let request_config = request_config.unwrap_or_default();
         let exec_config = exec_config.unwrap_or_default();
         let agent_name = agent_name.unwrap_or_else(|| "Metis".into());
+        let outbound = outbound_formatting.unwrap_or_default();
         let sessions =
             session_manager.unwrap_or_else(|| SessionManager::new(None).expect("failed to create session manager"));
 
@@ -469,7 +528,49 @@ impl AgentLoop {
             message_tool,
             spawn_tool,
             subagent_manager,
+            outbound,
         }
+    }
+
+    fn log_llm_thinking_json(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        session_key: &str,
+        iteration: usize,
+        response: &LlmResponse,
+    ) {
+        if !self.outbound.log_thinking_json {
+            return;
+        }
+        let Some(ref rc) = response.reasoning_content else {
+            return;
+        };
+        let t = rc.trim();
+        if t.is_empty() {
+            return;
+        }
+        let line = json!({
+            "channel": channel,
+            "chatId": chat_id,
+            "session": session_key,
+            "iteration": iteration,
+            "reasoning": t,
+        });
+        tracing::debug!(target: THINKING_LOG_TARGET, "{}", line);
+    }
+
+    /// Body as sent on the wire to `channel` (may strip fenced code for chat apps).
+    fn outbound_text_for_channel(&self, channel: &str, stored: &str) -> String {
+        if is_chat_app_channel(channel) && !self.outbound.include_fenced_code_in_chat_apps {
+            strip_markdown_fenced_code_blocks(stored)
+        } else {
+            stored.to_string()
+        }
+    }
+
+    fn outbound_message(&self, channel: &str, chat_id: &str, stored: &str) -> OutboundMessage {
+        OutboundMessage::new(channel, chat_id, &self.outbound_text_for_channel(channel, stored))
     }
 
     /// Run the event loop: poll inbound messages and process them.
@@ -498,7 +599,7 @@ impl AgentLoop {
                         }
                         Err(e) => {
                             error!(error = %e, session_key = %session_key, "message processing error");
-                            let err_msg = OutboundMessage::new(
+                            let err_msg = self.outbound_message(
                                 &msg.channel,
                                 &msg.chat_id,
                                 &format!("I encountered an error: {e}"),
@@ -548,7 +649,7 @@ impl AgentLoop {
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&content));
-            return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
         // Fast path for natural-language read-file requests with explicit path.
@@ -561,7 +662,7 @@ impl AgentLoop {
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
                     .add_message(&session_key, Message::assistant(&content));
-                return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content));
+                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
             }
         }
 
@@ -579,7 +680,7 @@ impl AgentLoop {
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&content));
-            return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
         // Script-file mode for explicit "run this PowerShell script" requests.
@@ -593,7 +694,7 @@ impl AgentLoop {
                         .add_message(&session_key, Message::user(&msg.content));
                     self.sessions
                         .add_message(&session_key, Message::assistant(&err));
-                    return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &err));
+                    return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &err));
                 }
                 let exec_cmd = format!(
                     "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
@@ -606,7 +707,7 @@ impl AgentLoop {
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
                     .add_message(&session_key, Message::assistant(&content));
-                return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content));
+                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
             }
         }
 
@@ -679,7 +780,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
                     .add_message(&session_key, Message::assistant(&err));
-                return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &err));
+                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &err));
             }
 
             let exec_cmd = format!(
@@ -693,7 +794,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&content));
-            return Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
         // Get session history
@@ -730,6 +831,8 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                     &self.request_config,
                 )
                 .await;
+
+            self.log_llm_thinking_json(&msg.channel, &msg.chat_id, &session_key, iteration, &response);
 
             if response.has_tool_calls() {
                 // Add assistant message with tool calls
@@ -836,7 +939,7 @@ Please send a follow-up message to run the next command."
         self.sessions
             .add_message(&session_key, Message::assistant(&content));
 
-        Ok(OutboundMessage::new(&msg.channel, &msg.chat_id, &content))
+        Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content))
     }
 
     /// Process a system message (from a subagent or cron).
@@ -892,6 +995,14 @@ Please send a follow-up message to run the next command."
                 .chat(&messages, Some(&tool_defs), &self.model, &self.request_config)
                 .await;
 
+            self.log_llm_thinking_json(
+                &origin_channel,
+                &origin_chat_id,
+                &session_key,
+                iteration,
+                &response,
+            );
+
             if response.has_tool_calls() {
                 let tool_calls: Vec<ToolCall> = response.tool_calls.clone();
                 ContextBuilder::add_assistant_message(
@@ -928,11 +1039,7 @@ Please send a follow-up message to run the next command."
             .add_message(&session_key, Message::assistant(&content));
 
         // Route response to the original channel/chat
-        Ok(OutboundMessage::new(
-            &origin_channel,
-            &origin_chat_id,
-            &content,
-        ))
+        Ok(self.outbound_message(&origin_channel, &origin_chat_id, &content))
     }
 
     /// Direct processing mode (CLI entry point).
@@ -1048,6 +1155,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
     }
 
@@ -1058,6 +1166,23 @@ mod tests {
 
         let result = agent.process_direct("Hi").await.unwrap();
         assert_eq!(result, "Hello from Metis!");
+    }
+
+    #[test]
+    fn test_strip_markdown_fenced_code_blocks() {
+        let s = "Hello\n```rust\nfn main() {}\n```\nBye";
+        let out = super::strip_markdown_fenced_code_blocks(s);
+        assert!(out.contains("Hello"));
+        assert!(out.contains("Bye"));
+        assert!(out.contains("code omitted"));
+        assert!(!out.contains("fn main"));
+    }
+
+    #[test]
+    fn test_strip_fenced_only_placeholder_line() {
+        let out = super::strip_markdown_fenced_code_blocks("```\nx\n```");
+        assert!(out.contains("code omitted"));
+        assert!(!out.contains('x'));
     }
 
     #[test]
@@ -1255,6 +1380,7 @@ Write-Output "hello"
             false,
             None,
             None,
+            None,
         );
 
         let result = agent.process_direct("Read test.txt").await.unwrap();
@@ -1351,6 +1477,7 @@ Write-Output "hello"
             false,
             None,
             None,
+            None,
         );
 
         // Simulate a subagent result message
@@ -1399,6 +1526,7 @@ Write-Output "hello"
             None,
             None,
             false,
+            None,
             None,
             None,
         );

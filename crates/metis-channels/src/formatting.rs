@@ -107,11 +107,22 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
     text
 }
 
-/// Split a message into chunks that fit within Telegram's 4096-char limit.
+/// Split a message into chunks of at most `max_chars` Unicode scalar values.
 ///
-/// Tries to split at newline boundaries to avoid breaking mid-sentence.
-pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
+/// Telegram/Discord limits are character counts, not UTF-8 byte lengths. Splits prefer
+/// newline boundaries and never cut inside a multi-byte character (e.g. emoji).
+pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.chars()
+                .map(|c| c.to_string())
+                .collect()
+        };
+    }
+
+    if text.chars().count() <= max_chars {
         return vec![text.to_string()];
     }
 
@@ -119,28 +130,48 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     let mut remaining = text;
 
     while !remaining.is_empty() {
-        if remaining.len() <= max_len {
+        if remaining.chars().count() <= max_chars {
             chunks.push(remaining.to_string());
             break;
         }
 
-        // Try to split at a newline near the limit
-        let split_at = remaining[..max_len]
-            .rfind('\n')
-            .unwrap_or(max_len);
-
+        let split_at = find_char_safe_split(remaining, max_chars);
         let (chunk, rest) = remaining.split_at(split_at);
         chunks.push(chunk.to_string());
-
-        // Skip the newline character if we split there
-        remaining = if rest.starts_with('\n') {
-            &rest[1..]
-        } else {
-            rest
-        };
+        remaining = rest.trim_start_matches('\n');
     }
 
     chunks
+}
+
+/// Byte index at which to split `text` so the left chunk has at most `max_chars` characters.
+fn find_char_safe_split(text: &str, max_chars: usize) -> usize {
+    let mut char_count = 0usize;
+    let mut byte_limit = text.len();
+    let mut last_newline = None;
+
+    for (byte_idx, ch) in text.char_indices() {
+        if char_count >= max_chars {
+            byte_limit = byte_idx;
+            break;
+        }
+        if ch == '\n' {
+            last_newline = Some(byte_idx);
+        }
+        char_count += 1;
+    }
+
+    if let Some(nl) = last_newline.filter(|&i| i > 0) {
+        nl
+    } else if byte_limit > 0 {
+        byte_limit
+    } else {
+        // `max_chars` is 0 handled above; here force one scalar so we always make progress.
+        text.chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(text.len())
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -294,5 +325,23 @@ mod tests {
         let chunks = split_message("", 4096);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], "");
+    }
+
+    #[test]
+    fn test_split_message_emoji_at_boundary() {
+        // Regression: byte slice at 4096 panicked inside 📡 (4 UTF-8 bytes).
+        let text = format!("{}📡{}", "a".repeat(4093), "tail");
+        let chunks = split_message(&text, 4096);
+        assert!(chunks.len() >= 2);
+        let joined: String = chunks.concat();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn test_split_message_multibyte_only() {
+        let text = "📡".repeat(5000);
+        let chunks = split_message(&text, 4096);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), text);
     }
 }

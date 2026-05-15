@@ -282,29 +282,7 @@ impl SlackChannel {
 
     /// Split a long message into chunks of up to `SLACK_MAX_LEN` characters.
     fn split_message(text: &str) -> Vec<String> {
-        if text.len() <= SLACK_MAX_LEN {
-            return vec![text.to_string()];
-        }
-
-        let mut chunks = Vec::new();
-        let mut remaining = text;
-
-        while !remaining.is_empty() {
-            if remaining.len() <= SLACK_MAX_LEN {
-                chunks.push(remaining.to_string());
-                break;
-            }
-
-            // Try to split at a newline within the limit
-            let slice = &remaining[..SLACK_MAX_LEN];
-            let split_at = slice.rfind('\n').unwrap_or(SLACK_MAX_LEN);
-            let split_at = if split_at == 0 { SLACK_MAX_LEN } else { split_at };
-
-            chunks.push(remaining[..split_at].to_string());
-            remaining = remaining[split_at..].trim_start_matches('\n');
-        }
-
-        chunks
+        crate::formatting::split_message(text, SLACK_MAX_LEN)
     }
 
     // ─────────────────────────────────────────

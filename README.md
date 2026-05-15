@@ -222,6 +222,8 @@ Metis gateway
 
 Metis transcribes Telegram voice/audio by calling an **HTTP Whisper-style** endpoint (`POST …/audio/transcriptions`, OpenAI multipart format). Nothing in upstream Metis “searches disk for Whisper” or runs embedded Python STT — if something claims that in chat, treat it as a model mistake.
 
+For a complete guide (providers, ffmpeg requirements, troubleshooting), see `VOICE-TRANSCRIPTION.md`.
+
 **A) Hosted Groq Whisper**
 
 1. `"transcription": { "enabled": true }`
@@ -570,6 +572,7 @@ See [SECURITY.md](SECURITY.md) for comprehensive security guidance.
 | `Metis agent --no-markdown` | Plain-text replies |
 | `Metis agent --logs` | Show debug logs |
 | `Metis gateway` | Start all channels + cron + heartbeat |
+| `Metis serve` | Local HTTP API for the agent (Axum; see [HTTP-SERVER.md](HTTP-SERVER.md)) |
 | `Metis status` | Show config & provider status |
 | `Metis channels status` | Show channel status |
 | `Metis channels login` | Link WhatsApp (scan QR) |

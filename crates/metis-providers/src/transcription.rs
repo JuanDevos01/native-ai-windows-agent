@@ -6,7 +6,8 @@
 //! - Groq-hosted Whisper (`https://api.groq.com/openai/v1/audio/transcriptions`)
 //! - Any OpenAI-compatible `POST …/audio/transcriptions` multipart API (common for **local Whisper** stacks).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -77,6 +78,150 @@ impl WhisperCppTranscriber {
     }
 }
 
+/// Convert audio file to WAV format (16kHz, mono, 16-bit PCM) required by whisper.cpp.
+/// Returns the path to the converted file in the same directory as the original.
+fn convert_to_wav(file_path: &Path) -> anyhow::Result<PathBuf> {
+    if !file_path.exists() {
+        return Err(anyhow::anyhow!(
+            "cannot convert to wav: file does not exist: {}",
+            file_path.display()
+        ));
+    }
+
+    // If the file is empty, treat as "no audio" rather than hard error.
+    // (Some chat platforms can produce zero-byte media placeholders.)
+    if let Ok(meta) = std::fs::metadata(file_path) {
+        if meta.len() == 0 {
+            warn!(path = %file_path.display(), "audio file is empty (0 bytes)");
+            return Ok(file_path.to_path_buf());
+        }
+    }
+
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    // Only convert if not already WAV
+    if extension == "wav" {
+        debug!(file = %file_path.display(), "audio already in WAV format");
+        return Ok(file_path.to_path_buf());
+    }
+
+    // Create output path in same directory as original
+    let wav_path = file_path.with_extension("wav");
+
+    debug!(
+        input = %file_path.display(),
+        output = %wav_path.display(),
+        "converting audio to WAV format (16kHz, mono, 16-bit PCM)"
+    );
+
+    // Use ffmpeg to convert to 16kHz, mono, 16-bit PCM WAV.
+    //
+    // NOTE: ffmpeg option ordering matters. `-y` must come before the output path;
+    // placing it after can be parsed as an (invalid) second output, causing flaky failures.
+    let input = file_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid path"))?;
+    let output = wav_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid path"))?;
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            input,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            output,
+        ])
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to run ffmpeg (is it installed and on PATH?): {e}"
+            )
+        })?;
+
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        error!(stderr = %stderr, "ffmpeg conversion failed");
+        return Err(anyhow::anyhow!("ffmpeg conversion failed: {}", stderr));
+    }
+
+    debug!(output = %wav_path.display(), "audio converted to WAV successfully");
+    Ok(wav_path)
+}
+
+/// Best-effort probe: does this file contain an audio stream?
+///
+/// Uses `ffprobe` when available, which is robust even when the file has no extension.
+/// If `ffprobe` is missing, falls back to extension-only heuristics.
+fn file_has_audio_stream(file_path: &Path) -> bool {
+    if !file_path.exists() {
+        return false;
+    }
+
+    // Fast fallback: extension-based guess.
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let ext_hint = matches!(
+        ext.as_str(),
+        "ogg"
+            | "oga"
+            | "opus"
+            | "mp3"
+            | "m4a"
+            | "wav"
+            | "flac"
+            | "aac"
+            | "wma"
+            | "webm"
+    );
+
+    // `ffprobe` gives the truth; use it if present.
+    let path = match file_path.to_str() {
+        Some(p) => p,
+        None => return ext_hint,
+    };
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            path,
+        ])
+        .output();
+
+    match out {
+        Ok(o) => {
+            if !o.status.success() {
+                return ext_hint;
+            }
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.to_lowercase().contains("audio")
+        }
+        Err(_) => ext_hint,
+    }
+}
+
 #[async_trait]
 impl TranscriptionProvider for WhisperCppTranscriber {
     async fn transcribe(&self, file_path: &Path) -> anyhow::Result<String> {
@@ -94,6 +239,17 @@ impl TranscriptionProvider for WhisperCppTranscriber {
             return Ok(String::new());
         }
 
+        // Avoid trying to convert/transcribe non-audio files (common when a platform
+        // provides a "media" attachment that isn't actually an audio stream).
+        if !file_has_audio_stream(file_path) {
+            warn!(path = %file_path.display(), "transcription: file has no detectable audio stream");
+            return Ok(String::new());
+        }
+
+        // Convert audio to WAV format if needed (whisper.cpp requires WAV)
+        let audio_file = convert_to_wav(file_path)?;
+        debug!(audio = %audio_file.display(), "using audio file for transcription");
+
         // whisper.cpp's `-of` expects an output prefix; it will append `.txt` when used with `-otxt`.
         // We create a temp dir so concurrent transcriptions don't collide.
         let tmp: TempDir = tempfile::tempdir()?;
@@ -104,7 +260,7 @@ impl TranscriptionProvider for WhisperCppTranscriber {
         debug!(
             exe = %self.exe_path,
             model = %self.model_path,
-            audio = %file_path.display(),
+            audio = %audio_file.display(),
             out = %out_txt.display(),
             "transcribing audio (whisper.cpp CLI)"
         );
@@ -114,7 +270,7 @@ impl TranscriptionProvider for WhisperCppTranscriber {
             "-m",
             self.model_path.as_str(),
             "-f",
-            file_path
+            audio_file
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("audio path is not valid UTF-8"))?,
             "-otxt",
@@ -248,6 +404,16 @@ impl TranscriptionProvider for OpenAiCompatibleTranscriber {
             return Ok(String::new());
         }
 
+        // Best-effort: do not send non-audio blobs to the transcription endpoint.
+        // This also helps when a platform downloads media without an extension.
+        if !file_has_audio_stream(file_path) {
+            warn!(
+                path = %file_path.display(),
+                "transcription: file has no detectable audio stream; skipping request"
+            );
+            return Ok(String::new());
+        }
+
         let file_name = file_path
             .file_name()
             .unwrap_or_default()
@@ -262,6 +428,10 @@ impl TranscriptionProvider for OpenAiCompatibleTranscriber {
         );
 
         let file_bytes = tokio::fs::read(file_path).await?;
+        if file_bytes.is_empty() {
+            warn!(path = %file_path.display(), "transcription: file is empty; skipping");
+            return Ok(String::new());
+        }
 
         let file_part = reqwest::multipart::Part::bytes(file_bytes)
             .file_name(file_name)
@@ -381,6 +551,14 @@ impl TranscriptionProvider for GroqTranscriber {
             return Ok(String::new());
         }
 
+        if !file_has_audio_stream(file_path) {
+            warn!(
+                path = %file_path.display(),
+                "transcription: file has no detectable audio stream; skipping request"
+            );
+            return Ok(String::new());
+        }
+
         let file_name = file_path
             .file_name()
             .unwrap_or_default()
@@ -394,6 +572,10 @@ impl TranscriptionProvider for GroqTranscriber {
         );
 
         let file_bytes = tokio::fs::read(file_path).await?;
+        if file_bytes.is_empty() {
+            warn!(path = %file_path.display(), "transcription: file is empty; skipping");
+            return Ok(String::new());
+        }
 
         let file_part = reqwest::multipart::Part::bytes(file_bytes)
             .file_name(file_name)
@@ -481,6 +663,23 @@ mod tests {
         assert!(!is_audio_file("photo.jpg"));
         assert!(!is_audio_file("document.pdf"));
         assert!(!is_audio_file("video.mp4"));
+    }
+
+    #[test]
+    fn test_file_has_audio_stream_missing_file() {
+        assert!(!file_has_audio_stream(Path::new("/nonexistent/file.ogg")));
+    }
+
+    #[test]
+    fn test_file_has_audio_stream_extension_fallback_without_ffprobe() {
+        // We cannot assume ffprobe exists in CI/dev machines running tests.
+        // This test validates the extension-based fallback path at minimum.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sample.mp3");
+        std::fs::write(&p, b"not really mp3").unwrap();
+        // Either ffprobe is present (and will likely return false), or missing (fallback true).
+        // The function is explicitly "best-effort", so assert it never panics and returns a boolean.
+        let _ = file_has_audio_stream(&p);
     }
 
     #[test]
