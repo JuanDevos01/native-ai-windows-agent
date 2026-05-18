@@ -89,6 +89,10 @@ pub struct AgentDefaults {
     /// a short placeholder in outbound messages only; session history still stores the full text.
     #[serde(default = "default_false")]
     pub include_fenced_code_in_chat_apps: bool,
+    /// When false (default), Telegram/Discord/WhatsApp outbound messages replace `<<<EXEC_RESULT>>>`
+    /// blocks with a one-line summary instead of full command output.
+    #[serde(default = "default_false")]
+    pub include_exec_output_in_chat_apps: bool,
 }
 
 fn default_true() -> bool {
@@ -109,6 +113,7 @@ impl Default for AgentDefaults {
             max_tool_iterations: 20,
             log_thinking_json: true,
             include_fenced_code_in_chat_apps: false,
+            include_exec_output_in_chat_apps: false,
         }
     }
 }
@@ -736,6 +741,7 @@ mod tests {
         assert_eq!(config.agents.defaults.max_tool_iterations, 20);
         assert!(config.agents.defaults.log_thinking_json);
         assert!(!config.agents.defaults.include_fenced_code_in_chat_apps);
+        assert!(!config.agents.defaults.include_exec_output_in_chat_apps);
         assert_eq!(config.gateway.port, 18790);
         assert_eq!(config.http_server.port, 18791);
         assert_eq!(config.http_server.host, "127.0.0.1");
@@ -791,6 +797,7 @@ mod tests {
         assert!(json["agents"]["defaults"].get("maxToolIterations").is_some());
         assert!(json["agents"]["defaults"].get("logThinkingJson").is_some());
         assert!(json["agents"]["defaults"].get("includeFencedCodeInChatApps").is_some());
+        assert!(json["agents"]["defaults"].get("includeExecOutputInChatApps").is_some());
         assert!(json["tools"].get("restrictToWorkspace").is_some());
         // Should NOT have snake_case keys
         assert!(json["agents"]["defaults"].get("max_tokens").is_none());

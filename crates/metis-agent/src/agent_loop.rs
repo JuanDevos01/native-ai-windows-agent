@@ -36,6 +36,10 @@ const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 /// Substring present in every real `exec` tool result (`tools/shell.rs`).
 const EXEC_RESULT_MARKER: &str = "<<<EXEC_RESULT>>>";
+const END_EXEC_RESULT_MARKER: &str = "<<<END_EXEC_RESULT>>>";
+
+/// Max characters of the COMMAND line shown in chat-app exec summaries.
+const CHAT_EXEC_COMMAND_PREVIEW: usize = 120;
 
 /// Tracing target for model `reasoning_content` JSON lines (see `OutboundFormatting::log_thinking_json`).
 pub const THINKING_LOG_TARGET: &str = "metis_thinking";
@@ -52,6 +56,9 @@ pub struct OutboundFormatting {
     /// When false (default), outbound replies on Telegram, Discord, and WhatsApp have markdown
     /// fenced code blocks replaced by a short placeholder (session history is unchanged).
     pub include_fenced_code_in_chat_apps: bool,
+    /// When false (default), `<<<EXEC_RESULT>>>` blocks (and stdout/stderr tails) are replaced
+    /// with a one-line summary on Telegram, Discord, and WhatsApp. Session history is unchanged.
+    pub include_exec_output_in_chat_apps: bool,
 }
 
 impl Default for OutboundFormatting {
@@ -59,6 +66,7 @@ impl Default for OutboundFormatting {
         Self {
             log_thinking_json: true,
             include_fenced_code_in_chat_apps: false,
+            include_exec_output_in_chat_apps: false,
         }
     }
 }
@@ -75,6 +83,161 @@ fn fenced_code_block_re() -> &'static Regex {
     FENCED_CODE_BLOCK_RE.get_or_init(|| Regex::new(r"(?s)```.*?```").expect("fenced code block regex"))
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    format!(
+        "{}…",
+        s.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
+fn parse_exec_exit_code(block: &str) -> Option<i32> {
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("EXIT_CODE: ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// True when a wrapped exec tool report indicates failure.
+pub fn exec_report_failed(block: &str) -> bool {
+    if block.contains("STATUS: FAILED") || block.contains("STATUS: TIMEOUT") {
+        return true;
+    }
+    parse_exec_exit_code(block).is_some_and(|c| c != 0)
+}
+
+fn first_stderr_summary_line(block: &str) -> Option<String> {
+    let mut in_stderr = false;
+    for line in block.lines() {
+        if line == "--- STDERR ---" {
+            in_stderr = true;
+            continue;
+        }
+        if in_stderr {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("At line:") || t.starts_with('+') || t.starts_with('~') {
+                continue;
+            }
+            if t.starts_with("+ CategoryInfo") || t.starts_with("+ FullyQualifiedErrorId") {
+                continue;
+            }
+            return Some(truncate_chars(t, 100));
+        }
+    }
+    None
+}
+
+/// One-line summary of an `<<<EXEC_RESULT>>>` report (header + optional stderr hint).
+pub fn summarize_exec_block(block: &str) -> String {
+    let mut command = None;
+    let mut exit_code = None;
+    let mut status = None;
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("COMMAND: ") {
+            command = Some(rest);
+        } else if let Some(rest) = line.strip_prefix("EXIT_CODE: ") {
+            exit_code = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("STATUS: ") {
+            status = Some(rest.trim());
+        }
+    }
+    let preview = truncate_chars(command.unwrap_or("(unknown command)"), CHAT_EXEC_COMMAND_PREVIEW);
+    if exec_report_failed(block) {
+        let ec = exit_code.unwrap_or("?");
+        let err = first_stderr_summary_line(block).unwrap_or_else(|| "command failed".to_string());
+        return format!("✗ `{preview}` failed (exit {ec}): {err}");
+    }
+    match (exit_code, status) {
+        (Some(ec), Some(st)) => format!("✓ Ran `{preview}` (exit {ec}, {st})"),
+        (Some(ec), None) => format!("✓ Ran `{preview}` (exit {ec})"),
+        (None, Some(st)) => format!("✓ Ran `{preview}` ({st})"),
+        _ => format!("✓ Ran `{preview}`"),
+    }
+}
+
+/// Remove all `<<<EXEC_RESULT>>>` reports (and stdout/stderr tails) from model-authored text.
+pub fn strip_all_exec_reports_from_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(EXEC_RESULT_MARKER) {
+        out.push_str(&rest[..start]);
+        let block = &rest[start..];
+        if let Some(end_rel) = block.find(END_EXEC_RESULT_MARKER) {
+            let header_end = end_rel + END_EXEC_RESULT_MARKER.len();
+            rest = skip_exec_process_output_tail(&block[header_end..]);
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Drop short optimistic "it's running" lines the model repeats when checks fail.
+fn strip_optimistic_running_claims(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            let l = t.to_lowercase();
+            if t.is_empty() {
+                return true;
+            }
+            if l.contains("running!") || l.contains("server is running") || l.contains("server running!") {
+                return false;
+            }
+            if l.starts_with("open http://") && (l.contains("localhost") || l.contains("127.0.0.1")) {
+                return false;
+            }
+            true
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
+}
+
+fn skip_exec_process_output_tail(s: &str) -> &str {
+    let s = s.trim_start_matches('\n');
+    loop {
+        if s.starts_with("--- STDOUT ---")
+            || s.starts_with("--- STDERR ---")
+            || s.starts_with("(no stdout/stderr)")
+        {
+            if let Some(pos) = s.find(EXEC_RESULT_MARKER) {
+                return &s[pos..];
+            }
+            return "";
+        }
+        break;
+    }
+    s
+}
+
+/// Replace exec tool reports with short summaries (for Telegram/Discord/WhatsApp).
+pub fn compact_exec_output_for_chat(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(EXEC_RESULT_MARKER) {
+        out.push_str(&rest[..start]);
+        let block = &rest[start..];
+        if let Some(end_rel) = block.find(END_EXEC_RESULT_MARKER) {
+            let header_end = end_rel + END_EXEC_RESULT_MARKER.len();
+            out.push_str(&summarize_exec_block(&block[..header_end]));
+            rest = skip_exec_process_output_tail(&block[header_end..]);
+        } else {
+            out.push_str(&summarize_exec_block(block));
+            return out.trim().to_string();
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 /// Remove ``` ... ``` blocks (non-greedy). Used for chat-app outbound messages.
 pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
     let re = fenced_code_block_re();
@@ -88,15 +251,44 @@ pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
     }
 }
 
-/// The outbound message is often only the model's final text; it may omit tool output.
-/// If `exec` ran this turn but the reply has no `EXEC_RESULT` block, append raw results
-/// so channel users (e.g. Telegram) always see proof the command ran.
-fn merge_exec_outputs_into_reply(content: String, exec_outputs: &[String]) -> String {
-    if exec_outputs.is_empty() || content.contains(EXEC_RESULT_MARKER) {
-        return content;
+/// Merge real exec tool output into the assistant reply.
+///
+/// Strips hallucinated `<<<EXEC_RESULT>>>` blocks from model text when real exec ran this turn,
+/// so pasted `EXIT_CODE: 0` fiction cannot hide a failed tool call.
+fn reconcile_exec_with_reply(content: String, exec_outputs: &[String], compact_exec: bool) -> String {
+    let mut text = if exec_outputs.is_empty() {
+        content
+    } else {
+        strip_all_exec_reports_from_text(&content)
+    };
+
+    if exec_outputs.iter().any(|o| exec_report_failed(o)) {
+        text = strip_optimistic_running_claims(&text);
     }
-    let block = exec_outputs.join("\n\n");
-    let trimmed = content.trim_end();
+
+    if exec_outputs.is_empty() {
+        return text;
+    }
+
+    let block = if compact_exec {
+        exec_outputs
+            .iter()
+            .map(|o| summarize_exec_block(o))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        exec_outputs.join("\n\n")
+    };
+
+    if exec_outputs.iter().any(|o| exec_report_failed(o)) {
+        let intro = "The command did not succeed — the server/process is not confirmed running.";
+        if text.trim().is_empty() {
+            return format!("{intro}\n\n{block}");
+        }
+        return format!("{intro}\n\n{text}\n\n{block}");
+    }
+
+    let trimmed = text.trim_end();
     if trimmed.is_empty() {
         block
     } else {
@@ -112,18 +304,44 @@ fn looks_like_unverified_success_claim(content: &str) -> bool {
     let lower = content.to_lowercase();
     let has_claim = lower.contains("done! ✅")
         || lower.contains("found it! ✅")
+        || lower.contains("running! ✅")
+        || lower.contains("server is running")
+        || lower.contains("server running!")
         || lower.contains("installed")
         || lower.contains("now installed")
         || lower.contains("downloaded")
         || lower.contains("model downloaded")
         || lower.contains("all files are there")
         || lower.contains("success");
-    let has_execution_evidence =
-        lower.contains("exit_code:") || lower.contains("status: success") || lower.contains("<<<end_exec_result>>>");
+    let has_execution_evidence = lower.contains("exit_code:")
+        || lower.contains("status: success")
+        || lower.contains("<<<end_exec_result>>>");
     has_claim && !has_execution_evidence
 }
 
+/// User is pushing back on a false "success" / "running" claim (do not run path-check guardrail).
+fn is_user_challenging_agent_claims(input: &str) -> bool {
+    let lower = input.trim().to_lowercase();
+    lower.contains("how can you say")
+        || lower.contains("why do you say")
+        || lower.contains("you said it")
+        || lower.contains("something different")
+        || lower.contains("while the powershell")
+        || lower.contains("but powershell")
+        || lower.contains("not running")
+        || lower.contains("isn't running")
+        || lower.contains("is not running")
+        || lower.contains("doesn't work")
+        || lower.contains("does not work")
+        || lower.contains("unable to connect")
+        || lower.contains("connection refused")
+        || (lower.contains("failed") && lower.contains("<<<exec_result>>>"))
+}
+
 fn is_execution_or_install_request(input: &str) -> bool {
+    if is_user_challenging_agent_claims(input) {
+        return false;
+    }
     let lower = input.trim().to_lowercase();
     if lower.is_empty() {
         return false;
@@ -133,13 +351,12 @@ fn is_execution_or_install_request(input: &str) -> bool {
         || lower.contains("execute ")
         || lower.contains("install")
         || lower.contains("download")
-        || lower.contains("script")
-        || lower.contains("powershell")
-        || lower.contains("cmd ")
+        || lower.contains("run this script")
+        || lower.contains("powershell script")
+        || lower.contains("cmd /")
         || lower.contains("terminal")
-        || lower.contains("command")
-        || lower.contains("verify")
-        || lower.contains("path")
+        || lower.contains("verify that")
+        || lower.contains("verify the")
 }
 
 fn should_use_script_file_mode(input: &str) -> bool {
@@ -560,13 +777,19 @@ impl AgentLoop {
         tracing::debug!(target: THINKING_LOG_TARGET, "{}", line);
     }
 
-    /// Body as sent on the wire to `channel` (may strip fenced code for chat apps).
+    /// Body as sent on the wire to `channel` (may compact exec output and strip fenced code).
     fn outbound_text_for_channel(&self, channel: &str, stored: &str) -> String {
-        if is_chat_app_channel(channel) && !self.outbound.include_fenced_code_in_chat_apps {
-            strip_markdown_fenced_code_blocks(stored)
-        } else {
-            stored.to_string()
+        if !is_chat_app_channel(channel) {
+            return stored.to_string();
         }
+        let mut text = stored.to_string();
+        if !self.outbound.include_exec_output_in_chat_apps {
+            text = compact_exec_output_for_chat(&text);
+        }
+        if !self.outbound.include_fenced_code_in_chat_apps {
+            text = strip_markdown_fenced_code_blocks(&text);
+        }
+        text
     }
 
     fn outbound_message(&self, channel: &str, chat_id: &str, stored: &str) -> OutboundMessage {
@@ -883,10 +1106,12 @@ Please send a follow-up message to run the next command."
         }
 
         // If we exhausted iterations without a final answer
-        let mut content = merge_exec_outputs_into_reply(
+        let compact_exec = is_chat_app_channel(&msg.channel);
+        let mut content = reconcile_exec_with_reply(
             final_content
                 .unwrap_or_else(|| "I've completed processing but have no response to give.".into()),
             &exec_tool_outputs,
+            compact_exec,
         );
 
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
@@ -907,10 +1132,29 @@ Please send a follow-up message to run the next command."
                 content = format!("{content}\n\n---\n\n{recovered}");
             }
         }
+        // User challenged a false "running" claim — prefer real exec failure output over guardrail noise.
+        if is_user_challenging_agent_claims(&msg.content) {
+            if exec_tool_outputs.iter().any(|o| exec_report_failed(o)) {
+                let block = if compact_exec {
+                    exec_tool_outputs
+                        .iter()
+                        .map(|o| summarize_exec_block(o))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    exec_tool_outputs.join("\n\n")
+                };
+                content = format!(
+                    "You're right — the check failed; I should not claim the server is running.\n\n{block}"
+                );
+            }
+        }
+
         // Guardrail: if the model pasted an `EXEC_RESULT` block without any real exec tool call,
         // treat it as untrusted and force deterministic path verification.
         let user_requested_execution = is_execution_or_install_request(&msg.content);
-        let should_apply_exec_guardrail = user_requested_execution
+        let should_apply_exec_guardrail = !is_user_challenging_agent_claims(&msg.content)
+            && user_requested_execution
             && (has_untrusted_exec_block(&content, &exec_tool_outputs)
                 || (exec_tool_outputs.is_empty() && looks_like_unverified_success_claim(&content)));
         if should_apply_exec_guardrail {
@@ -1026,10 +1270,12 @@ Please send a follow-up message to run the next command."
             }
         }
 
-        let content = merge_exec_outputs_into_reply(
+        let compact_exec = is_chat_app_channel(&origin_channel);
+        let content = reconcile_exec_with_reply(
             final_content
                 .unwrap_or_else(|| "I've completed processing but have no response to give.".into()),
             &exec_tool_outputs,
+            compact_exec,
         );
 
         // Save to the original session
@@ -1407,22 +1653,53 @@ Write-Output "hello"
     }
 
     #[test]
-    fn merge_exec_outputs_into_reply_appends_when_model_omits_proof_block() {
-        let raw = vec!["<<<EXEC_RESULT>>>\nEXIT_CODE: 0\n<<<END_EXEC_RESULT>>>".to_string()];
-        let merged =
-            super::merge_exec_outputs_into_reply("Executing now! 📩".to_string(), &raw);
+    fn reconcile_exec_strips_hallucinated_blocks_when_real_exec_ran() {
+        let fake = "Running! ✅\n\n<<<EXEC_RESULT>>>\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>";
+        let real = vec![
+            "<<<EXEC_RESULT>>>\nCOMMAND: Invoke-WebRequest http://localhost:5000\nEXIT_CODE: 1\nSTATUS: FAILED\n<<<END_EXEC_RESULT>>>\n--- STDERR ---\nUnable to connect to the remote server\n".to_string(),
+        ];
+        let merged = super::reconcile_exec_with_reply(fake.to_string(), &real, true);
+        assert!(!merged.contains("Running!"));
+        assert!(!merged.contains("EXIT_CODE: 0"));
+        assert!(merged.contains("not succeed") || merged.contains("✗"));
+        assert!(merged.contains("Unable to connect"));
+    }
+
+    #[test]
+    fn reconcile_exec_appends_when_model_omits_proof_block() {
+        let raw = vec!["<<<EXEC_RESULT>>>\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>".to_string()];
+        let merged = super::reconcile_exec_with_reply("Executing now! 📩".to_string(), &raw, false);
         assert!(merged.contains("Executing now"));
         assert!(merged.contains("<<<EXEC_RESULT>>>"));
     }
 
     #[test]
-    fn merge_exec_outputs_into_reply_skips_when_block_already_in_reply() {
-        let raw = vec!["<<<EXEC_RESULT>>>\nX\n<<<END_EXEC_RESULT>>>".to_string()];
-        let merged = super::merge_exec_outputs_into_reply(
-            "ok <<<EXEC_RESULT>>>".to_string(),
-            &raw,
+    fn reconcile_exec_compact_for_chat_apps() {
+        let raw = vec![
+            "<<<EXEC_RESULT>>>\nCOMMAND: [System.IO.File]::WriteAllText(\"C:\\\\big.html\", \"<!DOCTYPE html>...\")\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>".to_string(),
+        ];
+        let merged = super::reconcile_exec_with_reply("Done!".to_string(), &raw, true);
+        assert!(merged.contains("Done!"));
+        assert!(merged.contains("✓ Ran"));
+        assert!(merged.len() < 300, "compact merge should stay short, got {} chars", merged.len());
+    }
+
+    #[test]
+    fn test_exec_report_failed_detects_exit_code_one() {
+        let block = "<<<EXEC_RESULT>>>\nEXIT_CODE: 1\nSTATUS: FAILED\n<<<END_EXEC_RESULT>>>";
+        assert!(super::exec_report_failed(block));
+    }
+
+    #[test]
+    fn test_compact_exec_output_strips_huge_command() {
+        let huge = format!(
+            "<<<EXEC_RESULT>>>\nCOMMAND: {}\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\nmore noise",
+            "x".repeat(5000)
         );
-        assert_eq!(merged, "ok <<<EXEC_RESULT>>>");
+        let out = super::compact_exec_output_for_chat(&huge);
+        assert!(out.contains("✓ Ran"));
+        assert!(!out.contains(&"x".repeat(200)));
+        assert!(!out.contains("STDOUT"));
     }
 
     #[test]

@@ -153,6 +153,7 @@ pub async fn run() -> Result<()> {
     let outbound = OutboundFormatting {
         log_thinking_json: defaults.log_thinking_json,
         include_fenced_code_in_chat_apps: defaults.include_fenced_code_in_chat_apps,
+        include_exec_output_in_chat_apps: defaults.include_exec_output_in_chat_apps,
     };
     let agent_loop = Arc::new(AgentLoop::new(
         bus.clone(),

@@ -140,7 +140,9 @@ impl ContextBuilder {
              You have access to tools. Use them when needed to answer questions, \
              read/write files, run commands, search the web, and more.\n\
              Always prefer using tools over guessing. \
-             Be concise and helpful.\n\n\
+             Be concise and helpful.\n\
+             Never invent <<<EXEC_RESULT>>> blocks in your reply — only the exec tool emits them. \
+             If exec shows a non-zero exit code or connection errors, report failure; do not claim success or \"running\".\n\n\
              ## Memory\n\n\
              When you learn something important about the user or the project, \
              persist it by writing to `{memory_file}` using the `write_file` or `edit_file` tool.\n\

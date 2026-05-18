@@ -183,6 +183,9 @@ fn apply_env_overrides(mut config: Config) -> Config {
     if let Ok(val) = std::env::var("METIS_AGENTS__DEFAULTS__INCLUDE_FENCED_CODE_IN_CHAT_APPS") {
         config.agents.defaults.include_fenced_code_in_chat_apps = val == "true" || val == "1";
     }
+    if let Ok(val) = std::env::var("METIS_AGENTS__DEFAULTS__INCLUDE_EXEC_OUTPUT_IN_CHAT_APPS") {
+        config.agents.defaults.include_exec_output_in_chat_apps = val == "true" || val == "1";
+    }
 
     // Provider API keys (by provider name)
     apply_provider_env(&mut config.providers.anthropic, "ANTHROPIC");
