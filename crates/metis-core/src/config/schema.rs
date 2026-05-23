@@ -113,7 +113,7 @@ impl Default for AgentDefaults {
             max_tool_iterations: 20,
             log_thinking_json: true,
             include_fenced_code_in_chat_apps: false,
-            include_exec_output_in_chat_apps: false,
+            include_exec_output_in_chat_apps: true,
         }
     }
 }
@@ -585,7 +585,7 @@ pub struct ExecToolConfig {
 impl Default for ExecToolConfig {
     fn default() -> Self {
         Self {
-            timeout: 60,
+            timeout: 180,
             shell: default_exec_shell(),
             permission_mode: default_exec_permission_mode(),
         }
@@ -741,7 +741,7 @@ mod tests {
         assert_eq!(config.agents.defaults.max_tool_iterations, 20);
         assert!(config.agents.defaults.log_thinking_json);
         assert!(!config.agents.defaults.include_fenced_code_in_chat_apps);
-        assert!(!config.agents.defaults.include_exec_output_in_chat_apps);
+        assert!(config.agents.defaults.include_exec_output_in_chat_apps);
         assert_eq!(config.gateway.port, 18790);
         assert_eq!(config.http_server.port, 18791);
         assert_eq!(config.http_server.host, "127.0.0.1");

@@ -229,7 +229,8 @@ impl SubagentManager {
                 .await;
 
             if response.has_tool_calls() {
-                let tool_calls: Vec<ToolCall> = response.tool_calls.clone();
+                let tool_calls =
+                    crate::tools::base::sanitize_tool_calls_for_history(response.tool_calls.clone());
                 ContextBuilder::add_assistant_message(
                     &mut messages,
                     response.content.clone(),
@@ -237,17 +238,18 @@ impl SubagentManager {
                 );
 
                 for tc in &tool_calls {
-                    let params: HashMap<String, serde_json::Value> =
-                        serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-
-                    info!(
-                        task_id = %task_id,
-                        tool = %tc.function.name,
-                        iteration = iteration,
-                        "subagent executing tool"
-                    );
-
-                    let result = tools.execute(&tc.function.name, params).await;
+                    let result = match crate::tools::base::parse_tool_params(&tc.function.arguments) {
+                        Ok(params) => {
+                            info!(
+                                task_id = %task_id,
+                                tool = %tc.function.name,
+                                iteration = iteration,
+                                "subagent executing tool"
+                            );
+                            tools.execute(&tc.function.name, params).await
+                        }
+                        Err(e) => format!("Tool argument error for `{}`: {e}", tc.function.name),
+                    };
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &result);
                 }
             } else {

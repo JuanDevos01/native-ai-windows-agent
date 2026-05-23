@@ -16,6 +16,7 @@ mod status;
 mod gateway;
 mod cron_cmd;
 mod channels_cmd;
+mod heartbeat_cmd;
 mod serve;
 
 use std::sync::Arc;
@@ -98,6 +99,12 @@ enum Commands {
         action: channels_cmd::ChannelsCommands,
     },
 
+    /// Run one heartbeat tick (reads HEARTBEAT.md; tests periodic maintenance)
+    Heartbeat {
+        #[command(flatten)]
+        args: heartbeat_cmd::HeartbeatArgs,
+    },
+
     /// Start a local HTTP API for the agent (Axum; loopback by default)
     Serve {
         /// Bind address (overrides `httpServer.host` in config)
@@ -154,6 +161,10 @@ async fn main() -> Result<()> {
             cron_cmd::dispatch(action).await
         }
         Commands::Channels { action } => channels_cmd::dispatch(action),
+        Commands::Heartbeat { args } => {
+            init_logging(false);
+            heartbeat_cmd::run(args).await
+        }
         Commands::Serve {
             host,
             port,

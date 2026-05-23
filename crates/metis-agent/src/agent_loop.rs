@@ -5,7 +5,7 @@
 //! tool calls, and publishes outbound responses.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -20,6 +20,7 @@ use metis_providers::traits::{LlmProvider, LlmRequestConfig};
 
 use crate::context::ContextBuilder;
 use crate::subagent::SubagentManager;
+use crate::tools::base::{parse_tool_params, sanitize_tool_calls_for_history};
 use crate::tools::message::MessageTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::browser::BrowserTool;
@@ -104,12 +105,36 @@ fn parse_exec_exit_code(block: &str) -> Option<i32> {
     None
 }
 
+/// Stdout/stderr tail of an exec report (after `<<<END_EXEC_RESULT>>>`).
+fn exec_process_output_tail(block: &str) -> &str {
+    let Some(idx) = block.find(END_EXEC_RESULT_MARKER) else {
+        return "";
+    };
+    block[idx + END_EXEC_RESULT_MARKER.len()..].trim()
+}
+
+/// PowerShell fast-path scripts often exit 0 while printing failure markers on stdout.
+fn exec_output_indicates_failure(tail: &str) -> bool {
+    let lower = tail.to_lowercase();
+    lower.contains("http_server_fail")
+        || lower.contains("invoice_server_fail")
+        || lower.contains("unable to connect")
+        || lower.contains("connection refused")
+        || lower.contains("actively refused")
+        || lower.contains("operation has timed out")
+        || lower.contains("no connection could be made")
+        || lower.contains("target machine actively refused")
+}
+
 /// True when a wrapped exec tool report indicates failure.
 pub fn exec_report_failed(block: &str) -> bool {
     if block.contains("STATUS: FAILED") || block.contains("STATUS: TIMEOUT") {
         return true;
     }
-    parse_exec_exit_code(block).is_some_and(|c| c != 0)
+    if parse_exec_exit_code(block).is_some_and(|c| c != 0) {
+        return true;
+    }
+    exec_output_indicates_failure(exec_process_output_tail(block))
 }
 
 fn first_stderr_summary_line(block: &str) -> Option<String> {
@@ -133,6 +158,24 @@ fn first_stderr_summary_line(block: &str) -> Option<String> {
     None
 }
 
+fn first_failure_summary_line(block: &str) -> Option<String> {
+    if let Some(s) = first_stderr_summary_line(block) {
+        return Some(s);
+    }
+    let tail = exec_process_output_tail(block);
+    for line in tail.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let l = t.to_lowercase();
+        if l.contains("_fail") || l.contains("unable to connect") || l.contains("timed out") {
+            return Some(truncate_chars(t, 100));
+        }
+    }
+    None
+}
+
 /// One-line summary of an `<<<EXEC_RESULT>>>` report (header + optional stderr hint).
 pub fn summarize_exec_block(block: &str) -> String {
     let mut command = None;
@@ -150,7 +193,7 @@ pub fn summarize_exec_block(block: &str) -> String {
     let preview = truncate_chars(command.unwrap_or("(unknown command)"), CHAT_EXEC_COMMAND_PREVIEW);
     if exec_report_failed(block) {
         let ec = exit_code.unwrap_or("?");
-        let err = first_stderr_summary_line(block).unwrap_or_else(|| "command failed".to_string());
+        let err = first_failure_summary_line(block).unwrap_or_else(|| "command failed".to_string());
         return format!("✗ `{preview}` failed (exit {ec}): {err}");
     }
     match (exit_code, status) {
@@ -192,6 +235,12 @@ fn strip_optimistic_running_claims(text: &str) -> String {
             if l.contains("running!") || l.contains("server is running") || l.contains("server running!") {
                 return false;
             }
+            if l.contains("starting mission control")
+                || l.contains("servers are not running")
+                || l.contains("let me start them")
+            {
+                return false;
+            }
             if l.starts_with("open http://") && (l.contains("localhost") || l.contains("127.0.0.1")) {
                 return false;
             }
@@ -207,6 +256,7 @@ fn skip_exec_process_output_tail(s: &str) -> &str {
         if s.starts_with("--- STDOUT ---")
             || s.starts_with("--- STDERR ---")
             || s.starts_with("(no stdout/stderr)")
+            || s.starts_with("(no process output")   // timeout body
         {
             if let Some(pos) = s.find(EXEC_RESULT_MARKER) {
                 return &s[pos..];
@@ -238,14 +288,41 @@ pub fn compact_exec_output_for_chat(text: &str) -> String {
     out.trim().to_string()
 }
 
+static REASONING_TAG_RE: OnceLock<Regex> = OnceLock::new();
+
+/// Remove model reasoning tags that must not be sent to users/channels.
+pub fn strip_reasoning_tags(text: &str) -> String {
+    let re = REASONING_TAG_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:redacted_)?think(?:ing)?>.*?</(?:redacted_)?think(?:ing)?>")
+            .expect("reasoning tag regex")
+    });
+    let cleaned = re.replace_all(text, "");
+    cleaned.trim().to_string()
+}
+
 /// Remove ``` ... ``` blocks (non-greedy). Used for chat-app outbound messages.
+/// Multi-line code blocks are silently removed (not replaced with a placeholder message).
+/// Short single-line inline blocks are kept as-is.
 pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
     let re = fenced_code_block_re();
-    let replaced = re.replace_all(text, "\n_[code omitted]_\n");
+    let replaced = re.replace_all(text, |caps: &regex::Captures| {
+        let block = caps.get(0).map_or("", |m| m.as_str());
+        // Extract content between the opening/closing fences.
+        let inner_start = block.find('\n').map(|i| i + 1).unwrap_or(block.len());
+        let inner = &block[inner_start..];
+        let inner = inner.trim_end_matches('`').trim();
+        let lines = inner.lines().count();
+        if lines > 1 || inner.len() > 120 {
+            // Multi-line or long block: silently drop it.
+            String::new()
+        } else {
+            // Short single-line: keep as-is.
+            block.to_string()
+        }
+    });
     let trimmed = replaced.trim();
     if trimmed.is_empty() {
-        "(Assistant reply was only fenced code; set `agents.defaults.includeFencedCodeInChatApps` to show it.)"
-            .to_string()
+        String::new()
     } else {
         trimmed.to_string()
     }
@@ -262,7 +339,7 @@ fn reconcile_exec_with_reply(content: String, exec_outputs: &[String], compact_e
         strip_all_exec_reports_from_text(&content)
     };
 
-    if exec_outputs.iter().any(|o| exec_report_failed(o)) {
+    if exec_turn_should_show_hard_failure(exec_outputs) {
         text = strip_optimistic_running_claims(&text);
     }
 
@@ -280,8 +357,8 @@ fn reconcile_exec_with_reply(content: String, exec_outputs: &[String], compact_e
         exec_outputs.join("\n\n")
     };
 
-    if exec_outputs.iter().any(|o| exec_report_failed(o)) {
-        let intro = "The command did not succeed — the server/process is not confirmed running.";
+    if exec_turn_should_show_hard_failure(exec_outputs) {
+        let intro = "Some steps failed — see exec results below. Continue debugging if the task is not done.";
         if text.trim().is_empty() {
             return format!("{intro}\n\n{block}");
         }
@@ -338,6 +415,167 @@ fn is_user_challenging_agent_claims(input: &str) -> bool {
         || (lower.contains("failed") && lower.contains("<<<exec_result>>>"))
 }
 
+/// User asked to fix multiple things (e.g. port 8080 UI + port 5000 server).
+fn is_multi_step_fix_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let wants_fix = lower.contains("fix")
+        || lower.contains("not working")
+        || lower.contains("not clickable")
+        || lower.contains("broken")
+        || lower.contains("doesn't work")
+        || lower.contains("does not work");
+    let multi = lower.contains("both")
+        || lower.contains("two issues")
+        || lower.contains("2 issues")
+        || (lower.contains("8080") && lower.contains("5000"))
+        || lower.matches("port").count() >= 2;
+    wants_fix && multi
+}
+
+/// Local dev servers (Mission Control :8080, invoice :5000) — agent must debug iteratively, not one script.
+fn is_autonomous_local_servers_work(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let mentions = lower.contains("8080")
+        || lower.contains("5000")
+        || lower.contains("localhost")
+        || lower.contains("mission control")
+        || lower.contains("mission-control")
+        || lower.contains("invoice");
+    if !mentions {
+        return false;
+    }
+    lower.contains("start")
+        || lower.contains("verify")
+        || lower.contains("fix")
+        || lower.contains("debug")
+        || lower.contains("not working")
+        || lower.contains("not running")
+        || lower.contains("timeout")
+        || lower.contains("why")
+        || lower.contains("solution")
+        || lower.contains("running")
+}
+
+const AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION: &str = "\n\n[Metis instruction: Autonomous local-server task. \
+IMPORTANT: Do NOT write plans or code blocks — call exec/read_file tools DIRECTLY and IMMEDIATELY. \
+Do not stop after one command — keep calling tools until both services respond or you clearly state what is blocked. \
+Step 1: Check which ports are already responding (Invoke-WebRequest localhost:8080 and :5000 -TimeoutSec 3 -UseBasicParsing). If a port responds, skip starting that service. \
+Step 2: For services NOT yet responding, find and start them. \
+Mission Control: `mission-control/` under workspace (port 8080) — check what kind of server it is first (dir the folder; look for package.json, composer.json, *.py). \
+Invoice: `email-app/invoice_processor.py` (port 5000). \
+CRITICAL — starting servers: NEVER run `python script.py` or `node app.js` directly — they block forever and timeout. \
+Instead use Start-Process: `$p = Start-Process -FilePath python -ArgumentList 'invoice_processor.py' -WorkingDirectory 'C:\\full\\path\\to\\email-app' -PassThru -WindowStyle Hidden; Start-Sleep 2; try { (Invoke-WebRequest http://localhost:5000 -UseBasicParsing -TimeoutSec 4).StatusCode } catch { $_.Exception.Message }` \
+If the script has a bug/typo: use read_file to read it first, then edit_file to fix it, THEN start with Start-Process. \
+On Traceback from a previous run: read the script, find the error, fix it, then restart. \
+NEVER run a long-running process without Start-Process. Start with port checks NOW.]";
+
+/// True when an LLM response looks like a plan/narration with no real tool execution.
+/// Used to inject a "stop planning, execute now" continuation.
+fn response_is_plan_without_tools(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let has_plan_words = lower.contains("step 1")
+        || lower.contains("step 2")
+        || lower.contains("first,")
+        || lower.contains("first i")
+        || lower.contains("let me")
+        || lower.contains("i'll start")
+        || lower.contains("i will start")
+        || lower.contains("checking")
+        || lower.contains("i'll check")
+        || lower.contains("starting both")
+        || lower.contains("i need to");
+    let has_code_block = content.contains("```");
+    (has_plan_words || has_code_block) && content.len() > 60
+}
+
+/// Cap how many `exec` tool calls are allowed in one user turn (prevents spam, allows real workflows).
+fn max_exec_calls_for_message(input: &str) -> usize {
+    if is_whisper_cpp_install_request(input) {
+        return 1;
+    }
+    if is_autonomous_local_servers_work(input) || is_multi_step_fix_request(input) {
+        return 20;
+    }
+    if is_execution_or_install_request(input) {
+        return 8;
+    }
+    20
+}
+
+/// True when the turn should show the harsh failure banner (not when the agent recovered on a later exec).
+fn exec_turn_should_show_hard_failure(exec_outputs: &[String]) -> bool {
+    if exec_outputs.is_empty() {
+        return false;
+    }
+    // If the last exec succeeded, the agent recovered — no banner.
+    if exec_outputs
+        .last()
+        .is_some_and(|o| !exec_report_failed(o))
+    {
+        return false;
+    }
+    exec_outputs.iter().any(|o| exec_report_failed(o))
+}
+
+/// True when an HTTP check (Invoke-WebRequest) for a given port returned success in any exec output.
+fn port_confirmed_up(exec_outputs: &[String], port: u16) -> bool {
+    let port_str = format!(":{port}");
+    exec_outputs.iter().any(|o| {
+        let lower = o.to_lowercase();
+        (lower.contains("invoke-webrequest") || lower.contains("http://localhost"))
+            && lower.contains(&port_str)
+            && (lower.contains("status: success") || lower.contains("statuscode"))
+            && !exec_report_failed(o)
+    })
+}
+
+/// Build a human-readable summary from autonomous exec outputs when the model ran out of iterations.
+fn build_autonomous_summary(exec_outputs: &[String], compact: bool) -> String {
+    let port_8080_ok = port_confirmed_up(exec_outputs, 8080);
+    let port_5000_ok = port_confirmed_up(exec_outputs, 5000);
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("**Autonomous run complete** — reached iteration limit. Status:".into());
+
+    if port_8080_ok {
+        lines.push("  ✅ Port 8080 (Mission Control): responding".into());
+    } else if exec_outputs.iter().any(|o| {
+        let l = o.to_lowercase();
+        l.contains("8080") && exec_report_failed(o)
+    }) {
+        lines.push("  ❌ Port 8080 (Mission Control): could not start".into());
+    }
+
+    if port_5000_ok {
+        lines.push("  ✅ Port 5000 (Invoice): responding".into());
+    } else if exec_outputs.iter().any(|o| {
+        let l = o.to_lowercase();
+        (l.contains("5000") || l.contains("invoice")) && exec_report_failed(o)
+    }) {
+        // Pull the first error line from the invoice traceback
+        let err = exec_outputs
+            .iter()
+            .filter(|o| {
+                let l = o.to_lowercase();
+                (l.contains("invoice") || l.contains("5000")) && exec_report_failed(o)
+            })
+            .find_map(|o| first_failure_summary_line(o))
+            .unwrap_or_else(|| "check logs above".into());
+        lines.push(format!("  ❌ Port 5000 (Invoice): failed — {err}"));
+        lines.push("  → Send \"debug invoice error\" to continue fixing it.".into());
+    }
+
+    if !compact {
+        lines.push(String::new());
+        lines.push("**Exec log:**".into());
+        for o in exec_outputs {
+            lines.push(summarize_exec_block(o));
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn is_execution_or_install_request(input: &str) -> bool {
     if is_user_challenging_agent_claims(input) {
         return false;
@@ -373,6 +611,230 @@ fn is_whisper_cpp_install_request(input: &str) -> bool {
     let asks_install = lower.contains("install") || lower.contains("setup") || lower.contains("set up");
     let mentions_whisper = lower.contains("whisper.cpp") || lower.contains("whisper cpp") || lower.contains("whisper");
     asks_install && mentions_whisper
+}
+
+fn llm_response_is_api_error(response: &LlmResponse) -> bool {
+    response
+        .content
+        .as_ref()
+        .is_some_and(|c| c.starts_with("Error calling LLM:"))
+}
+
+fn content_claims_false_ok(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let positive = lower.contains("everything is ok")
+        || lower.contains("everything's ok")
+        || lower.contains("all good")
+        || lower.contains("all ok")
+        || lower.contains("is ok")
+        || lower.contains("looks good")
+        || lower.contains("working fine");
+    let negative = lower.contains("not ok")
+        || lower.contains("not succeed")
+        || lower.contains("failed")
+        || lower.contains("error calling llm");
+    positive && !negative
+}
+
+/// If exec/API failed, never let the assistant claim success.
+fn enforce_truthful_status_reply(
+    content: String,
+    exec_outputs: &[String],
+    compact_exec: bool,
+) -> String {
+    let hard_fail = exec_turn_should_show_hard_failure(exec_outputs);
+    let llm_err = content.contains("Error calling LLM:");
+    if !hard_fail && !llm_err && !content_claims_false_ok(&content) {
+        return content;
+    }
+
+    let mut parts = vec!["❌ **Not OK** — verification or execution failed.".to_string()];
+    if llm_err {
+        parts.push(content.clone());
+    } else if content_claims_false_ok(&content) {
+        parts.push("Earlier text incorrectly suggested success; see tool results below.".to_string());
+    } else {
+        let trimmed = strip_optimistic_running_claims(&content);
+        if !trimmed.is_empty() {
+            parts.push(trimmed);
+        }
+    }
+    if hard_fail || exec_outputs.iter().any(|o| exec_report_failed(o)) {
+        let block = if compact_exec {
+            exec_outputs
+                .iter()
+                .map(|o| summarize_exec_block(o))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            exec_outputs.join("\n\n")
+        };
+        parts.push(block);
+    }
+    parts.join("\n\n")
+}
+
+#[cfg(test)]
+fn is_invoice_processor_start_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    (lower.contains("invoice") || lower.contains("5000") || lower.contains(":5000"))
+        && (lower.contains("start")
+            || lower.contains("not working")
+            || lower.contains("verify")
+            || lower.contains("launch")
+            || lower.contains("run"))
+}
+
+fn build_invoice_processor_start_ps(workspace: &Path, port: u16) -> String {
+    let root = workspace.display().to_string().replace('\'', "''");
+    // Bounded search only — full-workspace -Recurse can exceed the exec tool timeout.
+    format!(
+        "$ErrorActionPreference='Stop'; \
+$root='{root}'; \
+$port={port}; \
+$script = $null; \
+$named = @('invoice.py','invoice_processor.py','invoice_app.py','app.py') | ForEach-Object {{ Join-Path $root $_ }} | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1; \
+if ($named) {{ $script = Get-Item -LiteralPath $named }}; \
+if (-not $script) {{ \
+  $searchDirs = @($root, (Join-Path $root 'invoice'), (Join-Path $root 'invoice-processor'), (Join-Path $root 'mission-control')); \
+  foreach ($dir in $searchDirs) {{ \
+    if (-not (Test-Path -LiteralPath $dir)) {{ continue }}; \
+    $script = Get-ChildItem -LiteralPath $dir -File -Filter '*.py' -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match 'invoice' }} | Select-Object -First 1; \
+    if ($script) {{ break }}; \
+    $script = Get-ChildItem -LiteralPath $dir -File -Filter '*.py' -Recurse -Depth 2 -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match 'invoice' }} | Select-Object -First 1; \
+    if ($script) {{ break }} \
+  }} \
+}}; \
+if (-not $script) {{ throw \"No invoice*.py found (searched $root and shallow subfolders only)\" }}; \
+$dir = $script.DirectoryName; \
+if (!(Test-Path -LiteralPath $dir)) {{ throw \"WorkingDirectory missing: $dir\" }}; \
+$py = (Get-Command py -ErrorAction SilentlyContinue).Source; \
+if (-not $py) {{ $py = (Get-Command python -ErrorAction SilentlyContinue).Source }}; \
+if (-not $py) {{ throw 'Python not found (py/python)' }}; \
+$proc = Start-Process -FilePath $py -ArgumentList $script.FullName -WorkingDirectory $dir -PassThru -WindowStyle Hidden; \
+Start-Sleep -Seconds 2; \
+try {{ \
+  $r = Invoke-WebRequest -Uri (\"http://127.0.0.1:{{0}}\" -f $port) -UseBasicParsing -TimeoutSec 4; \
+  \"INVOICE_SERVER_OK PID=$($proc.Id) STATUS=$($r.StatusCode) SCRIPT=$($script.FullName) DIR=$dir\" \
+}} catch {{ \
+  \"INVOICE_SERVER_FAIL PID=$($proc.Id) SCRIPT=$($script.FullName) DIR=$dir ERROR=$($_.Exception.Message)\" \
+}}"
+    )
+}
+
+fn is_local_http_server_start_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let asks_start = lower.contains("start")
+        || lower.contains("launch")
+        || lower.contains("bring up")
+        || (lower.contains("run") && (lower.contains("server") || lower.contains("webserver")));
+    let mentions_server = lower.contains("webserver")
+        || lower.contains("web server")
+        || lower.contains("http server")
+        || lower.contains("localhost")
+        || lower.contains("python -m http.server")
+        || lower.contains("mission-control")
+        || lower.contains("invoice");
+    let port_down = (lower.contains(":5000") || lower.contains("port 5000") || lower.contains(":8080"))
+        && (lower.contains("not working")
+            || lower.contains("not running")
+            || lower.contains("doesn't work")
+            || lower.contains("does not work"));
+    (asks_start && mentions_server) || port_down
+}
+
+fn extract_port_from_text(input: &str) -> Option<u16> {
+    extract_all_ports_from_text(input).into_iter().next()
+}
+
+fn extract_all_ports_from_text(input: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Ok(re_localhost) = Regex::new(r"localhost:(\d{2,5})") {
+        for cap in re_localhost.captures_iter(input) {
+            if let Ok(p) = cap[1].parse::<u16>() {
+                ports.push(p);
+            }
+        }
+    }
+    if let Ok(re_port) = Regex::new(r"(?i)\bport\s+(\d{2,5})\b") {
+        for cap in re_port.captures_iter(input) {
+            if let Ok(p) = cap[1].parse::<u16>() {
+                ports.push(p);
+            }
+        }
+    }
+    if let Ok(re_colon) = Regex::new(r":(\d{4,5})\b") {
+        for cap in re_colon.captures_iter(input) {
+            if let Ok(p) = cap[1].parse::<u16>() {
+                if (5000..=65535).contains(&p) || p == 8080 {
+                    ports.push(p);
+                }
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// User needs Mission Control (8080) and invoice processor (5000) addressed together.
+fn is_dual_local_servers_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let mentions_both = lower.contains("8080") && lower.contains("5000");
+    if !mentions_both {
+        return false;
+    }
+    let wants_action = lower.contains("fix")
+        || lower.contains("start")
+        || lower.contains("launch")
+        || lower.contains("verify")
+        || lower.contains("not working")
+        || lower.contains("not running")
+        || lower.contains("isn't running")
+        || lower.contains("is not running")
+        || lower.contains("false claim")
+        || lower.contains("again")
+        || lower.contains("full stop")
+        || lower.contains("mission control")
+        || lower.contains("invoice");
+    wants_action
+}
+
+fn default_http_server_port(input: &str) -> u16 {
+    let ports = extract_all_ports_from_text(input);
+    if ports.contains(&5000) && !ports.contains(&8080) {
+        return 5000;
+    }
+    if ports.contains(&8080) {
+        return 8080;
+    }
+    8080
+}
+
+#[cfg(test)]
+fn build_mission_control_start_ps(root: &Path, port: u16) -> String {
+    let root_escaped = root.display().to_string().replace('\'', "''");
+    format!(
+        "$ErrorActionPreference='Stop'; \
+$root='{root_escaped}'; \
+$port={port}; \
+if (!(Test-Path -LiteralPath $root)) {{ throw \"Directory not found: $root\" }}; \
+$py = (Get-Command py -ErrorAction SilentlyContinue).Source; \
+if (-not $py) {{ $py = (Get-Command python -ErrorAction SilentlyContinue).Source }}; \
+if (-not $py) {{ throw 'Python not found (py/python)' }}; \
+netstat -ano | Select-String (\":$port\\s\") | ForEach-Object {{ if ($_ -match '\\s+(\\d+)\\s*$') {{ Stop-Process -Id ([int]$matches[1]) -Force -ErrorAction SilentlyContinue }} }}; \
+$outLog = Join-Path $root 'metis_http_server.out.log'; \
+$errLog = Join-Path $root 'metis_http_server.err.log'; \
+$proc = Start-Process -FilePath $py -ArgumentList @('-m','http.server',$port,'--bind','127.0.0.1') -WorkingDirectory $root -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog; \
+Start-Sleep -Seconds 1; \
+try {{ \
+  $resp = Invoke-WebRequest -Uri (\"http://127.0.0.1:{{0}}\" -f $port) -UseBasicParsing -TimeoutSec 4; \
+  \"HTTP_SERVER_OK PID=$($proc.Id) STATUS=$($resp.StatusCode) URL=http://127.0.0.1:$port ROOT=$root\" \
+}} catch {{ \
+  \"HTTP_SERVER_FAIL PID=$($proc.Id) URL=http://127.0.0.1:$port ROOT=$root ERROR=$($_.Exception.Message)\"; \
+  if (Test-Path -LiteralPath $errLog) {{ Get-Content -LiteralPath $errLog -TotalCount 20 }} \
+}}"
+    )
 }
 
 fn extract_powershell_code_block(input: &str) -> Option<String> {
@@ -603,7 +1065,7 @@ pub struct ExecToolConfig {
 impl Default for ExecToolConfig {
     fn default() -> Self {
         Self {
-            timeout: 60,
+            timeout: 180,
             shell: if cfg!(target_os = "windows") {
                 "powershell".to_string()
             } else {
@@ -611,6 +1073,79 @@ impl Default for ExecToolConfig {
             },
             permission_mode: "unsafe_only".to_string(),
         }
+    }
+}
+
+// ─────────────────────────────────────────────
+// Tool progress helpers (for live chat-app ticks)
+// ─────────────────────────────────────────────
+
+/// Build a short "starting" description for a tool call.
+fn tool_progress_preview(tool_name: &str, arguments: &str) -> String {
+    match tool_name {
+        "exec" => {
+            let cmd = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| arguments.chars().take(80).collect());
+            let preview: String = cmd.chars().take(80).collect();
+            let ellipsis = if cmd.len() > 80 { "…" } else { "" };
+            format!("Exec: `{preview}{ellipsis}`")
+        }
+        "read_file" => {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            format!("Reading `{path}`")
+        }
+        "write_file" | "edit_file" => {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            let verb = if tool_name == "write_file" { "Writing" } else { "Editing" };
+            format!("{verb} `{path}`")
+        }
+        "list_dir" => {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            format!("Listing `{path}`")
+        }
+        "web_search" => {
+            let q = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("query").and_then(|c| c.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            let preview: String = q.chars().take(60).collect();
+            format!("Searching: {preview}")
+        }
+        other => format!("{other}…"),
+    }
+}
+
+/// Build a short "done" or "failed" outcome line after a tool call.
+fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &str) -> String {
+    if tool_name == "exec" {
+        let failed = exec_report_failed(result);
+        let cmd = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+        let preview: String = cmd.chars().take(60).collect();
+        let ellipsis = if cmd.len() > 60 { "…" } else { "" };
+        if failed {
+            let err = first_failure_summary_line(result)
+                .unwrap_or_else(|| "command failed".to_string());
+            format!("✗ `{preview}{ellipsis}` — {err}")
+        } else {
+            format!("✓ `{preview}{ellipsis}`")
+        }
+    } else {
+        let short: String = result.lines().next().unwrap_or("done").chars().take(60).collect();
+        format!("done — {short}")
     }
 }
 
@@ -779,10 +1314,10 @@ impl AgentLoop {
 
     /// Body as sent on the wire to `channel` (may compact exec output and strip fenced code).
     fn outbound_text_for_channel(&self, channel: &str, stored: &str) -> String {
+        let mut text = strip_reasoning_tags(stored);
         if !is_chat_app_channel(channel) {
-            return stored.to_string();
+            return text;
         }
-        let mut text = stored.to_string();
         if !self.outbound.include_exec_output_in_chat_apps {
             text = compact_exec_output_for_chat(&text);
         }
@@ -1025,9 +1560,19 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
 
         // Build LLM messages
         let media_paths: Vec<String> = msg.media.iter().map(|m| m.path.clone()).collect();
+        let mut user_text = msg.content.clone();
+        if is_autonomous_local_servers_work(&msg.content) {
+            user_text.push_str(AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION);
+        } else if is_multi_step_fix_request(&msg.content) {
+            user_text.push_str(
+                "\n\n[Metis instruction: You listed multiple issues. Complete ALL of them in this turn \
+                 before sending your final reply — use read_file/write_file/edit_file/exec as needed. \
+                 Do not stop after a single diagnostic command like Get-Content.]",
+            );
+        }
         let mut messages = self.context.build_messages(
             &history,
-            &msg.content,
+            &user_text,
             &media_paths,
             &msg.channel,
             &msg.chat_id,
@@ -1039,7 +1584,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // Agent loop: LLM ↔ tool calling
         let mut final_content: Option<String> = None;
         let mut exec_tool_outputs: Vec<String> = Vec::new();
-        let strict_exec_mode = is_execution_or_install_request(&msg.content);
+        let max_exec_calls = max_exec_calls_for_message(&msg.content);
         let mut exec_calls_executed: usize = 0;
 
         for iteration in 0..self.max_iterations {
@@ -1057,9 +1602,25 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
 
             self.log_llm_thinking_json(&msg.channel, &msg.chat_id, &session_key, iteration, &response);
 
+            if llm_response_is_api_error(&response) {
+                final_content = response.content;
+                break;
+            }
+
             if response.has_tool_calls() {
-                // Add assistant message with tool calls
-                let tool_calls: Vec<ToolCall> = response.tool_calls.clone();
+                // Add assistant message with tool calls (sanitize invalid JSON for next API round-trip)
+                let tool_calls = sanitize_tool_calls_for_history(response.tool_calls.clone());
+                // Publish any narration text the model sent alongside the tool calls.
+                if is_chat_app_channel(&msg.channel) {
+                    if let Some(ref text) = response.content {
+                        let stripped = strip_reasoning_tags(text);
+                        let cleaned = fenced_code_block_re().replace_all(&stripped, "").trim().to_string();
+                        if !cleaned.is_empty() {
+                            let narr = OutboundMessage::new(&msg.channel, &msg.chat_id, cleaned);
+                            let _ = self.bus.publish_outbound(narr).await;
+                        }
+                    }
+                }
                 ContextBuilder::add_assistant_message(
                     &mut messages,
                     response.content.clone(),
@@ -1068,23 +1629,49 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
 
                 // Execute each tool call
                 for tc in &tool_calls {
-                    if strict_exec_mode && tc.function.name == "exec" && exec_calls_executed >= 1 {
-                        let result = "Strict exec mode: only one command is executed per request. \
-Please send a follow-up message to run the next command."
-                            .to_string();
+                    if tc.function.name == "exec" && exec_calls_executed >= max_exec_calls {
+                        let result = format!(
+                            "Exec limit reached ({max_exec_calls} commands per request). \
+Run the next command in a follow-up message, or combine steps into one script."
+                        );
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &result);
                         continue;
                     }
-                    let params: HashMap<String, serde_json::Value> =
-                        serde_json::from_str(&tc.function.arguments).unwrap_or_default();
 
-                    info!(
-                        tool = %tc.function.name,
-                        iteration = iteration,
-                        "executing tool call"
-                    );
+                    // Publish a "starting" progress tick for chat channels.
+                    if is_chat_app_channel(&msg.channel) {
+                        let preview = tool_progress_preview(&tc.function.name, &tc.function.arguments);
+                        let tick = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            format!("🛠️ {preview}"),
+                        );
+                        let _ = self.bus.publish_outbound(tick).await;
+                    }
 
-                    let result = self.tools.execute(&tc.function.name, params).await;
+                    let result = match parse_tool_params(&tc.function.arguments) {
+                        Ok(params) => {
+                            info!(
+                                tool = %tc.function.name,
+                                iteration = iteration,
+                                "executing tool call"
+                            );
+                            self.tools.execute(&tc.function.name, params).await
+                        }
+                        Err(e) => format!("Tool argument error for `{}`: {e}", tc.function.name),
+                    };
+
+                    // Publish a "completed / failed" progress tick for chat channels.
+                    if is_chat_app_channel(&msg.channel) {
+                        let outcome = tool_outcome_preview(&tc.function.name, &tc.function.arguments, &result);
+                        let tick = OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            format!("  ↳ {outcome}"),
+                        );
+                        let _ = self.bus.publish_outbound(tick).await;
+                    }
+
                     if tc.function.name == "exec" {
                         exec_calls_executed += 1;
                         exec_tool_outputs.push(result.clone());
@@ -1099,20 +1686,56 @@ Please send a follow-up message to run the next command."
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &result);
                 }
             } else {
+                let content_text = response.content.as_deref().unwrap_or("");
+                // If the model returned a plan/narration with no tool calls on early iterations,
+                // push a continuation prompt and keep looping rather than treating it as the final answer.
+                let is_early = iteration < 3;
+                let is_autonomous = is_autonomous_local_servers_work(&msg.content);
+                if is_early && is_autonomous && response_is_plan_without_tools(content_text) && exec_calls_executed == 0 {
+                    ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    let nudge = "Stop describing what you will do — call the exec or read_file tool RIGHT NOW to start. \
+Do not write any more text until you have called at least one tool.";
+                    messages.push(Message::user(nudge));
+                    continue;
+                }
                 // No tool calls → final answer
                 final_content = response.content;
                 break;
             }
         }
 
-        // If we exhausted iterations without a final answer
+        // If we exhausted iterations without a final answer, build a summary from exec outputs.
         let compact_exec = is_chat_app_channel(&msg.channel);
-        let mut content = reconcile_exec_with_reply(
-            final_content
-                .unwrap_or_else(|| "I've completed processing but have no response to give.".into()),
-            &exec_tool_outputs,
-            compact_exec,
-        );
+        let used_autonomous_summary = final_content.is_none() && !exec_tool_outputs.is_empty();
+        let fallback = if used_autonomous_summary {
+            build_autonomous_summary(&exec_tool_outputs, compact_exec)
+        } else {
+            "I've completed processing but have no response to give.".into()
+        };
+        // Skip the reconcile banner when we already built a structured summary.
+        let mut content = if used_autonomous_summary {
+            fallback
+        } else {
+            reconcile_exec_with_reply(
+                final_content.unwrap_or(fallback),
+                &exec_tool_outputs,
+                compact_exec,
+            )
+        };
+
+        if is_multi_step_fix_request(&msg.content) && exec_calls_executed <= 1 {
+            let lower = content.to_lowercase();
+            let likely_only_diagnostic = lower.contains("get-content")
+                || lower.contains("select-string")
+                || lower.contains("checking");
+            let no_write = !lower.contains("successfully wrote") && !lower.contains("write_file");
+            if likely_only_diagnostic && no_write {
+                content.push_str(
+                    "\n\n⚠ Only a diagnostic step ran (not a full fix yet). \
+Reply **continue** and I will patch Mission Control click handlers and start/check port 5000.",
+                );
+            }
+        }
 
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
         // but never executed a tool call, force a deterministic read_file response.
@@ -1176,6 +1799,8 @@ Please send a follow-up message to run the next command."
             }
             content = hardened;
         }
+
+        content = enforce_truthful_status_reply(content, &exec_tool_outputs, compact_exec);
 
         // Save conversation to session
         self.sessions
@@ -1247,8 +1872,13 @@ Please send a follow-up message to run the next command."
                 &response,
             );
 
+            if llm_response_is_api_error(&response) {
+                final_content = response.content;
+                break;
+            }
+
             if response.has_tool_calls() {
-                let tool_calls: Vec<ToolCall> = response.tool_calls.clone();
+                let tool_calls = sanitize_tool_calls_for_history(response.tool_calls.clone());
                 ContextBuilder::add_assistant_message(
                     &mut messages,
                     response.content.clone(),
@@ -1256,9 +1886,10 @@ Please send a follow-up message to run the next command."
                 );
 
                 for tc in &tool_calls {
-                    let params: HashMap<String, serde_json::Value> =
-                        serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                    let result = self.tools.execute(&tc.function.name, params).await;
+                    let result = match parse_tool_params(&tc.function.arguments) {
+                        Ok(params) => self.tools.execute(&tc.function.name, params).await,
+                        Err(e) => format!("Tool argument error for `{}`: {e}", tc.function.name),
+                    };
                     if tc.function.name == "exec" {
                         exec_tool_outputs.push(result.clone());
                     }
@@ -1416,19 +2047,20 @@ mod tests {
 
     #[test]
     fn test_strip_markdown_fenced_code_blocks() {
-        let s = "Hello\n```rust\nfn main() {}\n```\nBye";
+        // Multi-line code block should be silently removed.
+        let s = "Hello\n```rust\nfn main() {}\nprintln!(\"hi\");\n```\nBye";
         let out = super::strip_markdown_fenced_code_blocks(s);
-        assert!(out.contains("Hello"));
-        assert!(out.contains("Bye"));
-        assert!(out.contains("code omitted"));
-        assert!(!out.contains("fn main"));
+        assert!(out.contains("Hello"), "should keep surrounding text: {out}");
+        assert!(out.contains("Bye"), "should keep surrounding text: {out}");
+        assert!(!out.contains("fn main"), "code should be stripped: {out}");
+        assert!(!out.contains("code block"), "no placeholder noise: {out}");
     }
 
     #[test]
     fn test_strip_fenced_only_placeholder_line() {
-        let out = super::strip_markdown_fenced_code_blocks("```\nx\n```");
-        assert!(out.contains("code omitted"));
-        assert!(!out.contains('x'));
+        // Multi-line block → silently removed (empty result is OK).
+        let out = super::strip_markdown_fenced_code_blocks("```\nline one\nline two\n```");
+        assert!(!out.contains("line one"), "code should be stripped: {out}");
     }
 
     #[test]
@@ -1691,6 +2323,71 @@ Write-Output "hello"
     }
 
     #[test]
+    fn test_exec_report_failed_detects_http_server_fail_on_stdout_exit_zero() {
+        let block = "<<<EXEC_RESULT>>>\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\nHTTP_SERVER_FAIL ERROR=connection refused\n";
+        assert!(super::exec_report_failed(block));
+    }
+
+    #[test]
+    fn test_invoice_start_script_uses_bounded_search() {
+        let ps = build_invoice_processor_start_ps(Path::new(r"C:\ws"), 5000);
+        assert!(!ps.contains("-Path $root -Recurse"));
+        assert!(ps.contains("-Depth 2"));
+    }
+
+    #[test]
+    fn test_exec_report_failed_detects_timeout() {
+        let block = "<<<EXEC_RESULT>>>\nSTATUS: TIMEOUT\nTIMEOUT_SECONDS: 60\n<<<END_EXEC_RESULT>>>";
+        assert!(super::exec_report_failed(block));
+    }
+
+    #[test]
+    fn test_dual_local_servers_detection() {
+        assert!(is_dual_local_servers_request(
+            "again false claim 8080 is running and 5000 not — full stop"
+        ));
+        assert!(is_dual_local_servers_request(
+            "port 8080 mission control not clickable, port 5000 invoice not working"
+        ));
+    }
+
+    #[test]
+    fn test_default_http_server_port_prefers_5000_when_only_5000_mentioned() {
+        assert_eq!(default_http_server_port("start server port 5000 not running"), 5000);
+        assert_eq!(default_http_server_port("fix localhost:8080 and :5000"), 8080);
+    }
+
+    #[test]
+    fn test_local_http_server_start_detection() {
+        assert!(is_local_http_server_start_request("start webserver on localhost:5000"));
+        assert!(is_local_http_server_start_request("run python -m http.server"));
+        assert!(!is_local_http_server_start_request("why is localhost failing"));
+    }
+
+    #[test]
+    fn test_extract_port_from_text() {
+        assert_eq!(extract_port_from_text("open localhost:5000"), Some(5000));
+        assert_eq!(extract_port_from_text("start server on port 8081"), Some(8081));
+        assert_eq!(extract_port_from_text("no port"), None);
+    }
+
+    #[test]
+    fn test_multi_step_fix_detection() {
+        let msg = "port 8080 mission control items not clickable, port 5000 invoice not working";
+        assert!(is_multi_step_fix_request(msg));
+        assert_eq!(max_exec_calls_for_message(msg), 20);
+        assert!(is_autonomous_local_servers_work(
+            "start mission control and invoice — verify localhost:8080 and localhost:5000"
+        ));
+    }
+
+    #[test]
+    fn test_strip_reasoning_tags() {
+        let raw2 = "Hi <think>plan</think> there";
+        assert_eq!(strip_reasoning_tags(raw2), "Hi  there");
+    }
+
+    #[test]
     fn test_compact_exec_output_strips_huge_command() {
         let huge = format!(
             "<<<EXEC_RESULT>>>\nCOMMAND: {}\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\nmore noise",
@@ -1731,7 +2428,7 @@ Write-Output "hello"
     #[test]
     fn test_exec_tool_config_default() {
         let config = ExecToolConfig::default();
-        assert_eq!(config.timeout, 60);
+        assert_eq!(config.timeout, 180);
         assert_eq!(config.permission_mode, "unsafe_only");
     }
 

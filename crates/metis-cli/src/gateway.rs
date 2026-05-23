@@ -195,15 +195,20 @@ pub async fn run() -> Result<()> {
     }
     let cron_jobs = cron_service.list_jobs().await;
 
-    // 9. Create heartbeat service
+    // 9. Create heartbeat service (isolated session `heartbeat:default`; not sent to Telegram)
     let heartbeat = {
         let agent = agent_loop.clone();
         let callback: metis_core::heartbeat::OnHeartbeatFn = Arc::new(move |prompt| {
             let agent = agent.clone();
-            Box::pin(async move { agent.process_direct(&prompt).await })
+            Box::pin(async move {
+                agent
+                    .process_direct_session("heartbeat", "default", &prompt)
+                    .await
+            })
         });
         Arc::new(HeartbeatService::new(
             workspace.clone(),
+            Some(bus.clone()),
             Some(callback),
             None, // default 30 min
             true,

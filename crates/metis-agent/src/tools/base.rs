@@ -75,10 +75,62 @@ pub fn optional_bool(params: &HashMap<String, Value>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse tool-call arguments JSON from the LLM.
+pub fn parse_tool_params(arguments: &str) -> Result<HashMap<String, Value>, String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(HashMap::new());
+    }
+    serde_json::from_str(trimmed)
+        .map_err(|e| format!("Invalid tool arguments JSON: {e}"))
+}
+
+/// Ensure each tool call has valid JSON arguments before sending history back to the LLM API.
+pub fn sanitize_tool_calls_for_history(mut calls: Vec<metis_core::types::ToolCall>) -> Vec<metis_core::types::ToolCall> {
+    for tc in &mut calls {
+        if parse_tool_params(&tc.function.arguments).is_err() {
+            tc.function.arguments = "{}".to_string();
+        }
+    }
+    calls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_tool_params_empty_is_ok() {
+        let p = parse_tool_params("").unwrap();
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_params_invalid_json_errors() {
+        assert!(parse_tool_params("{not json").is_err());
+    }
+
+    #[test]
+    fn sanitize_tool_calls_replaces_bad_arguments() {
+        use metis_core::types::{FunctionCall, ToolCall};
+        let tc = ToolCall {
+            id: "1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "exec".into(),
+                arguments: "not-json".into(),
+            },
+        };
+        let out = sanitize_tool_calls_for_history(vec![tc]);
+        assert_eq!(out[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn parse_tool_params_valid_object() {
+        let p = parse_tool_params(r#"{"command":"echo hi"}"#).unwrap();
+        assert_eq!(p.get("command"), Some(&json!("echo hi")));
+    }
 
     #[test]
     fn test_require_string_present() {

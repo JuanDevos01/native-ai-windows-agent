@@ -21,7 +21,7 @@ use super::base::{optional_string, require_string, Tool};
 const MAX_OUTPUT_LEN: usize = 10_000;
 
 /// Default command timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
 /// Dangerous command patterns that are always blocked.
 const DENY_PATTERNS: &[&str] = &[

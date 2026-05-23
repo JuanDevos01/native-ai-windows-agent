@@ -3,6 +3,9 @@
 //! Replaces nanobot's `bus/queue.py` (asyncio.Queue-based MessageBus).
 //! Uses tokio::sync::mpsc bounded channels.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use super::types::{InboundMessage, OutboundMessage};
 use tokio::sync::mpsc;
 
@@ -16,6 +19,8 @@ pub struct MessageBus {
     inbound_rx: tokio::sync::Mutex<mpsc::Receiver<InboundMessage>>,
     outbound_tx: mpsc::Sender<OutboundMessage>,
     outbound_rx: tokio::sync::Mutex<mpsc::Receiver<OutboundMessage>>,
+    /// Messages published to inbound but not yet consumed by the agent loop.
+    inbound_pending: Arc<AtomicUsize>,
 }
 
 impl MessageBus {
@@ -29,19 +34,31 @@ impl MessageBus {
             inbound_rx: tokio::sync::Mutex::new(inbound_rx),
             outbound_tx,
             outbound_rx: tokio::sync::Mutex::new(outbound_rx),
+            inbound_pending: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Number of inbound messages waiting for the agent loop (approximate).
+    pub fn inbound_pending(&self) -> usize {
+        self.inbound_pending.load(Ordering::Relaxed)
     }
 
     /// Publish a message from a channel to the agent (inbound).
     pub async fn publish_inbound(&self, msg: InboundMessage) -> Result<(), mpsc::error::SendError<InboundMessage>> {
-        self.inbound_tx.send(msg).await
+        self.inbound_tx.send(msg).await?;
+        self.inbound_pending.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Consume the next inbound message (blocks until available).
     /// Returns None if all senders are dropped.
     pub async fn consume_inbound(&self) -> Option<InboundMessage> {
         let mut rx = self.inbound_rx.lock().await;
-        rx.recv().await
+        let msg = rx.recv().await;
+        if msg.is_some() {
+            self.inbound_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+        msg
     }
 
     /// Publish a response from the agent to a channel (outbound).
@@ -158,6 +175,26 @@ mod tests {
         let channels: Vec<&str> = vec![r1.channel.as_str(), r2.channel.as_str()];
         assert!(channels.contains(&"telegram"));
         assert!(channels.contains(&"discord"));
+    }
+
+    #[tokio::test]
+    async fn test_inbound_pending_counter() {
+        let bus = MessageBus::new(10);
+        assert_eq!(bus.inbound_pending(), 0);
+
+        bus.publish_inbound(InboundMessage::new("telegram", "u", "c", "one"))
+            .await
+            .unwrap();
+        bus.publish_inbound(InboundMessage::new("telegram", "u", "c", "two"))
+            .await
+            .unwrap();
+        assert_eq!(bus.inbound_pending(), 2);
+
+        let _ = bus.consume_inbound().await.unwrap();
+        assert_eq!(bus.inbound_pending(), 1);
+
+        let _ = bus.consume_inbound().await.unwrap();
+        assert_eq!(bus.inbound_pending(), 0);
     }
 
     #[tokio::test]
