@@ -469,6 +469,108 @@ If the script has a bug/typo: use read_file to read it first, then edit_file to 
 On Traceback from a previous run: read the script, find the error, fix it, then restart. \
 NEVER run a long-running process without Start-Process. Start with port checks NOW.]";
 
+// ─────────────────────────────────────────────
+// Blocking-server command rewriter
+// ─────────────────────────────────────────────
+
+/// Pattern: the model calls `python script.py` or `node app.js` directly (blocks forever).
+/// Detects this and rewrites to a `Start-Process` + health-check form on Windows.
+#[cfg(target_os = "windows")]
+fn wrap_blocking_server_command_windows(cmd: &str) -> Option<String> {
+    let lower = cmd.trim().to_lowercase();
+
+    // Only rewrite on Windows (cfg guard + runtime check).
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+
+    // Must look like a Python or Node direct run.
+    let is_python_run = (lower.contains("python ") || lower.contains("python3 ") || lower.contains("py "))
+        && lower.ends_with(".py")
+        && !lower.contains("pip")
+        && !lower.contains("--version")
+        && !lower.contains("-m venv")
+        && !lower.contains("-m pytest")
+        && !lower.contains("-m http.server")
+        && !lower.contains("start-process");
+
+    let is_node_run = lower.contains("node ") && lower.ends_with(".js") && !lower.contains("npm") && !lower.contains("start-process");
+
+    let is_php_serve = lower.contains("php artisan serve") || lower.contains("php -S ");
+
+    if !is_python_run && !is_node_run && !is_php_serve {
+        return None;
+    }
+
+    // Extract optional `cd <dir>;` prefix as the working directory.
+    let (work_dir, bare_cmd) = if let Some(rest) = lower.strip_prefix("cd ") {
+        // Find the semicolon separating `cd path` from the actual command.
+        if let Some(semi) = rest.find(';') {
+            let raw_wd = cmd[3..3 + semi].trim().trim_matches('"').trim_matches('\'');
+            let remaining = cmd[3 + semi + 1..].trim();
+            (Some(raw_wd.to_string()), remaining.to_string())
+        } else {
+            (None, cmd.to_string())
+        }
+    } else {
+        (None, cmd.to_string())
+    };
+
+    // Split into executable + arguments (simple split on first space after exe).
+    let (exe, args) = {
+        let parts: Vec<&str> = bare_cmd.splitn(2, ' ').collect();
+        if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].trim().to_string())
+        } else {
+            (bare_cmd.clone(), String::new())
+        }
+    };
+
+    let wd_clause = work_dir
+        .as_deref()
+        .map(|w| {
+            let escaped = w.replace('\'', "''");
+            format!(" -WorkingDirectory '{escaped}'")
+        })
+        .unwrap_or_default();
+
+    let args_clause = if args.is_empty() {
+        String::new()
+    } else {
+        let escaped = args.replace('\'', "''");
+        format!(" -ArgumentList '{escaped}'")
+    };
+
+    // Build Start-Process command + 2-second wait + check if still alive.
+    let wrapped = format!(
+        "$__sp = Start-Process -FilePath '{exe}'{args_clause}{wd_clause} -PassThru -WindowStyle Hidden; \
+Start-Sleep -Seconds 2; \
+if ($__sp.HasExited) {{ \
+  Write-Host \"PROCESS_EXITED_EARLY exit=$($__sp.ExitCode) cmd={bare_cmd}\"; \
+  {log_tail} \
+}} else {{ \
+  Write-Host \"PROCESS_RUNNING PID=$($__sp.Id) cmd={bare_cmd}\" \
+}}",
+        log_tail = work_dir
+            .as_deref()
+            .map(|w| {
+                let escaped = w.replace('\'', "''");
+                format!(
+                    "Get-ChildItem -Path '{escaped}' -Filter '*.log' -ErrorAction SilentlyContinue | \
+ForEach-Object {{ Get-Content $_.FullName -Tail 20 -ErrorAction SilentlyContinue }}"
+                )
+            })
+            .unwrap_or_else(|| "# no working dir for log tail".to_string()),
+    );
+
+    Some(wrapped)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wrap_blocking_server_command_windows(_cmd: &str) -> Option<String> {
+    None
+}
+
 /// True when an LLM response looks like a plan/narration with no real tool execution.
 /// Used to inject a "stop planning, execute now" continuation.
 fn response_is_plan_without_tools(content: &str) -> bool {
@@ -1562,6 +1664,11 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let media_paths: Vec<String> = msg.media.iter().map(|m| m.path.clone()).collect();
         let mut user_text = msg.content.clone();
         if is_autonomous_local_servers_work(&msg.content) {
+            // Prepend any relevant memory notes so the agent remembers previous findings.
+            let memory_hint = self.context.memory().get_memory_context()
+                .map(|m| format!("\n\n[Memory from previous sessions — read this before acting:\n{m}\n]"))
+                .unwrap_or_default();
+            user_text.push_str(&memory_hint);
             user_text.push_str(AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION);
         } else if is_multi_step_fix_request(&msg.content) {
             user_text.push_str(
@@ -1650,7 +1757,20 @@ Run the next command in a follow-up message, or combine steps into one script."
                     }
 
                     let result = match parse_tool_params(&tc.function.arguments) {
-                        Ok(params) => {
+                        Ok(mut params) => {
+                            // Intercept blocking server commands and rewrite to Start-Process.
+                            // Models routinely ignore prompt instructions about this; enforce deterministically.
+                            if tc.function.name == "exec" {
+                                if let Some(serde_json::Value::String(cmd)) = params.get("command") {
+                                    if let Some(wrapped) = wrap_blocking_server_command_windows(cmd) {
+                                        info!(original = %cmd, "rewrote blocking server cmd to Start-Process");
+                                        params.insert(
+                                            "command".to_string(),
+                                            serde_json::Value::String(wrapped),
+                                        );
+                                    }
+                                }
+                            }
                             info!(
                                 tool = %tc.function.name,
                                 iteration = iteration,
@@ -2333,6 +2453,29 @@ Write-Output "hello"
         let ps = build_invoice_processor_start_ps(Path::new(r"C:\ws"), 5000);
         assert!(!ps.contains("-Path $root -Recurse"));
         assert!(ps.contains("-Depth 2"));
+    }
+
+    #[test]
+    fn test_wrap_blocking_server_command_rewrites_python() {
+        let cmd = r"cd C:\Users\chack\.metis\workspace\email-app; python invoice_processor.py";
+        let result = wrap_blocking_server_command_windows(cmd);
+        assert!(result.is_some(), "should rewrite blocking python server");
+        let wrapped = result.unwrap();
+        assert!(wrapped.contains("Start-Process"), "should use Start-Process: {wrapped}");
+        assert!(!wrapped.ends_with(".py"), "should not end with raw script: {wrapped}");
+        assert!(wrapped.contains("email-app"), "should preserve working dir: {wrapped}");
+    }
+
+    #[test]
+    fn test_wrap_blocking_server_skips_pip() {
+        let cmd = "pip install flask";
+        assert!(wrap_blocking_server_command_windows(cmd).is_none());
+    }
+
+    #[test]
+    fn test_wrap_blocking_server_skips_http_server() {
+        let cmd = "python -m http.server 8080";
+        assert!(wrap_blocking_server_command_windows(cmd).is_none());
     }
 
     #[test]
