@@ -114,11 +114,34 @@ fn exec_process_output_tail(block: &str) -> &str {
 }
 
 /// PowerShell fast-path scripts often exit 0 while printing failure markers on stdout.
+/// PowerShell fast-path scripts often exit 0 while printing failure markers on stdout.
+/// Also catches explicit network-error text, but ONLY for HTTP-check commands (not file reads).
 fn exec_output_indicates_failure(tail: &str) -> bool {
     let lower = tail.to_lowercase();
-    lower.contains("http_server_fail")
-        || lower.contains("invoice_server_fail")
-        || lower.contains("unable to connect")
+    // Custom sentinel markers emitted by our own PowerShell scripts — always meaningful.
+    if lower.contains("http_server_fail") || lower.contains("invoice_server_fail") {
+        return true;
+    }
+    false
+}
+
+/// Like `exec_output_indicates_failure` but additionally checks for network errors when
+/// the command was clearly an HTTP/web-request invocation.
+fn exec_output_indicates_network_failure(command: &str, tail: &str) -> bool {
+    if exec_output_indicates_failure(tail) {
+        return true;
+    }
+    // Only apply generic network-error heuristics when the command was a web request.
+    let cmd_lower = command.to_lowercase();
+    let is_web_request = cmd_lower.contains("invoke-webrequest")
+        || cmd_lower.contains("invoke-restmethod")
+        || cmd_lower.contains("curl ")
+        || cmd_lower.contains("wget ");
+    if !is_web_request {
+        return false;
+    }
+    let lower = tail.to_lowercase();
+    lower.contains("unable to connect")
         || lower.contains("connection refused")
         || lower.contains("actively refused")
         || lower.contains("operation has timed out")
@@ -134,7 +157,13 @@ pub fn exec_report_failed(block: &str) -> bool {
     if parse_exec_exit_code(block).is_some_and(|c| c != 0) {
         return true;
     }
-    exec_output_indicates_failure(exec_process_output_tail(block))
+    // Extract the command from the block header so network-error heuristics are only
+    // applied when the command was actually an HTTP/web-request call.
+    let command = block
+        .lines()
+        .find_map(|l| l.strip_prefix("COMMAND: "))
+        .unwrap_or("");
+    exec_output_indicates_network_failure(command, exec_process_output_tail(block))
 }
 
 fn first_stderr_summary_line(block: &str) -> Option<String> {
@@ -472,6 +501,34 @@ NEVER run a long-running process without Start-Process. Start with port checks N
 // ─────────────────────────────────────────────
 // Blocking-server command rewriter
 // ─────────────────────────────────────────────
+
+/// Strip a `| Select-String -Pattern ...` suffix from `Get-Content <file> | Select-String ...`
+/// commands. The model uses this to "grep" source files, but it produces partial output that
+/// our failure detector misreads. Returning the plain `Get-Content <file>` gives the LLM the
+/// full file so it can actually diagnose the issue.
+fn strip_get_content_select_string(cmd: &str) -> Option<String> {
+    let lower = cmd.to_lowercase();
+    // Must be a Get-Content piped to Select-String (or sls alias).
+    if !lower.contains("get-content") && !lower.contains("gc ") {
+        return None;
+    }
+    if !lower.contains("select-string") && !lower.contains("| sls ") {
+        return None;
+    }
+    // Extract the file path: text between Get-Content / gc and the first |
+    let start = lower
+        .find("get-content")
+        .map(|i| i + "get-content".len())
+        .or_else(|| lower.find("gc ").map(|i| i + 3))?;
+    let pipe_pos = cmd[start..].find('|').map(|i| i + start)?;
+    let file_part = cmd[start..pipe_pos].trim().trim_matches('"').trim_matches('\'');
+    if file_part.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Get-Content \"{file_part}\"\n# [Metis: rewrote Get-Content|Select-String to full file read; use the read_file tool for code files next time]"
+    ))
+}
 
 /// Pattern: the model calls `python script.py` or `node app.js` directly (blocks forever).
 /// Detects this and rewrites to a `Start-Process` + health-check form on Windows.
@@ -1988,6 +2045,15 @@ Run the next command in a follow-up message, or combine steps into one script."
                                         params.insert(
                                             "command".to_string(),
                                             serde_json::Value::String(wrapped),
+                                        );
+                                    } else if let Some(stripped) = strip_get_content_select_string(cmd) {
+                                        // Get-Content | Select-String is wrong for reading code files —
+                                        // it produces grep output that our failure detector mis-reads.
+                                        // Rewrite to plain Get-Content so the LLM gets the full file.
+                                        info!(original = %cmd, "rewrote Get-Content|Select-String to plain Get-Content");
+                                        params.insert(
+                                            "command".to_string(),
+                                            serde_json::Value::String(stripped),
                                         );
                                     }
                                 }
