@@ -571,6 +571,227 @@ fn wrap_blocking_server_command_windows(_cmd: &str) -> Option<String> {
     None
 }
 
+// ─────────────────────────────────────────────
+// Exec failure analysis & hint injection
+// ─────────────────────────────────────────────
+
+/// Recognised root-cause categories from exec output.
+#[derive(Debug)]
+enum ExecFailureKind {
+    MissingModule(String),
+    SyntaxError { file: Option<String>, line: Option<String> },
+    PortInUse(u16),
+    FileNotFound(String),
+    AccessDenied,
+    ProcessExitedEarly { exit_code: Option<String>, snippet: String },
+    Unknown,
+}
+
+/// Parse exec output into a structured failure reason.
+fn parse_exec_failure(output: &str) -> Option<ExecFailureKind> {
+    // PROCESS_EXITED_EARLY — produced by our Start-Process rewriter.
+    if let Some(pos) = output.find("PROCESS_EXITED_EARLY") {
+        let tail = &output[pos..];
+        let exit_code = tail
+            .split_whitespace()
+            .find(|w| w.starts_with("exit="))
+            .map(|w| w.trim_start_matches("exit=").to_string());
+
+        // Try to pick up the Python traceback or error line from the log tail.
+        let snippet = extract_error_snippet(output).unwrap_or_default();
+        return Some(ExecFailureKind::ProcessExitedEarly { exit_code, snippet });
+    }
+
+    // Python / pip module errors.
+    if let Some(pos) = output.find("ModuleNotFoundError: No module named") {
+        let rest = &output[pos + "ModuleNotFoundError: No module named".len()..];
+        let module = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '\'' || c == '"' || c == ';')
+            .to_string();
+        return Some(ExecFailureKind::MissingModule(module));
+    }
+    if let Some(pos) = output.find("ImportError: No module named") {
+        let rest = &output[pos + "ImportError: No module named".len()..];
+        let module = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '\'' || c == '"' || c == ';')
+            .to_string();
+        return Some(ExecFailureKind::MissingModule(module));
+    }
+
+    // SyntaxError with optional file/line info.
+    if output.contains("SyntaxError:") {
+        let file = output.lines().find_map(|l| {
+            let t = l.trim();
+            if t.starts_with("File \"") {
+                t.strip_prefix("File \"")
+                    .and_then(|s| s.split('"').next())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
+        let line = output.lines().find_map(|l| {
+            let t = l.trim();
+            if t.starts_with("line ") {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        });
+        return Some(ExecFailureKind::SyntaxError { file, line });
+    }
+
+    // Port already bound.
+    if output.contains("Only one usage of each socket address")
+        || output.contains("address already in use")
+        || output.contains("WSAEADDRINUSE")
+        || output.contains("10048")
+    {
+        // Try to extract port number from message.
+        let port = output
+            .split(':')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .next()
+            .unwrap_or(0);
+        return Some(ExecFailureKind::PortInUse(port));
+    }
+
+    // File / path not found.
+    if output.contains("FileNotFoundError:")
+        || output.contains("No such file or directory")
+        || (output.contains("cannot find") && output.contains("path"))
+    {
+        let snippet = extract_error_snippet(output).unwrap_or_default();
+        return Some(ExecFailureKind::FileNotFound(snippet));
+    }
+
+    // Windows access denied.
+    if output.contains("Access is denied") || output.contains("PermissionError:") {
+        return Some(ExecFailureKind::AccessDenied);
+    }
+
+    None
+}
+
+/// Extract the most informative error line from multi-line exec output.
+fn extract_error_snippet(output: &str) -> Option<String> {
+    // Look for the last "Error:" line first (most specific).
+    for line in output.lines().rev() {
+        let t = line.trim();
+        if t.contains("Error:") || t.contains("Exception:") || t.contains("Traceback") {
+            return Some(t.chars().take(200).collect());
+        }
+    }
+    // Fallback: last non-empty line.
+    output.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string())
+}
+
+/// Append a `[Metis hint: ...]` block to an exec result when a known failure is found.
+/// This gives the LLM a concrete remediation action for the next iteration.
+fn annotate_exec_result_with_hint(result: &str) -> String {
+    match parse_exec_failure(result) {
+        Some(ExecFailureKind::MissingModule(ref module)) if !module.is_empty() => {
+            let pip_name = pip_package_name(module);
+            format!(
+                "{result}\n\n[Metis hint: ❌ Missing Python module '{module}'. \
+Fix: call exec with `pip install {pip_name}` IMMEDIATELY, then retry Start-Process for the server. \
+Do NOT ask the user — just run pip install now.]"
+            )
+        }
+        Some(ExecFailureKind::MissingModule(_)) => {
+            // Empty module name — generic pip hint.
+            format!(
+                "{result}\n\n[Metis hint: ❌ Missing Python module detected. \
+Run pip install <module_name> then retry Start-Process.]"
+            )
+        }
+        Some(ExecFailureKind::SyntaxError { file: Some(ref f), line: ref ln }) => {
+            let line_info = ln.as_deref().map(|l| format!(", {l}")).unwrap_or_default();
+            format!(
+                "{result}\n\n[Metis hint: ❌ Python SyntaxError in `{f}`{line_info}. \
+Fix: call read_file on `{f}`, identify the syntax problem, call edit_file to fix it, then retry Start-Process. \
+Do NOT ask the user — just read and fix the file now.]"
+            )
+        }
+        Some(ExecFailureKind::SyntaxError { file: None, .. }) => {
+            format!(
+                "{result}\n\n[Metis hint: ❌ Python SyntaxError detected. \
+Find the script file with exec (dir / Get-ChildItem), read it with read_file, fix the syntax error with edit_file, then retry Start-Process.]"
+            )
+        }
+        Some(ExecFailureKind::PortInUse(port)) => {
+            let port_str = if port > 0 { format!("{port}") } else { "<port>".to_string() };
+            format!(
+                "{result}\n\n[Metis hint: ❌ Port {port_str} is already in use. \
+Fix: run exec `Get-NetTCPConnection -LocalPort {port_str} -State Listen | Select-Object -ExpandProperty OwningProcess | \
+ForEach-Object {{ Stop-Process -Id $_ -Force }}` to free the port, then retry Start-Process.]"
+            )
+        }
+        Some(ExecFailureKind::FileNotFound(ref snippet)) => {
+            format!(
+                "{result}\n\n[Metis hint: ❌ File/path not found{info}. \
+Fix: use exec to list the workspace directory (Get-ChildItem -Recurse -Depth 2) and find the correct path, \
+then retry with the right path.{info2}]",
+                info = if snippet.is_empty() { String::new() } else { format!(": {snippet}") },
+                info2 = if snippet.is_empty() { String::new() } else { String::new() },
+            )
+        }
+        Some(ExecFailureKind::AccessDenied) => {
+            format!(
+                "{result}\n\n[Metis hint: ❌ Access denied. \
+The target file or process is locked. If it's a running process, kill it first with Stop-Process, then retry.]"
+            )
+        }
+        Some(ExecFailureKind::ProcessExitedEarly { ref exit_code, ref snippet }) => {
+            let exit_info = exit_code.as_deref().map(|c| format!(" (exit {c})")).unwrap_or_default();
+            let err_info = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(" Error: {snippet}")
+            };
+            format!(
+                "{result}\n\n[Metis hint: ❌ Process exited immediately{exit_info}.{err_info} \
+Diagnose: (1) read the log files in the working directory, \
+(2) check for ModuleNotFoundError / SyntaxError in the output above, \
+(3) fix with pip install or edit_file, (4) retry Start-Process. \
+Do NOT inform the user yet — keep debugging.]"
+            )
+        }
+        Some(ExecFailureKind::Unknown) | None => result.to_string(),
+    }
+}
+
+/// Map common Python import names to their pip package names where they differ.
+fn pip_package_name(module: &str) -> &str {
+    match module {
+        "flask" | "Flask" => "flask",
+        "requests" => "requests",
+        "dotenv" | "dotenv_values" => "python-dotenv",
+        "PIL" => "Pillow",
+        "cv2" => "opencv-python",
+        "sklearn" => "scikit-learn",
+        "bs4" => "beautifulsoup4",
+        "yaml" | "ruamel" => "pyyaml",
+        "jwt" => "PyJWT",
+        "psycopg2" => "psycopg2-binary",
+        "MySQLdb" => "mysqlclient",
+        "pymongo" => "pymongo",
+        "redis" => "redis",
+        "celery" => "celery",
+        "boto3" => "boto3",
+        "google.cloud" => "google-cloud",
+        "openai" => "openai",
+        "anthropic" => "anthropic",
+        other => other,
+    }
+}
+
 /// True when an LLM response looks like a plan/narration with no real tool execution.
 /// Used to inject a "stop planning, execute now" continuation.
 fn response_is_plan_without_tools(content: &str) -> bool {
@@ -1803,7 +2024,47 @@ Run the next command in a follow-up message, or combine steps into one script."
                         "tool result"
                     );
 
-                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &result);
+                    // Annotate exec results with an actionable hint when a known failure is detected.
+                    // Also: for MissingModule, auto-inject a pip install exec immediately.
+                    let annotated_result = if tc.function.name == "exec" {
+                        annotate_exec_result_with_hint(&result)
+                    } else {
+                        result.clone()
+                    };
+                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &annotated_result);
+
+                    // Auto-fix: MissingModule → immediately run pip install without waiting for LLM.
+                    // This fires as a synthetic tool result that the LLM sees on the next iteration.
+                    if tc.function.name == "exec" {
+                        if let Some(ExecFailureKind::MissingModule(ref module)) = parse_exec_failure(&result) {
+                            if !module.is_empty() {
+                                let pip_name = pip_package_name(module).to_string();
+                                let pip_cmd = format!("pip install {pip_name}");
+                                info!(module = %module, pip = %pip_cmd, "auto-running pip install for missing module");
+                                let pip_params = {
+                                    let mut m = std::collections::HashMap::new();
+                                    m.insert("command".to_string(), serde_json::Value::String(pip_cmd.clone()));
+                                    m
+                                };
+                                let pip_result = self.tools.execute("exec", pip_params).await;
+                                exec_calls_executed += 1;
+                                exec_tool_outputs.push(pip_result.clone());
+                                // Inject as a synthetic tool call + result so the LLM knows it happened.
+                                let synthetic_id = format!("auto_pip_{}", tc.id);
+                                let pip_success = !pip_result.contains("ERROR") && !pip_result.contains("error:");
+                                let pip_note = if pip_success {
+                                    format!(
+                                        "✅ Auto-installed `{pip_name}` via pip. Now retry Start-Process for the server."
+                                    )
+                                } else {
+                                    format!(
+                                        "❌ pip install {pip_name} failed. Output:\n{pip_result}\nCheck pip availability or try a different package name."
+                                    )
+                                };
+                                ContextBuilder::add_tool_result(&mut messages, &synthetic_id, &format!("exec(`{pip_cmd}`):\n{pip_result}\n\n[Metis auto-fix result: {pip_note}]"));
+                            }
+                        }
+                    }
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
@@ -2476,6 +2737,60 @@ Write-Output "hello"
     fn test_wrap_blocking_server_skips_http_server() {
         let cmd = "python -m http.server 8080";
         assert!(wrap_blocking_server_command_windows(cmd).is_none());
+    }
+
+    #[test]
+    fn test_parse_exec_failure_missing_module() {
+        let out = "Traceback (most recent call last):\n  File \"app.py\", line 1\nModuleNotFoundError: No module named 'flask'";
+        match parse_exec_failure(out) {
+            Some(ExecFailureKind::MissingModule(m)) => assert_eq!(m, "flask"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_exec_failure_syntax_error() {
+        let out = "  File \"invoice_processor.py\", line 42\nSyntaxError: invalid syntax";
+        match parse_exec_failure(out) {
+            Some(ExecFailureKind::SyntaxError { file: Some(f), .. }) => {
+                assert!(f.contains("invoice_processor.py"), "got: {f}")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_exec_failure_port_in_use() {
+        let out = "OSError: [WinError 10048] Only one usage of each socket address is normally permitted: ('0.0.0.0', 5000)";
+        match parse_exec_failure(out) {
+            Some(ExecFailureKind::PortInUse(_)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_annotate_exec_hint_pip_install() {
+        let out = "ModuleNotFoundError: No module named 'requests'";
+        let annotated = annotate_exec_result_with_hint(out);
+        assert!(annotated.contains("pip install requests"), "got: {annotated}");
+        assert!(annotated.contains("Metis hint"), "got: {annotated}");
+    }
+
+    #[test]
+    fn test_annotate_exec_hint_process_exited_early() {
+        let out = "PROCESS_EXITED_EARLY exit=1 cmd=python app.py";
+        let annotated = annotate_exec_result_with_hint(out);
+        assert!(annotated.contains("Metis hint"), "got: {annotated}");
+        assert!(annotated.contains("exited immediately"), "got: {annotated}");
+    }
+
+    #[test]
+    fn test_pip_package_name_known_aliases() {
+        assert_eq!(pip_package_name("PIL"), "Pillow");
+        assert_eq!(pip_package_name("dotenv"), "python-dotenv");
+        assert_eq!(pip_package_name("bs4"), "beautifulsoup4");
+        assert_eq!(pip_package_name("cv2"), "opencv-python");
+        assert_eq!(pip_package_name("unknown_pkg"), "unknown_pkg");
     }
 
     #[test]
