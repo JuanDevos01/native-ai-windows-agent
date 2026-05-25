@@ -464,16 +464,16 @@ fn is_multi_step_fix_request(input: &str) -> bool {
 /// Local dev servers (Mission Control :8080, invoice :5000) — agent must debug iteratively, not one script.
 fn is_autonomous_local_servers_work(input: &str) -> bool {
     let lower = input.to_lowercase();
-    let mentions = lower.contains("8080")
+
+    // Server/port task keywords — original set.
+    let mentions_server = lower.contains("8080")
         || lower.contains("5000")
         || lower.contains("localhost")
         || lower.contains("mission control")
         || lower.contains("mission-control")
         || lower.contains("invoice");
-    if !mentions {
-        return false;
-    }
-    lower.contains("start")
+
+    let action_verb = lower.contains("start")
         || lower.contains("verify")
         || lower.contains("fix")
         || lower.contains("debug")
@@ -482,7 +482,32 @@ fn is_autonomous_local_servers_work(input: &str) -> bool {
         || lower.contains("timeout")
         || lower.contains("why")
         || lower.contains("solution")
-        || lower.contains("running")
+        || lower.contains("running");
+
+    if mentions_server && action_verb {
+        return true;
+    }
+
+    // Also treat any multi-step debugging / fixing request as autonomous.
+    let is_fix_request = (lower.contains("fix") || lower.contains("install") || lower.contains("debug"))
+        && (lower.contains("python") || lower.contains("pip") || lower.contains("script")
+            || lower.contains("server") || lower.contains("error") || lower.contains("fail"));
+
+    // Short follow-up queries from a user mid-task ("and now?", "continue", "try again", "what now")
+    let is_continuation = lower == "and now?"
+        || lower == "continue"
+        || lower == "try again"
+        || lower == "what now"
+        || lower == "keep going"
+        || lower == "go ahead"
+        || lower.starts_with("and now")
+        || lower.starts_with("now what")
+        || lower.starts_with("what next")
+        || lower.starts_with("next step")
+        || lower.starts_with("please continue")
+        || lower.starts_with("keep going");
+
+    is_fix_request || is_continuation
 }
 
 const AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION: &str = "\n\n[Metis instruction: Autonomous local-server task. \
@@ -846,6 +871,70 @@ fn pip_package_name(module: &str) -> &str {
         "openai" => "openai",
         "anthropic" => "anthropic",
         other => other,
+    }
+}
+
+// ─────────────────────────────────────────────
+// Persistence / unresolved-failure helpers
+// ─────────────────────────────────────────────
+
+/// True when the most recent exec output still shows an unresolved failure.
+/// Used to force the agent to keep working rather than stopping mid-task.
+fn has_unresolved_exec_failures(outputs: &[String]) -> bool {
+    // Walk backwards: find the last exec that was NOT an auto-pip result injected by us.
+    // If the very last exec succeeded (exit 0, no failure marker), the task may be done.
+    let meaningful: Vec<&String> = outputs
+        .iter()
+        .filter(|o| !o.contains("auto-pip") && !o.starts_with("exec(`pip install"))
+        .collect();
+
+    let last = match meaningful.last() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    exec_report_failed(last)
+}
+
+/// Build a short human-readable description of the last unresolved failure.
+fn last_exec_failure_hint(outputs: &[String]) -> String {
+    let meaningful: Vec<&String> = outputs
+        .iter()
+        .filter(|o| !o.contains("auto-pip") && !o.starts_with("exec(`pip install"))
+        .collect();
+
+    let last = match meaningful.last() {
+        Some(o) => o,
+        None => return "the last command failed".to_string(),
+    };
+
+    // Try to extract a useful error description.
+    match parse_exec_failure(last) {
+        Some(ExecFailureKind::MissingModule(ref m)) if !m.is_empty() => {
+            format!("Python module '{m}' is still missing — run pip install and retry")
+        }
+        Some(ExecFailureKind::SyntaxError { file: Some(ref f), .. }) => {
+            format!("SyntaxError in '{f}' is still not fixed — read_file then edit_file")
+        }
+        Some(ExecFailureKind::PortInUse(p)) => {
+            format!("port {p} is still occupied — kill the process then retry Start-Process")
+        }
+        Some(ExecFailureKind::ProcessExitedEarly { ref snippet, .. }) => {
+            if snippet.is_empty() {
+                "the server process exited immediately — check logs and fix the error".to_string()
+            } else {
+                format!("the server crashed: {snippet} — diagnose and fix")
+            }
+        }
+        Some(ExecFailureKind::FileNotFound(ref s)) => {
+            format!("file/path not found ({s}) — locate the correct path and retry")
+        }
+        _ => {
+            // Pull the first failure-looking line from the output.
+            first_failure_summary_line(last)
+                .map(|s| format!("the last command failed: {s}"))
+                .unwrap_or_else(|| "the last command failed — diagnose and continue".to_string())
+        }
     }
 }
 
@@ -2134,18 +2223,36 @@ Run the next command in a follow-up message, or combine steps into one script."
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
-                // If the model returned a plan/narration with no tool calls on early iterations,
-                // push a continuation prompt and keep looping rather than treating it as the final answer.
-                let is_early = iteration < 3;
                 let is_autonomous = is_autonomous_local_servers_work(&msg.content);
-                if is_early && is_autonomous && response_is_plan_without_tools(content_text) && exec_calls_executed == 0 {
+                let remaining_exec_budget = exec_calls_executed < max_exec_calls;
+
+                // Case 1: early iteration, no tools called yet, LLM is just narrating a plan.
+                let is_early = iteration < 3;
+                let is_idle_plan = is_early && exec_calls_executed == 0 && response_is_plan_without_tools(content_text);
+
+                // Case 2: last exec(s) had unresolved failures — keep the agent working
+                // rather than letting it give a "here's what happened" summary and stop.
+                let still_failing = is_autonomous
+                    && remaining_exec_budget
+                    && has_unresolved_exec_failures(&exec_tool_outputs);
+
+                if is_autonomous && (is_idle_plan || still_failing) {
                     ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
-                    let nudge = "Stop describing what you will do — call the exec or read_file tool RIGHT NOW to start. \
-Do not write any more text until you have called at least one tool.";
-                    messages.push(Message::user(nudge));
+                    let nudge = if still_failing {
+                        let hint = last_exec_failure_hint(&exec_tool_outputs);
+                        format!(
+                            "The task is NOT done yet — {hint}. \
+Do NOT stop or summarise. Call the next tool RIGHT NOW to fix it. \
+Keep calling tools until the problem is resolved or you have exhausted all options."
+                        )
+                    } else {
+                        "Stop describing what you will do — call the exec or read_file tool RIGHT NOW to start. \
+Do not write any more text until you have called at least one tool.".to_string()
+                    };
+                    messages.push(Message::user(&nudge));
                     continue;
                 }
-                // No tool calls → final answer
+                // No tool calls and task is either done or non-autonomous → final answer
                 final_content = response.content;
                 break;
             }
