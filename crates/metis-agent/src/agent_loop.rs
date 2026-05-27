@@ -557,18 +557,37 @@ fn strip_get_content_select_string(cmd: &str) -> Option<String> {
 
 /// Pattern: the model calls `python script.py` or `node app.js` directly (blocks forever).
 /// Detects this and rewrites to a `Start-Process` + health-check form on Windows.
+///
+/// Only rewrites when the command is **purely** a server launch — optionally preceded by a
+/// single `cd <dir>` statement. Multi-program scripts (taskkill; cd; python ...) are left
+/// untouched so we don't accidentally wrap the wrong executable.
 #[cfg(target_os = "windows")]
 fn wrap_blocking_server_command_windows(cmd: &str) -> Option<String> {
     let lower = cmd.trim().to_lowercase();
 
-    // Only rewrite on Windows (cfg guard + runtime check).
-    if !cfg!(target_os = "windows") {
-        return None;
-    }
+    // Split on `;` and filter blank/whitespace parts.
+    let parts: Vec<&str> = cmd
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Only accept 1-part or 2-part (cd + python) patterns.
+    // More parts means it's a complex script — don't rewrite.
+    let (work_dir_raw, server_cmd_raw): (Option<&str>, &str) = match parts.as_slice() {
+        [only] => (None, only),
+        [first, second] if first.to_lowercase().starts_with("cd ") => {
+            let wd = first["cd ".len()..].trim().trim_matches('"').trim_matches('\'');
+            (Some(wd), second)
+        }
+        _ => return None, // 3+ parts → complex script, leave as-is
+    };
+
+    let server_lower = server_cmd_raw.to_lowercase();
 
     // Must look like a Python or Node direct run.
-    let is_python_run = (lower.contains("python ") || lower.contains("python3 ") || lower.contains("py "))
-        && lower.ends_with(".py")
+    let is_python_run = (server_lower.starts_with("python ") || server_lower.starts_with("python3 ") || server_lower.starts_with("py "))
+        && server_lower.ends_with(".py")
         && !lower.contains("pip")
         && !lower.contains("--version")
         && !lower.contains("-m venv")
@@ -576,27 +595,20 @@ fn wrap_blocking_server_command_windows(cmd: &str) -> Option<String> {
         && !lower.contains("-m http.server")
         && !lower.contains("start-process");
 
-    let is_node_run = lower.contains("node ") && lower.ends_with(".js") && !lower.contains("npm") && !lower.contains("start-process");
+    let is_node_run = server_lower.starts_with("node ")
+        && server_lower.ends_with(".js")
+        && !lower.contains("npm")
+        && !lower.contains("start-process");
 
-    let is_php_serve = lower.contains("php artisan serve") || lower.contains("php -S ");
+    let is_php_serve = server_lower.contains("php artisan serve") || server_lower.contains("php -s ");
 
     if !is_python_run && !is_node_run && !is_php_serve {
         return None;
     }
 
-    // Extract optional `cd <dir>;` prefix as the working directory.
-    let (work_dir, bare_cmd) = if let Some(rest) = lower.strip_prefix("cd ") {
-        // Find the semicolon separating `cd path` from the actual command.
-        if let Some(semi) = rest.find(';') {
-            let raw_wd = cmd[3..3 + semi].trim().trim_matches('"').trim_matches('\'');
-            let remaining = cmd[3 + semi + 1..].trim();
-            (Some(raw_wd.to_string()), remaining.to_string())
-        } else {
-            (None, cmd.to_string())
-        }
-    } else {
-        (None, cmd.to_string())
-    };
+    // Use the working directory from the `cd` prefix if present, otherwise none.
+    let work_dir = work_dir_raw.map(String::from);
+    let bare_cmd = server_cmd_raw.to_string();
 
     // Split into executable + arguments (simple split on first space after exe).
     let (exe, args) = {
@@ -666,11 +678,40 @@ enum ExecFailureKind {
     FileNotFound(String),
     AccessDenied,
     ProcessExitedEarly { exit_code: Option<String>, snippet: String },
+    SqliteSchemaError { table: String, column: String },
     Unknown,
 }
 
 /// Parse exec output into a structured failure reason.
 fn parse_exec_failure(output: &str) -> Option<ExecFailureKind> {
+    // SQLite schema errors — "table X has no column named Y"
+    if let Some(pos) = output.find("has no column named") {
+        let before = &output[..pos];
+        let after = &output[pos + "has no column named".len()..];
+        let table = before
+            .split_whitespace()
+            .rev()
+            .find(|w| !w.is_empty())
+            .unwrap_or("unknown")
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .to_string();
+        let column = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .to_string();
+        return Some(ExecFailureKind::SqliteSchemaError { table, column });
+    }
+    // Also catch "OperationalError: table X" form.
+    if output.contains("OperationalError") && output.contains("no column named") {
+        let col = output
+            .find("no column named")
+            .and_then(|p| output[p + "no column named".len()..].split_whitespace().next().map(|s| s.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        return Some(ExecFailureKind::SqliteSchemaError { table: "invoices".to_string(), column: col });
+    }
+
     // PROCESS_EXITED_EARLY — produced by our Start-Process rewriter.
     if let Some(pos) = output.find("PROCESS_EXITED_EARLY") {
         let tail = &output[pos..];
@@ -845,6 +886,18 @@ Diagnose: (1) read the log files in the working directory, \
 Do NOT inform the user yet — keep debugging.]"
             )
         }
+        Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
+            format!(
+                "{result}\n\n[Metis hint: ❌ SQLite schema error — table '{table}' is missing column '{column}'. \
+Do NOT restart Python. The fix is to migrate the database schema. \
+Steps: \
+(1) Use read_file to open the Python script and find where the table is created (CREATE TABLE statement). \
+(2) Add the missing column: run exec with `python -c \"import sqlite3; conn = sqlite3.connect('invoices.db'); conn.execute('ALTER TABLE {table} ADD COLUMN {column} TEXT'); conn.commit(); conn.close(); print('OK')\"` \
+    (adjust the DB file path and column type from the CREATE TABLE definition). \
+(3) Retry Start-Process for the server. \
+NEVER run python server.py directly — always use Start-Process.]"
+            )
+        }
         Some(ExecFailureKind::Unknown) | None => result.to_string(),
     }
 }
@@ -928,6 +981,9 @@ fn last_exec_failure_hint(outputs: &[String]) -> String {
         }
         Some(ExecFailureKind::FileNotFound(ref s)) => {
             format!("file/path not found ({s}) — locate the correct path and retry")
+        }
+        Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
+            format!("SQLite schema mismatch: table '{table}' is missing column '{column}' — use ALTER TABLE or recreate the DB, do NOT restart Python")
         }
         _ => {
             // Pull the first failure-looking line from the output.
@@ -2904,6 +2960,37 @@ Write-Output "hello"
     fn test_wrap_blocking_server_skips_pip() {
         let cmd = "pip install flask";
         assert!(wrap_blocking_server_command_windows(cmd).is_none());
+    }
+
+    #[test]
+    fn test_wrap_blocking_server_skips_taskkill_prefix() {
+        // Multi-part command — must NOT be rewritten (rewriter would wrap taskkill, not python).
+        let cmd = r"taskkill /F /IM python.exe 2>$null; cd C:\Users\chack\.metis\workspace\email-app; python invoice_processor.py";
+        assert!(
+            wrap_blocking_server_command_windows(cmd).is_none(),
+            "3-part command should not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_parse_exec_failure_sqlite_schema() {
+        let out = "sqlite3.OperationalError: table invoices has no column named invoice_date";
+        match parse_exec_failure(out) {
+            Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
+                assert!(column.contains("invoice_date"), "column: {column}");
+                assert!(table.contains("invoices"), "table: {table}");
+            }
+            other => panic!("expected SqliteSchemaError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_annotate_exec_sqlite_hint() {
+        let out = "sqlite3.OperationalError: table invoices has no column named invoice_date";
+        let annotated = annotate_exec_result_with_hint(out);
+        assert!(annotated.contains("ALTER TABLE"), "should suggest ALTER TABLE: {annotated}");
+        assert!(annotated.contains("Metis hint"), "{annotated}");
+        assert!(!annotated.contains("Start-Process python"), "should not suggest restarting: {annotated}");
     }
 
     #[test]
