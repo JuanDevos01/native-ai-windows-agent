@@ -209,7 +209,10 @@ impl ExecTool {
         let avail_for_body = MAX_OUTPUT_LEN.saturating_sub(header.len() + sep_len + 64);
         if body.len() > avail_for_body {
             let omit = body.len() - avail_for_body;
-            body.truncate(avail_for_body);
+            // Find the nearest char boundary at or before avail_for_body so we never
+            // split a multi-byte UTF-8 sequence (which would panic on truncate).
+            let safe_len = body.floor_char_boundary(avail_for_body);
+            body.truncate(safe_len);
             body.push_str(&format!(
                 "\n... (truncated stdout/stderr; {omit} chars omitted)"
             ));
