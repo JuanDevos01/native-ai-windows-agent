@@ -113,57 +113,29 @@ fn exec_process_output_tail(block: &str) -> &str {
     block[idx + END_EXEC_RESULT_MARKER.len()..].trim()
 }
 
-/// PowerShell fast-path scripts often exit 0 while printing failure markers on stdout.
-/// PowerShell fast-path scripts often exit 0 while printing failure markers on stdout.
-/// Also catches explicit network-error text, but ONLY for HTTP-check commands (not file reads).
-fn exec_output_indicates_failure(tail: &str) -> bool {
+/// True when exec stdout contains one of our own explicit failure sentinel markers.
+/// These are emitted only by our own PowerShell scripts, never by arbitrary commands.
+fn exec_output_has_custom_failure_marker(tail: &str) -> bool {
     let lower = tail.to_lowercase();
-    // Custom sentinel markers emitted by our own PowerShell scripts — always meaningful.
-    if lower.contains("http_server_fail") || lower.contains("invoice_server_fail") {
-        return true;
-    }
-    false
-}
-
-/// Like `exec_output_indicates_failure` but additionally checks for network errors when
-/// the command was clearly an HTTP/web-request invocation.
-fn exec_output_indicates_network_failure(command: &str, tail: &str) -> bool {
-    if exec_output_indicates_failure(tail) {
-        return true;
-    }
-    // Only apply generic network-error heuristics when the command was a web request.
-    let cmd_lower = command.to_lowercase();
-    let is_web_request = cmd_lower.contains("invoke-webrequest")
-        || cmd_lower.contains("invoke-restmethod")
-        || cmd_lower.contains("curl ")
-        || cmd_lower.contains("wget ");
-    if !is_web_request {
-        return false;
-    }
-    let lower = tail.to_lowercase();
-    lower.contains("unable to connect")
-        || lower.contains("connection refused")
-        || lower.contains("actively refused")
-        || lower.contains("operation has timed out")
-        || lower.contains("no connection could be made")
-        || lower.contains("target machine actively refused")
+    lower.contains("http_server_fail") || lower.contains("invoice_server_fail")
 }
 
 /// True when a wrapped exec tool report indicates failure.
+///
+/// Deliberately conservative: we only trust structured signals, never heuristic
+/// string-matching on stdout (which causes false positives on file-read commands whose
+/// output happens to contain words like "connection refused" or "error").
 pub fn exec_report_failed(block: &str) -> bool {
+    // Explicit structured failure from the exec tool itself.
     if block.contains("STATUS: FAILED") || block.contains("STATUS: TIMEOUT") {
         return true;
     }
+    // Non-zero exit code (covers virtually all real failures).
     if parse_exec_exit_code(block).is_some_and(|c| c != 0) {
         return true;
     }
-    // Extract the command from the block header so network-error heuristics are only
-    // applied when the command was actually an HTTP/web-request call.
-    let command = block
-        .lines()
-        .find_map(|l| l.strip_prefix("COMMAND: "))
-        .unwrap_or("");
-    exec_output_indicates_network_failure(command, exec_process_output_tail(block))
+    // Our own custom failure markers — only these, nothing else.
+    exec_output_has_custom_failure_marker(exec_process_output_tail(block))
 }
 
 fn first_stderr_summary_line(block: &str) -> Option<String> {
@@ -452,13 +424,20 @@ fn is_multi_step_fix_request(input: &str) -> bool {
         || lower.contains("not clickable")
         || lower.contains("broken")
         || lower.contains("doesn't work")
-        || lower.contains("does not work");
+        || lower.contains("does not work")
+        || lower.contains("troubleshoot")
+        || lower.contains("getting error")
+        || lower.contains("error:")
+        || lower.contains("check and")
+        || lower.contains("please check");
     let multi = lower.contains("both")
         || lower.contains("two issues")
         || lower.contains("2 issues")
         || (lower.contains("8080") && lower.contains("5000"))
         || lower.matches("port").count() >= 2;
-    wants_fix && multi
+    // Single-service but complex enough: has an error message and an instruction
+    let single_complex = lower.contains("error") && (lower.contains("fix") || lower.contains("troubleshoot") || lower.contains("check"));
+    (wants_fix && multi) || single_complex
 }
 
 /// Local dev servers (Mission Control :8080, invoice :5000) — agent must debug iteratively, not one script.
@@ -482,7 +461,12 @@ fn is_autonomous_local_servers_work(input: &str) -> bool {
         || lower.contains("timeout")
         || lower.contains("why")
         || lower.contains("solution")
-        || lower.contains("running");
+        || lower.contains("running")
+        || lower.contains("troubleshoot")
+        || lower.contains("getting error")
+        || lower.contains("check and")
+        || lower.contains("please check")
+        || lower.contains("error:");
 
     if mentions_server && action_verb {
         return true;
@@ -527,31 +511,56 @@ NEVER run a long-running process without Start-Process. Start with port checks N
 // Blocking-server command rewriter
 // ─────────────────────────────────────────────
 
-/// Strip a `| Select-String -Pattern ...` suffix from `Get-Content <file> | Select-String ...`
-/// commands. The model uses this to "grep" source files, but it produces partial output that
-/// our failure detector misreads. Returning the plain `Get-Content <file>` gives the LLM the
-/// full file so it can actually diagnose the issue.
-fn strip_get_content_select_string(cmd: &str) -> Option<String> {
+/// Detect when the model uses PowerShell to grep/search a source file instead of read_file.
+/// Covers both forms:
+///   - `Get-Content <file> | Select-String -Pattern "..."`
+///   - `Select-String -Path "<file>" -Pattern "..."`
+///
+/// Rewrites both to a plain `Get-Content <file>` so the LLM receives the full file
+/// content rather than partial grep output, which often triggers false failure detections.
+fn rewrite_file_grep_command(cmd: &str) -> Option<String> {
     let lower = cmd.to_lowercase();
-    // Must be a Get-Content piped to Select-String (or sls alias).
-    if !lower.contains("get-content") && !lower.contains("gc ") {
+
+    // Form 1: `Get-Content <file> | Select-String ...` (or `gc <file> | sls ...`)
+    let is_gc_pipe = (lower.contains("get-content") || lower.contains("gc "))
+        && (lower.contains("select-string") || lower.contains("| sls "));
+
+    // Form 2: `Select-String -Path "<file>" ...` (standalone, no pipe)
+    let is_sls_path = (lower.contains("select-string") || lower.starts_with("sls "))
+        && lower.contains("-path ");
+
+    if !is_gc_pipe && !is_sls_path {
         return None;
     }
-    if !lower.contains("select-string") && !lower.contains("| sls ") {
-        return None;
-    }
-    // Extract the file path: text between Get-Content / gc and the first |
-    let start = lower
-        .find("get-content")
-        .map(|i| i + "get-content".len())
-        .or_else(|| lower.find("gc ").map(|i| i + 3))?;
-    let pipe_pos = cmd[start..].find('|').map(|i| i + start)?;
-    let file_part = cmd[start..pipe_pos].trim().trim_matches('"').trim_matches('\'');
-    if file_part.is_empty() {
-        return None;
-    }
+
+    // Extract the file path.
+    let file_path: Option<String> = if is_gc_pipe {
+        // Path is between `get-content`/`gc` and the first `|`
+        let start = lower
+            .find("get-content")
+            .map(|i| i + "get-content".len())
+            .or_else(|| lower.find("gc ").map(|i| i + 3))?;
+        let pipe_pos = cmd[start..].find('|').map(|i| i + start)?;
+        let raw = cmd[start..pipe_pos].trim().trim_matches('"').trim_matches('\'');
+        if raw.is_empty() { None } else { Some(raw.to_string()) }
+    } else {
+        // Path follows `-Path` argument
+        let path_pos = lower.find("-path ")? + "-path ".len();
+        let rest = cmd[path_pos..].trim();
+        // Consume quoted or unquoted token up to the next space/flag
+        let raw = if rest.starts_with('"') {
+            rest[1..].split('"').next().unwrap_or("")
+        } else if rest.starts_with('\'') {
+            rest[1..].split('\'').next().unwrap_or("")
+        } else {
+            rest.split_whitespace().next().unwrap_or("")
+        };
+        if raw.is_empty() { None } else { Some(raw.to_string()) }
+    };
+
+    let file = file_path?;
     Some(format!(
-        "Get-Content \"{file_part}\"\n# [Metis: rewrote Get-Content|Select-String to full file read; use the read_file tool for code files next time]"
+        "Get-Content \"{file}\"\n# [Metis: use the read_file tool for source files, not Select-String/Get-Content]"
     ))
 }
 
@@ -1011,6 +1020,36 @@ fn response_is_plan_without_tools(content: &str) -> bool {
         || lower.contains("i need to");
     let has_code_block = content.contains("```");
     (has_plan_words || has_code_block) && content.len() > 60
+}
+
+/// True when the model response describes having identified a problem but hasn't called
+/// any tool to actually fix it yet. This is the "I see the issue, let me fix it:" pattern
+/// where the agent narrates rather than acts.
+fn response_identified_problem_without_fix(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    let identified = lower.contains("i see the problem")
+        || lower.contains("i see the issue")
+        || lower.contains("i found the")
+        || lower.contains("the issue is")
+        || lower.contains("the problem is")
+        || lower.contains("the error is")
+        || lower.contains("the bug is")
+        || lower.contains("i can see")
+        || lower.contains("i notice")
+        || lower.contains("i've identified")
+        || lower.contains("the root cause")
+        || lower.contains("the fix is")
+        || lower.contains("let me fix")
+        || lower.contains("i'll fix")
+        || lower.contains("i need to fix")
+        || lower.contains("needs to be")
+        || lower.contains("should be fixed")
+        || lower.contains("missing column")
+        || lower.contains("schema mismatch")
+        || lower.contains("alter table")
+        || lower.contains("pip install");
+    // Only counts if it's a substantial response (not a one-liner)
+    identified && content.len() > 40
 }
 
 /// Cap how many `exec` tool calls are allowed in one user turn (prevents spam, allows real workflows).
@@ -2191,11 +2230,10 @@ Run the next command in a follow-up message, or combine steps into one script."
                                             "command".to_string(),
                                             serde_json::Value::String(wrapped),
                                         );
-                                    } else if let Some(stripped) = strip_get_content_select_string(cmd) {
-                                        // Get-Content | Select-String is wrong for reading code files —
-                                        // it produces grep output that our failure detector mis-reads.
-                                        // Rewrite to plain Get-Content so the LLM gets the full file.
-                                        info!(original = %cmd, "rewrote Get-Content|Select-String to plain Get-Content");
+                                    } else if let Some(stripped) = rewrite_file_grep_command(cmd) {
+                                        // Both `Get-Content | Select-String` and `Select-String -Path`
+                                        // are wrong for reading source files. Rewrite to plain Get-Content.
+                                        info!(original = %cmd, "rewrote file-grep command to plain Get-Content");
                                         params.insert(
                                             "command".to_string(),
                                             serde_json::Value::String(stripped),
@@ -2279,20 +2317,28 @@ Run the next command in a follow-up message, or combine steps into one script."
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
-                let is_autonomous = is_autonomous_local_servers_work(&msg.content);
+                let is_autonomous = is_autonomous_local_servers_work(&msg.content)
+                    || is_multi_step_fix_request(&msg.content);
                 let remaining_exec_budget = exec_calls_executed < max_exec_calls;
 
-                // Case 1: early iteration, no tools called yet, LLM is just narrating a plan.
+                // Case 1: early iteration, no tools called yet, LLM is narrating a plan.
                 let is_early = iteration < 3;
-                let is_idle_plan = is_early && exec_calls_executed == 0 && response_is_plan_without_tools(content_text);
+                let is_idle_plan = is_early
+                    && exec_calls_executed == 0
+                    && response_is_plan_without_tools(content_text);
 
-                // Case 2: last exec(s) had unresolved failures — keep the agent working
-                // rather than letting it give a "here's what happened" summary and stop.
-                let still_failing = is_autonomous
-                    && remaining_exec_budget
+                // Case 2: last exec(s) had unresolved failures — keep the agent working.
+                // Use exec_report_failed on the raw outputs (not parse_exec_failure) to avoid
+                // false positives from heuristic string matching.
+                let still_failing = remaining_exec_budget
                     && has_unresolved_exec_failures(&exec_tool_outputs);
 
-                if is_autonomous && (is_idle_plan || still_failing) {
+                // Case 3: model described a problem without calling a tool to fix it.
+                // "I see the issue, the column is missing. Let me fix it:" → but no tool call.
+                let identified_without_acting = remaining_exec_budget
+                    && response_identified_problem_without_fix(content_text);
+
+                if is_autonomous && (is_idle_plan || still_failing || identified_without_acting) {
                     ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
                     let nudge = if still_failing {
                         let hint = last_exec_failure_hint(&exec_tool_outputs);
@@ -2301,6 +2347,10 @@ Run the next command in a follow-up message, or combine steps into one script."
 Do NOT stop or summarise. Call the next tool RIGHT NOW to fix it. \
 Keep calling tools until the problem is resolved or you have exhausted all options."
                         )
+                    } else if identified_without_acting {
+                        "You described the problem but did NOT call a tool to fix it. \
+Call exec, read_file, or edit_file RIGHT NOW to apply the fix. \
+Do not describe — act.".to_string()
                     } else {
                         "Stop describing what you will do — call the exec or read_file tool RIGHT NOW to start. \
 Do not write any more text until you have called at least one tool.".to_string()
@@ -2991,6 +3041,67 @@ Write-Output "hello"
         assert!(annotated.contains("ALTER TABLE"), "should suggest ALTER TABLE: {annotated}");
         assert!(annotated.contains("Metis hint"), "{annotated}");
         assert!(!annotated.contains("Start-Process python"), "should not suggest restarting: {annotated}");
+    }
+
+    // ── Layer 1: exec_report_failed conservatism ──────────────────────────────
+
+    #[test]
+    fn test_exec_report_failed_no_false_positive_on_select_string_output() {
+        // Select-String -Path on a Python file that mentions "connection refused" as a string
+        // should NOT be flagged as failed if exit code is 0.
+        let block = "<<<EXEC_RESULT>>>\nCOMMAND: Select-String -Path \"invoice_processor.py\" -Pattern \"INSERT INTO\"\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\ninvoice_processor.py:42: raise ConnectionError(\"connection refused\")\n";
+        assert!(!exec_report_failed(block), "exit-0 Select-String should not be failed");
+    }
+
+    #[test]
+    fn test_exec_report_failed_respects_exit_code_1() {
+        let block = "<<<EXEC_RESULT>>>\nCOMMAND: python test.py\nEXIT_CODE: 1\nSTATUS: FAILED\n<<<END_EXEC_RESULT>>>\n--- STDERR ---\nModuleNotFoundError: No module named 'flask'\n";
+        assert!(exec_report_failed(block), "exit-1 should be failed");
+    }
+
+    #[test]
+    fn test_exec_report_failed_custom_marker_still_works() {
+        let block = "<<<EXEC_RESULT>>>\nCOMMAND: Invoke-WebRequest http://localhost:5000\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\nINVOICE_SERVER_FAIL PID=1234\n";
+        assert!(exec_report_failed(block), "custom marker should still trigger failure");
+    }
+
+    // ── Layer 2: file-grep rewriter ────────────────────────────────────────
+
+    #[test]
+    fn test_rewrite_file_grep_catches_select_string_path_form() {
+        let cmd = r#"Select-String -Path "C:\Users\chack\.metis\workspace\email-app\invoice_processor.py" -Pattern "INSERT INTO invoices" -Context 3"#;
+        let result = rewrite_file_grep_command(cmd);
+        assert!(result.is_some(), "should rewrite Select-String -Path form");
+        let rewritten = result.unwrap();
+        assert!(rewritten.contains("Get-Content"), "should use Get-Content: {rewritten}");
+        assert!(rewritten.contains("invoice_processor.py"), "should preserve file path: {rewritten}");
+    }
+
+    #[test]
+    fn test_rewrite_file_grep_catches_gc_pipe_form() {
+        let cmd = r#"Get-Content "invoice_processor.py" | Select-String -Pattern "CREATE TABLE""#;
+        let result = rewrite_file_grep_command(cmd);
+        assert!(result.is_some(), "should rewrite Get-Content|Select-String form");
+    }
+
+    #[test]
+    fn test_rewrite_file_grep_ignores_invoke_webrequest() {
+        let cmd = "Invoke-WebRequest http://localhost:5000 -UseBasicParsing";
+        assert!(rewrite_file_grep_command(cmd).is_none(), "should not rewrite web requests");
+    }
+
+    // ── Layer 3: identified-without-acting detection ───────────────────────
+
+    #[test]
+    fn test_response_identified_problem_without_fix() {
+        let resp = "I see the problem — the invoice_date column is missing from the table. Let me fix it:";
+        assert!(response_identified_problem_without_fix(resp));
+    }
+
+    #[test]
+    fn test_response_identified_short_does_not_trigger() {
+        let resp = "OK done.";
+        assert!(!response_identified_problem_without_fix(resp));
     }
 
     #[test]

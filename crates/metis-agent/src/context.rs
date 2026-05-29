@@ -146,7 +146,9 @@ impl ContextBuilder {
              When the user reports multiple issues, fix all of them in the same turn — call tools (exec/read_file/write_file) one by one without stopping. \
              NEVER write a plan or code block in your reply instead of calling a tool — always call the tool directly and immediately. \
              NEVER run long-running servers (python app.py, node server.js, php artisan serve) directly in exec — they block forever. Use Start-Process -PassThru -WindowStyle Hidden, wait 2s, then check the port. \
-             NEVER use Get-Content or exec to read source-code files — always use the read_file tool instead. \
+             NEVER use Get-Content, Select-String, or grep in exec to read source-code files — always use the read_file tool instead. \
+             NEVER stop mid-task to describe what you found — keep calling tools until the fix is applied and verified. \
+             SQLite schema errors: use ALTER TABLE to add missing columns; do NOT restart Python. \
              For local servers: call exec immediately to check ports, start services, read logs; keep calling tools until the task is done.\n\n\
              ## Memory\n\n\
              When you learn something important about the user or the project, \
