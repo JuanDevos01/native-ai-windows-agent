@@ -416,126 +416,6 @@ fn is_user_challenging_agent_claims(input: &str) -> bool {
         || (lower.contains("failed") && lower.contains("<<<exec_result>>>"))
 }
 
-/// User asked to fix multiple things (e.g. port 8080 UI + port 5000 server).
-fn is_multi_step_fix_request(input: &str) -> bool {
-    // Questions / inspection requests are answered, not treated as fix tasks.
-    if is_question_or_inspection(input) {
-        return false;
-    }
-    let lower = input.to_lowercase();
-    let wants_fix = lower.contains("fix")
-        || lower.contains("not working")
-        || lower.contains("not clickable")
-        || lower.contains("broken")
-        || lower.contains("doesn't work")
-        || lower.contains("does not work")
-        || lower.contains("troubleshoot")
-        || lower.contains("getting error")
-        || lower.contains("error:")
-        || lower.contains("check and")
-        || lower.contains("please check");
-    let multi = lower.contains("both")
-        || lower.contains("two issues")
-        || lower.contains("2 issues")
-        || (lower.contains("8080") && lower.contains("5000"))
-        || lower.matches("port").count() >= 2;
-    // Single-service but complex enough: has an error message and an instruction
-    let single_complex = lower.contains("error") && (lower.contains("fix") || lower.contains("troubleshoot") || lower.contains("check"));
-    (wants_fix && multi) || single_complex
-}
-
-/// True when the message is a question or an inspection/read request rather than an
-/// action task. We must ANSWER these, not hijack them into starting servers.
-fn is_question_or_inspection(input: &str) -> bool {
-    let lower = input.trim().to_lowercase();
-
-    // If the user explicitly asks to start/run/launch/restart something, it's an action,
-    // not a pure question — let the autonomous path handle it.
-    let explicit_action = lower.contains("start ")
-        || lower.contains("run ")
-        || lower.contains("launch ")
-        || lower.contains("restart")
-        || lower.contains("boot up")
-        || lower.contains("spin up");
-    if explicit_action {
-        return false;
-    }
-
-    // Question / inspection signals.
-    lower.starts_with("why")
-        || lower.starts_with("what")
-        || lower.starts_with("are you")
-        || lower.starts_with("did you")
-        || lower.starts_with("can you")
-        || lower.starts_with("do you")
-        || lower.starts_with("is it")
-        || lower.starts_with("is the")
-        || lower.starts_with("how ")
-        || lower.starts_with("please do not")
-        || lower.starts_with("please don't")
-        || lower.contains("are you reading")
-        || lower.contains("did you read")
-        || lower.contains("read the")
-        || lower.contains("?")
-}
-
-/// Local dev servers (Mission Control :8080, invoice :5000) — agent must debug iteratively, not one script.
-fn is_autonomous_local_servers_work(input: &str) -> bool {
-    let lower = input.to_lowercase();
-
-    // Questions and inspection requests must be answered, not hijacked into server work.
-    if is_question_or_inspection(input) {
-        return false;
-    }
-
-    // Server/port task keywords — original set.
-    let mentions_server = lower.contains("8080")
-        || lower.contains("5000")
-        || lower.contains("localhost")
-        || lower.contains("mission control")
-        || lower.contains("mission-control")
-        || lower.contains("invoice");
-
-    let action_verb = lower.contains("start")
-        || lower.contains("verify")
-        || lower.contains("fix")
-        || lower.contains("debug")
-        || lower.contains("not working")
-        || lower.contains("not running")
-        || lower.contains("timeout")
-        || lower.contains("solution")
-        || lower.contains("running")
-        || lower.contains("troubleshoot")
-        || lower.contains("getting error")
-        || lower.contains("check and")
-        || lower.contains("please check");
-
-    if mentions_server && action_verb {
-        return true;
-    }
-
-    // Also treat any multi-step debugging / fixing request as autonomous.
-    let is_fix_request = (lower.contains("fix") || lower.contains("install") || lower.contains("debug"))
-        && (lower.contains("python") || lower.contains("pip") || lower.contains("script")
-            || lower.contains("server") || lower.contains("error") || lower.contains("fail"));
-
-    // Short follow-up queries from a user mid-task ("and now?", "continue", "try again", "what now")
-    let is_continuation = lower == "and now?"
-        || lower == "continue"
-        || lower == "try again"
-        || lower == "what now"
-        || lower == "keep going"
-        || lower == "go ahead"
-        || lower.starts_with("and now")
-        || lower.starts_with("now what")
-        || lower.starts_with("what next")
-        || lower.starts_with("next step")
-        || lower.starts_with("please continue")
-        || lower.starts_with("keep going");
-
-    is_fix_request || is_continuation
-}
-
 /// Injected on the final allowed iteration to force a clean, on-topic final answer.
 const WRAPUP_INSTRUCTION: &str = "[Metis instruction: You have reached the step limit — do NOT call any more tools. \
 Write your FINAL answer now, directly addressing the user's original question. Use this structure:\n\
@@ -543,19 +423,6 @@ Write your FINAL answer now, directly addressing the user's original question. U
 **What I did:** <bullet list of the concrete steps/checks you performed>\n\
 **Result:** <the actual answer or outcome — if the question was a question, ANSWER it; if it was a task, state done/blocked and why>\n\
 Keep it concise. If you could not fully complete it, say exactly what is blocking and what the next step would be.]";
-
-const AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION: &str = "\n\n[Metis instruction: Autonomous local-server task. \
-IMPORTANT: Do NOT write plans or code blocks — call exec/read_file tools DIRECTLY and IMMEDIATELY. \
-Do not stop after one command — keep calling tools until both services respond or you clearly state what is blocked. \
-Step 1: Check which ports are already responding (Invoke-WebRequest localhost:8080 and :5000 -TimeoutSec 3 -UseBasicParsing). If a port responds, skip starting that service. \
-Step 2: For services NOT yet responding, find and start them. \
-Mission Control: `mission-control/` under workspace (port 8080) — check what kind of server it is first (dir the folder; look for package.json, composer.json, *.py). \
-Invoice: `email-app/invoice_processor.py` (port 5000). \
-CRITICAL — starting servers: NEVER run `python script.py` or `node app.js` directly — they block forever and timeout. \
-Instead use Start-Process: `$p = Start-Process -FilePath python -ArgumentList 'invoice_processor.py' -WorkingDirectory 'C:\\full\\path\\to\\email-app' -PassThru -WindowStyle Hidden; Start-Sleep 2; try { (Invoke-WebRequest http://localhost:5000 -UseBasicParsing -TimeoutSec 4).StatusCode } catch { $_.Exception.Message }` \
-If the script has a bug/typo: use read_file to read it first, then edit_file to fix it, THEN start with Start-Process. \
-On Traceback from a previous run: read the script, find the error, fix it, then restart. \
-NEVER run a long-running process without Start-Process. Start with port checks NOW.]";
 
 // ─────────────────────────────────────────────
 // Blocking-server command rewriter
@@ -1061,9 +928,6 @@ fn response_identified_problem_without_fix(content: &str) -> bool {
 fn max_exec_calls_for_message(input: &str) -> usize {
     if is_whisper_cpp_install_request(input) {
         return 1;
-    }
-    if is_autonomous_local_servers_work(input) || is_multi_step_fix_request(input) {
-        return 20;
     }
     if is_execution_or_install_request(input) {
         return 8;
@@ -2102,21 +1966,10 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
 
         // Build LLM messages
         let media_paths: Vec<String> = msg.media.iter().map(|m| m.path.clone()).collect();
-        let mut user_text = msg.content.clone();
-        if is_autonomous_local_servers_work(&msg.content) {
-            // Prepend any relevant memory notes so the agent remembers previous findings.
-            let memory_hint = self.context.memory().get_memory_context()
-                .map(|m| format!("\n\n[Memory from previous sessions — read this before acting:\n{m}\n]"))
-                .unwrap_or_default();
-            user_text.push_str(&memory_hint);
-            user_text.push_str(AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION);
-        } else if is_multi_step_fix_request(&msg.content) {
-            user_text.push_str(
-                "\n\n[Metis instruction: You listed multiple issues. Complete ALL of them in this turn \
-                 before sending your final reply — use read_file/write_file/edit_file/exec as needed. \
-                 Do not stop after a single diagnostic command like Get-Content.]",
-            );
-        }
+        // No per-message instruction injection: the general operating principles live in the
+        // system prompt (build_identity). Task-specific overrides here previously hijacked
+        // questions into "start the server / fix it" behavior.
+        let user_text = msg.content.clone();
         let mut messages = self.context.build_messages(
             &history,
             &user_text,
@@ -2137,12 +1990,10 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let mut exec_calls_executed: usize = 0;
         let mut wrapup_injected = false;
 
-        // For longer/autonomous tasks, post a visible "goal" line up-front so the user can see
+        // For any non-trivial request, post a visible "goal" line up-front so the user can see
         // what the agent set out to do (helps when work takes a while). Marked intermediate so
-        // the typing indicator keeps running afterwards.
-        if is_chat_app_channel(&msg.channel)
-            && (is_autonomous_local_servers_work(&msg.content) || is_multi_step_fix_request(&msg.content))
-        {
+        // the typing indicator keeps running afterwards. Length-based (general), not keyword-based.
+        if is_chat_app_channel(&msg.channel) && msg.content.trim().chars().count() > 40 {
             let goal = truncate_chars(msg.content.trim(), 160);
             let mut goal_msg = OutboundMessage::new(
                 &msg.channel,
@@ -2401,20 +2252,6 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 compact_exec,
             )
         };
-
-        if is_multi_step_fix_request(&msg.content) && exec_calls_executed <= 1 {
-            let lower = content.to_lowercase();
-            let likely_only_diagnostic = lower.contains("get-content")
-                || lower.contains("select-string")
-                || lower.contains("checking");
-            let no_write = !lower.contains("successfully wrote") && !lower.contains("write_file");
-            if likely_only_diagnostic && no_write {
-                content.push_str(
-                    "\n\n⚠ Only a diagnostic step ran (not a full fix yet). \
-Reply **continue** and I will patch Mission Control click handlers and start/check port 5000.",
-                );
-            }
-        }
 
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
         // but never executed a tool call, force a deterministic read_file response.
@@ -3103,27 +2940,6 @@ Write-Output "hello"
 
     // ── Question guard: don't hijack questions into server work ────────────
 
-    #[test]
-    fn test_question_about_invoice_is_not_autonomous_server_work() {
-        let q = "are you reading the pdf file? here is the forwarded invoice";
-        assert!(is_question_or_inspection(q), "should be detected as question");
-        assert!(!is_autonomous_local_servers_work(q), "question must NOT trigger server work");
-        assert!(!is_multi_step_fix_request(q), "question must NOT trigger fix task");
-    }
-
-    #[test]
-    fn test_why_smtp_question_is_not_autonomous() {
-        let q = "why are you sending via smtp? please do not smtp out without permission";
-        assert!(!is_autonomous_local_servers_work(q));
-    }
-
-    #[test]
-    fn test_explicit_start_request_is_still_autonomous() {
-        let q = "start mission control and invoice — verify localhost:8080 and localhost:5000";
-        assert!(!is_question_or_inspection(q), "explicit start must not be treated as question");
-        assert!(is_autonomous_local_servers_work(q), "explicit start should be autonomous");
-    }
-
     // ── Task ledger + question-anchored summary ────────────────────────────
 
     #[test]
@@ -3227,16 +3043,6 @@ Write-Output "hello"
     fn test_exec_report_failed_detects_timeout() {
         let block = "<<<EXEC_RESULT>>>\nSTATUS: TIMEOUT\nTIMEOUT_SECONDS: 60\n<<<END_EXEC_RESULT>>>";
         assert!(super::exec_report_failed(block));
-    }
-
-    #[test]
-    fn test_multi_step_fix_detection() {
-        let msg = "port 8080 mission control items not clickable, port 5000 invoice not working";
-        assert!(is_multi_step_fix_request(msg));
-        assert_eq!(max_exec_calls_for_message(msg), 20);
-        assert!(is_autonomous_local_servers_work(
-            "start mission control and invoice — verify localhost:8080 and localhost:5000"
-        ));
     }
 
     #[test]
