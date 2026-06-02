@@ -418,6 +418,10 @@ fn is_user_challenging_agent_claims(input: &str) -> bool {
 
 /// User asked to fix multiple things (e.g. port 8080 UI + port 5000 server).
 fn is_multi_step_fix_request(input: &str) -> bool {
+    // Questions / inspection requests are answered, not treated as fix tasks.
+    if is_question_or_inspection(input) {
+        return false;
+    }
     let lower = input.to_lowercase();
     let wants_fix = lower.contains("fix")
         || lower.contains("not working")
@@ -440,9 +444,49 @@ fn is_multi_step_fix_request(input: &str) -> bool {
     (wants_fix && multi) || single_complex
 }
 
+/// True when the message is a question or an inspection/read request rather than an
+/// action task. We must ANSWER these, not hijack them into starting servers.
+fn is_question_or_inspection(input: &str) -> bool {
+    let lower = input.trim().to_lowercase();
+
+    // If the user explicitly asks to start/run/launch/restart something, it's an action,
+    // not a pure question — let the autonomous path handle it.
+    let explicit_action = lower.contains("start ")
+        || lower.contains("run ")
+        || lower.contains("launch ")
+        || lower.contains("restart")
+        || lower.contains("boot up")
+        || lower.contains("spin up");
+    if explicit_action {
+        return false;
+    }
+
+    // Question / inspection signals.
+    lower.starts_with("why")
+        || lower.starts_with("what")
+        || lower.starts_with("are you")
+        || lower.starts_with("did you")
+        || lower.starts_with("can you")
+        || lower.starts_with("do you")
+        || lower.starts_with("is it")
+        || lower.starts_with("is the")
+        || lower.starts_with("how ")
+        || lower.starts_with("please do not")
+        || lower.starts_with("please don't")
+        || lower.contains("are you reading")
+        || lower.contains("did you read")
+        || lower.contains("read the")
+        || lower.contains("?")
+}
+
 /// Local dev servers (Mission Control :8080, invoice :5000) — agent must debug iteratively, not one script.
 fn is_autonomous_local_servers_work(input: &str) -> bool {
     let lower = input.to_lowercase();
+
+    // Questions and inspection requests must be answered, not hijacked into server work.
+    if is_question_or_inspection(input) {
+        return false;
+    }
 
     // Server/port task keywords — original set.
     let mentions_server = lower.contains("8080")
@@ -459,14 +503,12 @@ fn is_autonomous_local_servers_work(input: &str) -> bool {
         || lower.contains("not working")
         || lower.contains("not running")
         || lower.contains("timeout")
-        || lower.contains("why")
         || lower.contains("solution")
         || lower.contains("running")
         || lower.contains("troubleshoot")
         || lower.contains("getting error")
         || lower.contains("check and")
-        || lower.contains("please check")
-        || lower.contains("error:");
+        || lower.contains("please check");
 
     if mentions_server && action_verb {
         return true;
@@ -493,6 +535,14 @@ fn is_autonomous_local_servers_work(input: &str) -> bool {
 
     is_fix_request || is_continuation
 }
+
+/// Injected on the final allowed iteration to force a clean, on-topic final answer.
+const WRAPUP_INSTRUCTION: &str = "[Metis instruction: You have reached the step limit — do NOT call any more tools. \
+Write your FINAL answer now, directly addressing the user's original question. Use this structure:\n\
+**What you asked:** <restate the original question/request in one line>\n\
+**What I did:** <bullet list of the concrete steps/checks you performed>\n\
+**Result:** <the actual answer or outcome — if the question was a question, ANSWER it; if it was a task, state done/blocked and why>\n\
+Keep it concise. If you could not fully complete it, say exactly what is blocking and what the next step would be.]";
 
 const AUTONOMOUS_LOCAL_SERVERS_INSTRUCTION: &str = "\n\n[Metis instruction: Autonomous local-server task. \
 IMPORTANT: Do NOT write plans or code blocks — call exec/read_file tools DIRECTLY and IMMEDIATELY. \
@@ -1135,6 +1185,105 @@ fn build_autonomous_summary(exec_outputs: &[String], compact: bool) -> String {
         for o in exec_outputs {
             lines.push(summarize_exec_block(o));
         }
+    }
+
+    lines.join("\n")
+}
+
+// ─────────────────────────────────────────────
+// Task ledger — durable record of what the agent did
+// ─────────────────────────────────────────────
+
+/// A single recorded action the agent took during a turn (the "checking" log).
+#[derive(Debug, Clone)]
+struct TaskStep {
+    /// Short human label of the action (e.g. "Exec: `python ...`", "Read `app.py`").
+    label: String,
+    /// Whether the step succeeded.
+    ok: bool,
+    /// Optional outcome detail (error reason for failures).
+    detail: Option<String>,
+}
+
+impl TaskStep {
+    /// Build a step record from a completed tool call.
+    fn from_tool_call(tool_name: &str, arguments: &str, result: &str) -> Self {
+        let label = tool_progress_preview(tool_name, arguments);
+        if tool_name == "exec" {
+            let failed = exec_report_failed(result);
+            let detail = if failed {
+                first_failure_summary_line(result)
+            } else {
+                None
+            };
+            TaskStep { label, ok: !failed, detail }
+        } else {
+            // Non-exec tools: treat an explicit "Tool argument error" / "error:" as failure.
+            let lower = result.to_lowercase();
+            let failed = lower.starts_with("tool argument error")
+                || lower.starts_with("error:")
+                || lower.contains("no such file")
+                || lower.contains("failed to");
+            let detail = if failed {
+                Some(truncate_chars(result.lines().next().unwrap_or("failed"), 100))
+            } else {
+                None
+            };
+            TaskStep { label, ok: !failed, detail }
+        }
+    }
+
+    fn render(&self) -> String {
+        let mark = if self.ok { "✓" } else { "✗" };
+        match &self.detail {
+            Some(d) if !self.ok => format!("  {mark} {} — {d}", self.label),
+            _ => format!("  {mark} {}", self.label),
+        }
+    }
+}
+
+/// Build a generic, question-anchored summary: Task → Steps taken → Outcome.
+///
+/// Unlike `build_autonomous_summary`, this is NOT hardcoded to specific ports — it works
+/// for any task and always restates the original question so the reply stays on-topic.
+fn build_task_summary(question: &str, steps: &[TaskStep], compact: bool) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    let q = truncate_chars(question.trim(), 200);
+    if !q.is_empty() {
+        lines.push(format!("**Task:** {q}"));
+        lines.push(String::new());
+    }
+
+    if steps.is_empty() {
+        lines.push("No actions were completed before the step limit was reached.".into());
+        return lines.join("\n");
+    }
+
+    lines.push("**Steps taken:**".into());
+    // In compact (chat) mode, cap the number of rendered steps to avoid huge messages.
+    let max_steps = if compact { 8 } else { steps.len() };
+    let shown = steps.len().min(max_steps);
+    for step in &steps[..shown] {
+        lines.push(step.render());
+    }
+    if steps.len() > shown {
+        lines.push(format!("  … and {} more step(s)", steps.len() - shown));
+    }
+
+    // Outcome: derive from the final step.
+    lines.push(String::new());
+    let last = steps.last().unwrap();
+    let any_failed = steps.iter().any(|s| !s.ok);
+    if last.ok && !any_failed {
+        lines.push("**Outcome:** ✅ Completed — all steps succeeded.".into());
+    } else if last.ok && any_failed {
+        lines.push("**Outcome:** ⚠ Partially done — earlier steps failed but the last step succeeded. Reply **continue** to keep going.".into());
+    } else {
+        let reason = last.detail.clone().unwrap_or_else(|| "last step failed".into());
+        lines.push(format!(
+            "**Outcome:** ❌ Not finished — {reason}. Reply **continue** to keep debugging."
+        ));
     }
 
     lines.join("\n")
@@ -2153,17 +2302,51 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // Agent loop: LLM ↔ tool calling
         let mut final_content: Option<String> = None;
         let mut exec_tool_outputs: Vec<String> = Vec::new();
+        // Durable record of every action taken this turn (the "checking" log).
+        let mut task_steps: Vec<TaskStep> = Vec::new();
         let max_exec_calls = max_exec_calls_for_message(&msg.content);
         let mut exec_calls_executed: usize = 0;
+        let mut wrapup_injected = false;
+
+        // For longer/autonomous tasks, post a visible "goal" line up-front so the user can see
+        // what the agent set out to do (helps when work takes a while). Marked intermediate so
+        // the typing indicator keeps running afterwards.
+        if is_chat_app_channel(&msg.channel)
+            && (is_autonomous_local_servers_work(&msg.content) || is_multi_step_fix_request(&msg.content))
+        {
+            let goal = truncate_chars(msg.content.trim(), 160);
+            let mut goal_msg = OutboundMessage::new(
+                &msg.channel,
+                &msg.chat_id,
+                format!("🎯 Working on: {goal}"),
+            );
+            goal_msg.metadata.insert("intermediate".into(), "true".into());
+            let _ = self.bus.publish_outbound(goal_msg).await;
+        }
 
         for iteration in 0..self.max_iterations {
             debug!(iteration = iteration, "LLM call");
+
+            // On the final allowed iteration, force a clean wrap-up: disable tools and ask
+            // the model to write a structured answer that addresses the original question.
+            // The model has full context (everything it read/ran), so it can answer properly
+            // instead of us synthesising a hardcoded summary.
+            let is_last_iteration = iteration + 1 >= self.max_iterations;
+            if is_last_iteration && !task_steps.is_empty() && !wrapup_injected {
+                messages.push(Message::user(WRAPUP_INSTRUCTION));
+                wrapup_injected = true;
+            }
+            let tools_for_call = if is_last_iteration && wrapup_injected {
+                None
+            } else {
+                Some(tool_defs.as_slice())
+            };
 
             let response = self
                 .provider
                 .chat(
                     &messages,
-                    Some(&tool_defs),
+                    tools_for_call,
                     &self.model,
                     &self.request_config,
                 )
@@ -2185,7 +2368,8 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                         let stripped = strip_reasoning_tags(text);
                         let cleaned = fenced_code_block_re().replace_all(&stripped, "").trim().to_string();
                         if !cleaned.is_empty() {
-                            let narr = OutboundMessage::new(&msg.channel, &msg.chat_id, cleaned);
+                            let mut narr = OutboundMessage::new(&msg.channel, &msg.chat_id, cleaned);
+                            narr.metadata.insert("intermediate".into(), "true".into());
                             let _ = self.bus.publish_outbound(narr).await;
                         }
                     }
@@ -2210,11 +2394,12 @@ Run the next command in a follow-up message, or combine steps into one script."
                     // Publish a "starting" progress tick for chat channels.
                     if is_chat_app_channel(&msg.channel) {
                         let preview = tool_progress_preview(&tc.function.name, &tc.function.arguments);
-                        let tick = OutboundMessage::new(
+                        let mut tick = OutboundMessage::new(
                             &msg.channel,
                             &msg.chat_id,
                             format!("🛠️ {preview}"),
                         );
+                        tick.metadata.insert("intermediate".into(), "true".into());
                         let _ = self.bus.publish_outbound(tick).await;
                     }
 
@@ -2254,11 +2439,12 @@ Run the next command in a follow-up message, or combine steps into one script."
                     // Publish a "completed / failed" progress tick for chat channels.
                     if is_chat_app_channel(&msg.channel) {
                         let outcome = tool_outcome_preview(&tc.function.name, &tc.function.arguments, &result);
-                        let tick = OutboundMessage::new(
+                        let mut tick = OutboundMessage::new(
                             &msg.channel,
                             &msg.chat_id,
                             format!("  ↳ {outcome}"),
                         );
+                        tick.metadata.insert("intermediate".into(), "true".into());
                         let _ = self.bus.publish_outbound(tick).await;
                     }
 
@@ -2266,6 +2452,13 @@ Run the next command in a follow-up message, or combine steps into one script."
                         exec_calls_executed += 1;
                         exec_tool_outputs.push(result.clone());
                     }
+
+                    // Record the step in the durable task ledger.
+                    task_steps.push(TaskStep::from_tool_call(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &result,
+                    ));
 
                     debug!(
                         tool = %tc.function.name,
@@ -2364,10 +2557,14 @@ Do not write any more text until you have called at least one tool.".to_string()
             }
         }
 
-        // If we exhausted iterations without a final answer, build a summary from exec outputs.
+        // If we exhausted iterations without a final answer, build a summary from the task ledger.
+        // This is question-anchored (Task → Steps → Outcome) so the reply stays on-topic instead
+        // of dumping hardcoded server status.
         let compact_exec = is_chat_app_channel(&msg.channel);
-        let used_autonomous_summary = final_content.is_none() && !exec_tool_outputs.is_empty();
+        let used_autonomous_summary = final_content.is_none() && !task_steps.is_empty();
         let fallback = if used_autonomous_summary {
+            build_task_summary(&msg.content, &task_steps, compact_exec)
+        } else if final_content.is_none() && !exec_tool_outputs.is_empty() {
             build_autonomous_summary(&exec_tool_outputs, compact_exec)
         } else {
             "I've completed processing but have no response to give.".into()
@@ -2941,7 +3138,13 @@ Write-Output "hello"
         let agent = create_test_loop(provider);
 
         let result = agent.process_direct("loop forever").await.unwrap();
-        assert!(result.contains("completed processing"));
+        // After exhausting iterations the agent now emits a question-anchored task summary
+        // (Task → Steps → Outcome) rather than a generic "no response" message.
+        assert!(
+            result.contains("**Task:**") && result.contains("loop forever"),
+            "expected question-anchored summary, got: {result}"
+        );
+        assert!(result.contains("**Steps taken:**"), "expected steps section, got: {result}");
     }
 
     #[test]
@@ -3102,6 +3305,68 @@ Write-Output "hello"
     fn test_response_identified_short_does_not_trigger() {
         let resp = "OK done.";
         assert!(!response_identified_problem_without_fix(resp));
+    }
+
+    // ── Question guard: don't hijack questions into server work ────────────
+
+    #[test]
+    fn test_question_about_invoice_is_not_autonomous_server_work() {
+        let q = "are you reading the pdf file? here is the forwarded invoice";
+        assert!(is_question_or_inspection(q), "should be detected as question");
+        assert!(!is_autonomous_local_servers_work(q), "question must NOT trigger server work");
+        assert!(!is_multi_step_fix_request(q), "question must NOT trigger fix task");
+    }
+
+    #[test]
+    fn test_why_smtp_question_is_not_autonomous() {
+        let q = "why are you sending via smtp? please do not smtp out without permission";
+        assert!(!is_autonomous_local_servers_work(q));
+    }
+
+    #[test]
+    fn test_explicit_start_request_is_still_autonomous() {
+        let q = "start mission control and invoice — verify localhost:8080 and localhost:5000";
+        assert!(!is_question_or_inspection(q), "explicit start must not be treated as question");
+        assert!(is_autonomous_local_servers_work(q), "explicit start should be autonomous");
+    }
+
+    // ── Task ledger + question-anchored summary ────────────────────────────
+
+    #[test]
+    fn test_task_step_from_failed_exec() {
+        let result = "<<<EXEC_RESULT>>>\nCOMMAND: python app.py\nEXIT_CODE: 1\nSTATUS: FAILED\n<<<END_EXEC_RESULT>>>\n--- STDERR ---\nModuleNotFoundError: No module named 'flask'\n";
+        let args = r#"{"command":"python app.py"}"#;
+        let step = TaskStep::from_tool_call("exec", args, result);
+        assert!(!step.ok, "failed exec should be marked not ok");
+    }
+
+    #[test]
+    fn test_task_step_from_ok_read_file() {
+        let step = TaskStep::from_tool_call("read_file", r#"{"path":"app.py"}"#, "line1\nline2\n");
+        assert!(step.ok, "successful read should be ok");
+    }
+
+    #[test]
+    fn test_build_task_summary_anchors_question() {
+        let steps = vec![
+            TaskStep { label: "Read `invoice.pdf`".into(), ok: true, detail: None },
+            TaskStep { label: "Exec: `python check.py`".into(), ok: false, detail: Some("ModuleNotFoundError".into()) },
+        ];
+        let summary = build_task_summary("what is in the invoice pdf?", &steps, true);
+        assert!(summary.contains("**Task:**"), "must restate task: {summary}");
+        assert!(summary.contains("invoice pdf"), "must include original question: {summary}");
+        assert!(summary.contains("**Steps taken:**"), "must list steps: {summary}");
+        assert!(summary.contains("**Outcome:**"), "must give outcome: {summary}");
+        assert!(summary.contains("❌"), "should show failure outcome: {summary}");
+    }
+
+    #[test]
+    fn test_build_task_summary_all_success() {
+        let steps = vec![
+            TaskStep { label: "Exec: `dir`".into(), ok: true, detail: None },
+        ];
+        let summary = build_task_summary("list files", &steps, true);
+        assert!(summary.contains("✅ Completed"), "all-success outcome: {summary}");
     }
 
     #[test]

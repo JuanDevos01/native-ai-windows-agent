@@ -515,6 +515,14 @@ impl Channel for TelegramChannel {
             .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {}", msg.chat_id))?;
         self.stop_typing(chat_id).await;
 
+        // Intermediate progress messages (e.g. "🛠️ Exec…", "↳ ✓") mean the agent is still
+        // working. Restart the typing indicator after sending so the user knows it's alive.
+        let is_intermediate = msg
+            .metadata
+            .get("intermediate")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         // Convert markdown to Telegram HTML
         let html = markdown_to_telegram_html(&msg.content);
 
@@ -535,8 +543,16 @@ impl Channel for TelegramChannel {
                 for plain_chunk in &plain_chunks {
                     let _ = bot.send_message(ChatId(chat_id), plain_chunk).await;
                 }
+                if is_intermediate {
+                    self.start_typing(chat_id, &bot).await;
+                }
                 return Ok(());
             }
+        }
+
+        // Agent is still working after an intermediate update — keep the typing indicator alive.
+        if is_intermediate {
+            self.start_typing(chat_id, &bot).await;
         }
 
         debug!(chat_id = chat_id, "telegram message sent");
