@@ -5,7 +5,7 @@
 //! tool calls, and publishes outbound responses.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 use metis_core::bus::queue::MessageBus;
 use metis_core::bus::types::{InboundMessage, OutboundMessage};
 use metis_core::session::manager::SessionManager;
-use metis_core::types::{Message, ToolCall, LlmResponse};
+use metis_core::types::{Message, LlmResponse};
 use metis_providers::traits::{LlmProvider, LlmRequestConfig};
 
 use crate::context::ContextBuilder;
@@ -737,40 +737,10 @@ enum ExecFailureKind {
     FileNotFound(String),
     AccessDenied,
     ProcessExitedEarly { exit_code: Option<String>, snippet: String },
-    SqliteSchemaError { table: String, column: String },
-    Unknown,
 }
 
 /// Parse exec output into a structured failure reason.
 fn parse_exec_failure(output: &str) -> Option<ExecFailureKind> {
-    // SQLite schema errors — "table X has no column named Y"
-    if let Some(pos) = output.find("has no column named") {
-        let before = &output[..pos];
-        let after = &output[pos + "has no column named".len()..];
-        let table = before
-            .split_whitespace()
-            .rev()
-            .find(|w| !w.is_empty())
-            .unwrap_or("unknown")
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
-            .to_string();
-        let column = after
-            .split_whitespace()
-            .next()
-            .unwrap_or("unknown")
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
-            .to_string();
-        return Some(ExecFailureKind::SqliteSchemaError { table, column });
-    }
-    // Also catch "OperationalError: table X" form.
-    if output.contains("OperationalError") && output.contains("no column named") {
-        let col = output
-            .find("no column named")
-            .and_then(|p| output[p + "no column named".len()..].split_whitespace().next().map(|s| s.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-        return Some(ExecFailureKind::SqliteSchemaError { table: "invoices".to_string(), column: col });
-    }
-
     // PROCESS_EXITED_EARLY — produced by our Start-Process rewriter.
     if let Some(pos) = output.find("PROCESS_EXITED_EARLY") {
         let tail = &output[pos..];
@@ -945,19 +915,7 @@ Diagnose: (1) read the log files in the working directory, \
 Do NOT inform the user yet — keep debugging.]"
             )
         }
-        Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
-            format!(
-                "{result}\n\n[Metis hint: ❌ SQLite schema error — table '{table}' is missing column '{column}'. \
-Do NOT restart Python. The fix is to migrate the database schema. \
-Steps: \
-(1) Use read_file to open the Python script and find where the table is created (CREATE TABLE statement). \
-(2) Add the missing column: run exec with `python -c \"import sqlite3; conn = sqlite3.connect('invoices.db'); conn.execute('ALTER TABLE {table} ADD COLUMN {column} TEXT'); conn.commit(); conn.close(); print('OK')\"` \
-    (adjust the DB file path and column type from the CREATE TABLE definition). \
-(3) Retry Start-Process for the server. \
-NEVER run python server.py directly — always use Start-Process.]"
-            )
-        }
-        Some(ExecFailureKind::Unknown) | None => result.to_string(),
+        None => result.to_string(),
     }
 }
 
@@ -1040,9 +998,6 @@ fn last_exec_failure_hint(outputs: &[String]) -> String {
         }
         Some(ExecFailureKind::FileNotFound(ref s)) => {
             format!("file/path not found ({s}) — locate the correct path and retry")
-        }
-        Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
-            format!("SQLite schema mismatch: table '{table}' is missing column '{column}' — use ALTER TABLE or recreate the DB, do NOT restart Python")
         }
         _ => {
             // Pull the first failure-looking line from the output.
@@ -1398,134 +1353,8 @@ fn is_invoice_processor_start_request(input: &str) -> bool {
             || lower.contains("run"))
 }
 
-fn build_invoice_processor_start_ps(workspace: &Path, port: u16) -> String {
-    let root = workspace.display().to_string().replace('\'', "''");
-    // Bounded search only — full-workspace -Recurse can exceed the exec tool timeout.
-    format!(
-        "$ErrorActionPreference='Stop'; \
-$root='{root}'; \
-$port={port}; \
-$script = $null; \
-$named = @('invoice.py','invoice_processor.py','invoice_app.py','app.py') | ForEach-Object {{ Join-Path $root $_ }} | Where-Object {{ Test-Path -LiteralPath $_ }} | Select-Object -First 1; \
-if ($named) {{ $script = Get-Item -LiteralPath $named }}; \
-if (-not $script) {{ \
-  $searchDirs = @($root, (Join-Path $root 'invoice'), (Join-Path $root 'invoice-processor'), (Join-Path $root 'mission-control')); \
-  foreach ($dir in $searchDirs) {{ \
-    if (-not (Test-Path -LiteralPath $dir)) {{ continue }}; \
-    $script = Get-ChildItem -LiteralPath $dir -File -Filter '*.py' -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match 'invoice' }} | Select-Object -First 1; \
-    if ($script) {{ break }}; \
-    $script = Get-ChildItem -LiteralPath $dir -File -Filter '*.py' -Recurse -Depth 2 -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match 'invoice' }} | Select-Object -First 1; \
-    if ($script) {{ break }} \
-  }} \
-}}; \
-if (-not $script) {{ throw \"No invoice*.py found (searched $root and shallow subfolders only)\" }}; \
-$dir = $script.DirectoryName; \
-if (!(Test-Path -LiteralPath $dir)) {{ throw \"WorkingDirectory missing: $dir\" }}; \
-$py = (Get-Command py -ErrorAction SilentlyContinue).Source; \
-if (-not $py) {{ $py = (Get-Command python -ErrorAction SilentlyContinue).Source }}; \
-if (-not $py) {{ throw 'Python not found (py/python)' }}; \
-$proc = Start-Process -FilePath $py -ArgumentList $script.FullName -WorkingDirectory $dir -PassThru -WindowStyle Hidden; \
-Start-Sleep -Seconds 2; \
-try {{ \
-  $r = Invoke-WebRequest -Uri (\"http://127.0.0.1:{{0}}\" -f $port) -UseBasicParsing -TimeoutSec 4; \
-  \"INVOICE_SERVER_OK PID=$($proc.Id) STATUS=$($r.StatusCode) SCRIPT=$($script.FullName) DIR=$dir\" \
-}} catch {{ \
-  \"INVOICE_SERVER_FAIL PID=$($proc.Id) SCRIPT=$($script.FullName) DIR=$dir ERROR=$($_.Exception.Message)\" \
-}}"
-    )
-}
-
-fn is_local_http_server_start_request(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    let asks_start = lower.contains("start")
-        || lower.contains("launch")
-        || lower.contains("bring up")
-        || (lower.contains("run") && (lower.contains("server") || lower.contains("webserver")));
-    let mentions_server = lower.contains("webserver")
-        || lower.contains("web server")
-        || lower.contains("http server")
-        || lower.contains("localhost")
-        || lower.contains("python -m http.server")
-        || lower.contains("mission-control")
-        || lower.contains("invoice");
-    let port_down = (lower.contains(":5000") || lower.contains("port 5000") || lower.contains(":8080"))
-        && (lower.contains("not working")
-            || lower.contains("not running")
-            || lower.contains("doesn't work")
-            || lower.contains("does not work"));
-    (asks_start && mentions_server) || port_down
-}
-
-fn extract_port_from_text(input: &str) -> Option<u16> {
-    extract_all_ports_from_text(input).into_iter().next()
-}
-
-fn extract_all_ports_from_text(input: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-    if let Ok(re_localhost) = Regex::new(r"localhost:(\d{2,5})") {
-        for cap in re_localhost.captures_iter(input) {
-            if let Ok(p) = cap[1].parse::<u16>() {
-                ports.push(p);
-            }
-        }
-    }
-    if let Ok(re_port) = Regex::new(r"(?i)\bport\s+(\d{2,5})\b") {
-        for cap in re_port.captures_iter(input) {
-            if let Ok(p) = cap[1].parse::<u16>() {
-                ports.push(p);
-            }
-        }
-    }
-    if let Ok(re_colon) = Regex::new(r":(\d{4,5})\b") {
-        for cap in re_colon.captures_iter(input) {
-            if let Ok(p) = cap[1].parse::<u16>() {
-                if (5000..=65535).contains(&p) || p == 8080 {
-                    ports.push(p);
-                }
-            }
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
-}
-
-/// User needs Mission Control (8080) and invoice processor (5000) addressed together.
-fn is_dual_local_servers_request(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    let mentions_both = lower.contains("8080") && lower.contains("5000");
-    if !mentions_both {
-        return false;
-    }
-    let wants_action = lower.contains("fix")
-        || lower.contains("start")
-        || lower.contains("launch")
-        || lower.contains("verify")
-        || lower.contains("not working")
-        || lower.contains("not running")
-        || lower.contains("isn't running")
-        || lower.contains("is not running")
-        || lower.contains("false claim")
-        || lower.contains("again")
-        || lower.contains("full stop")
-        || lower.contains("mission control")
-        || lower.contains("invoice");
-    wants_action
-}
-
-fn default_http_server_port(input: &str) -> u16 {
-    let ports = extract_all_ports_from_text(input);
-    if ports.contains(&5000) && !ports.contains(&8080) {
-        return 5000;
-    }
-    if ports.contains(&8080) {
-        return 8080;
-    }
-    8080
-}
-
 #[cfg(test)]
-fn build_mission_control_start_ps(root: &Path, port: u16) -> String {
+fn build_mission_control_start_ps(root: &std::path::Path, port: u16) -> String {
     let root_escaped = root.display().to_string().replace('\'', "''");
     format!(
         "$ErrorActionPreference='Stop'; \
@@ -2510,48 +2339,41 @@ Run the next command in a follow-up message, or combine steps into one script."
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
-                let is_autonomous = is_autonomous_local_servers_work(&msg.content)
-                    || is_multi_step_fix_request(&msg.content);
                 let remaining_exec_budget = exec_calls_executed < max_exec_calls;
 
-                // Case 1: early iteration, no tools called yet, LLM is narrating a plan.
-                let is_early = iteration < 3;
-                let is_idle_plan = is_early
-                    && exec_calls_executed == 0
-                    && response_is_plan_without_tools(content_text);
-
-                // Case 2: last exec(s) had unresolved failures — keep the agent working.
-                // Use exec_report_failed on the raw outputs (not parse_exec_failure) to avoid
-                // false positives from heuristic string matching.
+                // Universal persistence signal: a tool call FAILED and we still have budget.
+                // This is task-agnostic (no server/keyword gating) and never fires on a pure
+                // question, because a question has no failed tool call.
                 let still_failing = remaining_exec_budget
                     && has_unresolved_exec_failures(&exec_tool_outputs);
 
-                // Case 3: model described a problem without calling a tool to fix it.
-                // "I see the issue, the column is missing. Let me fix it:" → but no tool call.
-                let identified_without_acting = remaining_exec_budget
-                    && response_identified_problem_without_fix(content_text);
+                // Behavioural signal: the model SAID it would act ("let me…", "I'll fix…",
+                // "I see the problem…") on an early iteration but called no tool. Nudge it to
+                // actually act. This keys off the model's own stated intent, not task keywords,
+                // so it does not force tool calls when the model simply answered a question.
+                let said_will_act_but_didnt = exec_calls_executed == 0
+                    && iteration < 3
+                    && (response_is_plan_without_tools(content_text)
+                        || response_identified_problem_without_fix(content_text));
 
-                if is_autonomous && (is_idle_plan || still_failing || identified_without_acting) {
+                if still_failing || said_will_act_but_didnt {
                     ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
                     let nudge = if still_failing {
                         let hint = last_exec_failure_hint(&exec_tool_outputs);
                         format!(
-                            "The task is NOT done yet — {hint}. \
-Do NOT stop or summarise. Call the next tool RIGHT NOW to fix it. \
-Keep calling tools until the problem is resolved or you have exhausted all options."
+                            "A step did not succeed yet — {hint}. \
+Continue: call the next tool to fix it. If you are genuinely blocked, stop and explain exactly \
+what is blocking and the next step — do not stop silently."
                         )
-                    } else if identified_without_acting {
-                        "You described the problem but did NOT call a tool to fix it. \
-Call exec, read_file, or edit_file RIGHT NOW to apply the fix. \
-Do not describe — act.".to_string()
                     } else {
-                        "Stop describing what you will do — call the exec or read_file tool RIGHT NOW to start. \
-Do not write any more text until you have called at least one tool.".to_string()
+                        "You said what you would do but did not call a tool. \
+Call the tool now to actually do it (or, if this was only a question, just answer it directly)."
+                            .to_string()
                     };
                     messages.push(Message::user(&nudge));
                     continue;
                 }
-                // No tool calls and task is either done or non-autonomous → final answer
+                // No tool calls and nothing pending → final answer.
                 final_content = response.content;
                 break;
             }
@@ -2820,7 +2642,7 @@ Reply **continue** and I will patch Mission Control click handlers and start/che
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use metis_core::types::{LlmResponse, ToolDefinition};
+    use metis_core::types::{LlmResponse, ToolCall, ToolDefinition};
 
     /// A mock LLM provider that returns canned responses.
     struct MockProvider {
@@ -3192,13 +3014,6 @@ Write-Output "hello"
     }
 
     #[test]
-    fn test_invoice_start_script_uses_bounded_search() {
-        let ps = build_invoice_processor_start_ps(Path::new(r"C:\ws"), 5000);
-        assert!(!ps.contains("-Path $root -Recurse"));
-        assert!(ps.contains("-Depth 2"));
-    }
-
-    #[test]
     fn test_wrap_blocking_server_command_rewrites_python() {
         let cmd = r"cd C:\Users\chack\.metis\workspace\email-app; python invoice_processor.py";
         let result = wrap_blocking_server_command_windows(cmd);
@@ -3223,27 +3038,6 @@ Write-Output "hello"
             wrap_blocking_server_command_windows(cmd).is_none(),
             "3-part command should not be rewritten"
         );
-    }
-
-    #[test]
-    fn test_parse_exec_failure_sqlite_schema() {
-        let out = "sqlite3.OperationalError: table invoices has no column named invoice_date";
-        match parse_exec_failure(out) {
-            Some(ExecFailureKind::SqliteSchemaError { ref table, ref column }) => {
-                assert!(column.contains("invoice_date"), "column: {column}");
-                assert!(table.contains("invoices"), "table: {table}");
-            }
-            other => panic!("expected SqliteSchemaError, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_annotate_exec_sqlite_hint() {
-        let out = "sqlite3.OperationalError: table invoices has no column named invoice_date";
-        let annotated = annotate_exec_result_with_hint(out);
-        assert!(annotated.contains("ALTER TABLE"), "should suggest ALTER TABLE: {annotated}");
-        assert!(annotated.contains("Metis hint"), "{annotated}");
-        assert!(!annotated.contains("Start-Process python"), "should not suggest restarting: {annotated}");
     }
 
     // ── Layer 1: exec_report_failed conservatism ──────────────────────────────
@@ -3433,36 +3227,6 @@ Write-Output "hello"
     fn test_exec_report_failed_detects_timeout() {
         let block = "<<<EXEC_RESULT>>>\nSTATUS: TIMEOUT\nTIMEOUT_SECONDS: 60\n<<<END_EXEC_RESULT>>>";
         assert!(super::exec_report_failed(block));
-    }
-
-    #[test]
-    fn test_dual_local_servers_detection() {
-        assert!(is_dual_local_servers_request(
-            "again false claim 8080 is running and 5000 not — full stop"
-        ));
-        assert!(is_dual_local_servers_request(
-            "port 8080 mission control not clickable, port 5000 invoice not working"
-        ));
-    }
-
-    #[test]
-    fn test_default_http_server_port_prefers_5000_when_only_5000_mentioned() {
-        assert_eq!(default_http_server_port("start server port 5000 not running"), 5000);
-        assert_eq!(default_http_server_port("fix localhost:8080 and :5000"), 8080);
-    }
-
-    #[test]
-    fn test_local_http_server_start_detection() {
-        assert!(is_local_http_server_start_request("start webserver on localhost:5000"));
-        assert!(is_local_http_server_start_request("run python -m http.server"));
-        assert!(!is_local_http_server_start_request("why is localhost failing"));
-    }
-
-    #[test]
-    fn test_extract_port_from_text() {
-        assert_eq!(extract_port_from_text("open localhost:5000"), Some(5000));
-        assert_eq!(extract_port_from_text("start server on port 8081"), Some(8081));
-        assert_eq!(extract_port_from_text("no port"), None);
     }
 
     #[test]
