@@ -448,12 +448,17 @@ pub async fn run() -> Result<()> {
         }
     }
     info!(
+        version = %metis_core::build::version_line(),
         model = %model,
         workspace = %workspace.display(),
         channels = ?channel_manager.channel_names(),
         "gateway starting"
     );
 
+    println!(
+        "  Version:   {}",
+        metis_core::build::version_line()
+    );
     println!(
         "  Model:     {}",
         model

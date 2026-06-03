@@ -1,3 +1,4 @@
+pub mod build;
 pub mod types;
 pub mod bus;
 pub mod config;

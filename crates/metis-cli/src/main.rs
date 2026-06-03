@@ -37,7 +37,7 @@ use metis_providers::http_provider::create_provider;
 
 /// 🦀 Metis — Ultra-lightweight AI assistant in Rust
 #[derive(Parser)]
-#[command(name = "metis", version, about, long_about = None)]
+#[command(name = "metis", version = metis_core::build::VERSION_LINE, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

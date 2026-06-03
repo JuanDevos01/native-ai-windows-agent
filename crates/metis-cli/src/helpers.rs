@@ -34,12 +34,11 @@ pub fn print_response(response: &str, _render_markdown: bool) {
 
 /// Print the banner shown at REPL start.
 pub fn print_banner() {
-    let version = env!("CARGO_PKG_VERSION");
     println!();
     println!(
-        "{}  v{}",
+        "{}  {}",
         "🦀 Metis".cyan().bold(),
-        version.dimmed()
+        metis_core::build::version_line().dimmed()
     );
     println!(
         "{}",
