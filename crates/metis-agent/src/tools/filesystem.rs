@@ -128,9 +128,12 @@ impl Tool for ReadFileTool {
             anyhow::bail!("Not a file: {}", path.display());
         }
 
-        let content = std::fs::read_to_string(&path)
+        // Read as bytes then decode leniently: log files and other artifacts often contain
+        // non-UTF-8 bytes, and read_to_string would hard-fail on them. Lossy decoding lets the
+        // agent still inspect the file instead of falling back to shell commands.
+        let bytes = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
-        Ok(content)
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 

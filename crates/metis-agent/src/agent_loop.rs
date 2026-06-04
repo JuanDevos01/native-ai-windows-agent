@@ -2146,47 +2146,14 @@ Run the next command in a follow-up message, or combine steps into one script."
                         "tool result"
                     );
 
-                    // Annotate exec results with an actionable hint when a known failure is detected.
-                    // Also: for MissingModule, auto-inject a pip install exec immediately.
+                    // Annotate exec results with a short actionable hint when a known failure
+                    // pattern is detected (the hint guides the model — it is not an action).
                     let annotated_result = if tc.function.name == "exec" {
                         annotate_exec_result_with_hint(&result)
                     } else {
                         result.clone()
                     };
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &annotated_result);
-
-                    // Auto-fix: MissingModule → immediately run pip install without waiting for LLM.
-                    // This fires as a synthetic tool result that the LLM sees on the next iteration.
-                    if tc.function.name == "exec" {
-                        if let Some(ExecFailureKind::MissingModule(ref module)) = parse_exec_failure(&result) {
-                            if !module.is_empty() {
-                                let pip_name = pip_package_name(module).to_string();
-                                let pip_cmd = format!("pip install {pip_name}");
-                                info!(module = %module, pip = %pip_cmd, "auto-running pip install for missing module");
-                                let pip_params = {
-                                    let mut m = std::collections::HashMap::new();
-                                    m.insert("command".to_string(), serde_json::Value::String(pip_cmd.clone()));
-                                    m
-                                };
-                                let pip_result = self.tools.execute("exec", pip_params).await;
-                                exec_calls_executed += 1;
-                                exec_tool_outputs.push(pip_result.clone());
-                                // Inject as a synthetic tool call + result so the LLM knows it happened.
-                                let synthetic_id = format!("auto_pip_{}", tc.id);
-                                let pip_success = !pip_result.contains("ERROR") && !pip_result.contains("error:");
-                                let pip_note = if pip_success {
-                                    format!(
-                                        "✅ Auto-installed `{pip_name}` via pip. Now retry Start-Process for the server."
-                                    )
-                                } else {
-                                    format!(
-                                        "❌ pip install {pip_name} failed. Output:\n{pip_result}\nCheck pip availability or try a different package name."
-                                    )
-                                };
-                                ContextBuilder::add_tool_result(&mut messages, &synthetic_id, &format!("exec(`{pip_cmd}`):\n{pip_result}\n\n[Metis auto-fix result: {pip_note}]"));
-                            }
-                        }
-                    }
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
