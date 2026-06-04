@@ -209,13 +209,16 @@ impl ExecTool {
         let avail_for_body = MAX_OUTPUT_LEN.saturating_sub(header.len() + sep_len + 64);
         if body.len() > avail_for_body {
             let omit = body.len() - avail_for_body;
-            // Find the nearest char boundary at or before avail_for_body so we never
-            // split a multi-byte UTF-8 sequence (which would panic on truncate).
-            let safe_len = body.floor_char_boundary(avail_for_body);
-            body.truncate(safe_len);
-            body.push_str(&format!(
-                "\n... (truncated stdout/stderr; {omit} chars omitted)"
-            ));
+            // Keep BOTH the head and the tail. Errors/tracebacks put the actual message at the
+            // END, so dropping the tail would hide the one line needed to fix the problem.
+            // Bias toward the tail (where the error lives) while keeping some leading context.
+            let marker = format!("\n... (truncated; {omit} chars omitted from the middle) ...\n");
+            let budget = avail_for_body.saturating_sub(marker.len());
+            let head_len = budget / 3;
+            let tail_len = budget - head_len;
+            let head_end = body.floor_char_boundary(head_len);
+            let tail_start = body.ceil_char_boundary(body.len() - tail_len);
+            body = format!("{}{}{}", &body[..head_end], marker, &body[tail_start..]);
         }
 
         format!("{header}\n{body}")

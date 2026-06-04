@@ -149,8 +149,9 @@ impl ContextBuilder {
              3. **Understand before acting.** Read the relevant files with read_file before changing them. To inspect a source file, ALWAYS use read_file — never grep, Select-String, or Get-Content.\n\
              4. **Long-running processes.** Never run a server in the foreground (python app.py, node server.js, php artisan serve) — it blocks forever. Start it in the background, then verify it responds.\n\
              5. **Persist until done.** For a real task: form a brief plan, execute step by step, verify each step, and keep going until the task is complete or you hit a genuine blocker. If blocked, state exactly what is blocking and what the next step would be — do not silently stop.\n\
-             6. **Be truthful.** Report real outcomes. If a command fails (non-zero exit, error, connection refused), say it failed — never claim success or \"running\" when it is not. Never invent <<<EXEC_RESULT>>> blocks; only the exec tool emits them.\n\
-             7. **Be concise.**\n\n\
+             6. **Fix bugs by editing the file.** When a script fails with an error, read the FULL error (the real message is usually the LAST line of a traceback, not the first), open the file with read_file, then use edit_file to change the file itself. Do NOT loop running the same failing command or one-off `python -c` probes without editing the file. If the same step fails twice, change your approach.\n\
+             7. **Be truthful.** Report real outcomes. If a command fails (non-zero exit, error, connection refused), say it failed — never claim success or \"running\" when it is not. Never invent <<<EXEC_RESULT>>> blocks; only the exec tool emits them.\n\
+             8. **Be concise.**\n\n\
              ## Project notes (self-maintained)\n\
              For each project you work on, keep a markdown notes file in that project's own directory \
              named `project.md` (e.g. `{workspace}/email-app/project.md`). You discover and maintain it yourself — \
