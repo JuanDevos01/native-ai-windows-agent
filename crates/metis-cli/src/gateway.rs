@@ -160,6 +160,7 @@ pub async fn run() -> Result<()> {
         Arc::new(provider),
         workspace.clone(),
         Some(model.to_string()),
+        Some(defaults.subagent_model.clone()),
         Some(defaults.max_tool_iterations as usize),
         None,
         brave_key,
@@ -210,8 +211,8 @@ pub async fn run() -> Result<()> {
             workspace.clone(),
             Some(bus.clone()),
             Some(callback),
-            None, // default 30 min
-            true,
+            Some(config.heartbeat.interval_seconds()),
+            config.heartbeat.enabled,
         ))
     };
 
@@ -475,7 +476,11 @@ pub async fn run() -> Result<()> {
         let enabled = cron_jobs.iter().filter(|j| j.enabled).count();
         println!("  Cron:      {} jobs ({} enabled)", cron_jobs.len(), enabled);
     }
-    println!("  Heartbeat: every 30m");
+    if config.heartbeat.enabled {
+        println!("  Heartbeat: every {}m", config.heartbeat.interval_minutes.max(1));
+    } else {
+        println!("  Heartbeat: disabled");
+    }
     println!();
 
     if channel_manager.is_empty() {

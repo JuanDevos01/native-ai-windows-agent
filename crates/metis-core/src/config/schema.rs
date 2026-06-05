@@ -29,6 +29,9 @@ pub struct Config {
     /// Local HTTP API for the agent (`metis serve`).
     #[serde(default)]
     pub http_server: HttpServerConfig,
+    /// Periodic background heartbeat (reads HEARTBEAT.md).
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
 }
 
 impl Default for Config {
@@ -41,7 +44,34 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             transcription: TranscriptionConfig::default(),
             http_server: HttpServerConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         }
+    }
+}
+
+/// Background heartbeat configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HeartbeatConfig {
+    /// Whether the periodic heartbeat runs at all.
+    pub enabled: bool,
+    /// Minutes between heartbeat ticks (clamped to a minimum of 1).
+    pub interval_minutes: u64,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_minutes: 30,
+        }
+    }
+}
+
+impl HeartbeatConfig {
+    /// Effective interval in seconds (minimum 60s to avoid hammering the model).
+    pub fn interval_seconds(&self) -> u64 {
+        self.interval_minutes.max(1) * 60
     }
 }
 
@@ -74,6 +104,10 @@ pub struct AgentDefaults {
     pub workspace: String,
     /// Default LLM model identifier.
     pub model: String,
+    /// Optional model for spawned subagents. Empty = use the same model as `model`.
+    /// Lets you run cheaper/faster subagents (or a different provider) than the main agent.
+    #[serde(default)]
+    pub subagent_model: String,
     /// Maximum tokens to generate per response.
     pub max_tokens: u32,
     /// Sampling temperature (0.0 – 2.0).
@@ -108,6 +142,7 @@ impl Default for AgentDefaults {
         Self {
             workspace: "~/.metis/workspace".to_string(),
             model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            subagent_model: String::new(),
             max_tokens: 8192,
             temperature: 0.7,
             max_tool_iterations: 20,
@@ -776,7 +811,7 @@ mod tests {
         assert!(!config.agents.defaults.include_fenced_code_in_chat_apps);
         // Defaults preserved for missing fields
         assert!(!config.tools.restrict_to_workspace);
-        assert_eq!(config.tools.exec.timeout, 60);
+        assert_eq!(config.tools.exec.timeout, 180);
     }
 
     #[test]

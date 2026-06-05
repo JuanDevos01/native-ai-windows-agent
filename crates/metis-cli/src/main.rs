@@ -251,6 +251,7 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         Arc::new(provider),
         workspace,
         Some(model.to_string()),
+        Some(defaults.subagent_model.clone()),
         Some(defaults.max_tool_iterations as usize),
         None, // uses defaults for temperature/max_tokens
         brave_key,

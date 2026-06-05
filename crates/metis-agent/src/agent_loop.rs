@@ -1598,6 +1598,7 @@ impl AgentLoop {
         provider: Arc<dyn LlmProvider>,
         workspace: PathBuf,
         model: Option<String>,
+        subagent_model: Option<String>,
         max_iterations: Option<usize>,
         request_config: Option<LlmRequestConfig>,
         brave_api_key: Option<String>,
@@ -1608,6 +1609,10 @@ impl AgentLoop {
         outbound_formatting: Option<OutboundFormatting>,
     ) -> Self {
         let model = model.unwrap_or_else(|| provider.default_model().to_string());
+        // Subagents fall back to the main model unless a non-empty override is provided.
+        let subagent_model = subagent_model
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| model.clone());
         let max_iterations = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
         let request_config = request_config.unwrap_or_default();
         let exec_config = exec_config.unwrap_or_default();
@@ -1656,7 +1661,7 @@ impl AgentLoop {
             provider.clone(),
             workspace.clone(),
             bus.clone(),
-            model.clone(),
+            subagent_model.clone(),
             brave_api_key,
             exec_config,
             restrict_to_workspace,
@@ -1668,6 +1673,7 @@ impl AgentLoop {
 
         info!(
             model = %model,
+            subagent_model = %subagent_model,
             tools = tools.len(),
             max_iterations = max_iterations,
             "agent loop initialized"
@@ -2508,6 +2514,7 @@ mod tests {
             provider,
             workspace,
             None,
+            None,
             Some(5),
             None,
             None,
@@ -2733,6 +2740,7 @@ Write-Output "hello"
             bus,
             provider,
             dir.path().to_path_buf(),
+            None,
             None,
             Some(10),
             None,
@@ -3075,6 +3083,7 @@ Write-Output "hello"
             provider,
             workspace,
             None,
+            None,
             Some(5),
             None,
             None,
@@ -3125,6 +3134,7 @@ Write-Output "hello"
             bus.clone(),
             provider,
             workspace,
+            None,
             None,
             Some(5),
             None,
