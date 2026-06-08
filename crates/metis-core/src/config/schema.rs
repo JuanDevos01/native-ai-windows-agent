@@ -211,6 +211,10 @@ pub struct ProvidersConfig {
     pub minimax: ProviderConfig,
     #[serde(default)]
     pub aihubmix: ProviderConfig,
+    /// Local Ollama server (OpenAI-compatible). No API key required;
+    /// defaults to http://localhost:11434/v1.
+    #[serde(default)]
+    pub ollama: ProviderConfig,
 }
 
 impl ProvidersConfig {
@@ -229,6 +233,7 @@ impl ProvidersConfig {
             "moonshot" => Some(&self.moonshot),
             "minimax" => Some(&self.minimax),
             "aihubmix" => Some(&self.aihubmix),
+            "ollama" => Some(&self.ollama),
             _ => None,
         }
     }
@@ -249,6 +254,7 @@ impl ProvidersConfig {
             ("moonshot", &self.moonshot),
             ("minimax", &self.minimax),
             ("aihubmix", &self.aihubmix),
+            ("ollama", &self.ollama),
         ];
         for (name, config) in entries {
             map.insert(name.to_string(), (*config).clone());

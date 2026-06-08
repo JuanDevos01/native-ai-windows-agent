@@ -222,6 +222,8 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     let providers_map = config.providers.to_map();
     let provider = create_provider(model, &providers_map)
         .map_err(|e| anyhow::anyhow!(e))?;
+    let subagent_provider =
+        helpers::build_subagent_provider(&defaults.subagent_model, &providers_map);
 
     // Brave API key
     let brave_key = if config.tools.web.search.api_key.is_empty() {
@@ -252,6 +254,7 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         workspace,
         Some(model.to_string()),
         Some(defaults.subagent_model.clone()),
+        subagent_provider,
         Some(defaults.max_tool_iterations as usize),
         None, // uses defaults for temperature/max_tokens
         brave_key,

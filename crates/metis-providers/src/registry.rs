@@ -254,6 +254,23 @@ pub static PROVIDERS: &[ProviderSpec] = &[
         strip_model_prefix: false,
         model_overrides: &[],
     },
+    // 12b. Ollama — local, OpenAI-compatible server (no API key required)
+    ProviderSpec {
+        name: "ollama",
+        keywords: &["ollama"],
+        env_key: "OLLAMA_API_KEY",
+        display_name: "Ollama",
+        // Send the bare model name to Ollama (strip the "ollama/" routing prefix).
+        prefix: None,
+        skip_prefixes: &[],
+        is_gateway: false,
+        is_local: true,
+        detect_by_key_prefix: None,
+        detect_by_base_keyword: Some("11434"),
+        default_api_base: Some("http://localhost:11434/v1"),
+        strip_model_prefix: true,
+        model_overrides: &[],
+    },
     // 12. Groq
     ProviderSpec {
         name: "groq",
@@ -278,13 +295,14 @@ pub static PROVIDERS: &[ProviderSpec] = &[
 
 /// Find a provider spec by matching keywords against a model name.
 ///
-/// Skips gateways and local providers — those are fallback only.
+/// Skips gateways (those are fallback-only). Local providers (e.g. Ollama,
+/// vLLM) ARE matched here because their keywords are specific and explicit —
+/// a model like `"ollama/llama3.1"` should route directly to Ollama.
 /// Returns the first match in priority order.
 pub fn find_by_model(model: &str) -> Option<&'static ProviderSpec> {
     let model_lower = model.to_lowercase();
     PROVIDERS.iter().find(|spec| {
         !spec.is_gateway
-            && !spec.is_local
             && spec
                 .keywords
                 .iter()
@@ -412,7 +430,11 @@ pub fn match_provider<'a>(
     // 1. Direct keyword match
     if let Some(spec) = find_by_model(model) {
         if let Some(config) = providers.get(spec.name) {
-            if config.is_configured() {
+            // Local providers (Ollama, vLLM) need no API key — they're usable
+            // as long as they have an endpoint (configured or default).
+            let local_reachable =
+                spec.is_local && (config.api_base.is_some() || spec.default_api_base.is_some());
+            if config.is_configured() || local_reachable {
                 return Some((config, spec));
             }
         }
@@ -655,6 +677,27 @@ mod tests {
 
     #[test]
     fn test_provider_count() {
-        assert_eq!(PROVIDERS.len(), 12);
+        assert_eq!(PROVIDERS.len(), 13);
+    }
+
+    #[test]
+    fn test_find_by_model_ollama() {
+        let spec = find_by_model("ollama/llama3.1").unwrap();
+        assert_eq!(spec.name, "ollama");
+    }
+
+    #[test]
+    fn test_ollama_resolves_to_bare_model() {
+        let spec = find_by_name("ollama").unwrap();
+        // The "ollama/" routing prefix is stripped before hitting the local API.
+        assert_eq!(resolve_model_name("ollama/llama3.1", spec), "llama3.1");
+    }
+
+    #[test]
+    fn test_ollama_matches_without_api_key() {
+        let mut providers = HashMap::new();
+        providers.insert("ollama".to_string(), ProviderConfig::default());
+        let (_cfg, spec) = match_provider("ollama/llama3.1", &providers).unwrap();
+        assert_eq!(spec.name, "ollama");
     }
 }

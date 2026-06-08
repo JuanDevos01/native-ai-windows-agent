@@ -131,6 +131,8 @@ pub async fn run() -> Result<()> {
     let providers_map = config.providers.to_map();
     let provider = create_provider(model, &providers_map)
         .map_err(|e| anyhow::anyhow!(e))?;
+    let subagent_provider =
+        helpers::build_subagent_provider(&defaults.subagent_model, &providers_map);
 
     // 5. Brave API key
     let brave_key = if config.tools.web.search.api_key.is_empty() {
@@ -161,6 +163,7 @@ pub async fn run() -> Result<()> {
         workspace.clone(),
         Some(model.to_string()),
         Some(defaults.subagent_model.clone()),
+        subagent_provider,
         Some(defaults.max_tool_iterations as usize),
         None,
         brave_key,

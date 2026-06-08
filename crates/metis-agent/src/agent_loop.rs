@@ -1599,6 +1599,7 @@ impl AgentLoop {
         workspace: PathBuf,
         model: Option<String>,
         subagent_model: Option<String>,
+        subagent_provider: Option<Arc<dyn LlmProvider>>,
         max_iterations: Option<usize>,
         request_config: Option<LlmRequestConfig>,
         brave_api_key: Option<String>,
@@ -1613,6 +1614,9 @@ impl AgentLoop {
         let subagent_model = subagent_model
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| model.clone());
+        // Subagents reuse the main provider unless a dedicated one is supplied
+        // (e.g. a local Ollama backend for cheap/offline delegation).
+        let subagent_provider = subagent_provider.unwrap_or_else(|| provider.clone());
         let max_iterations = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
         let request_config = request_config.unwrap_or_default();
         let exec_config = exec_config.unwrap_or_default();
@@ -1658,7 +1662,7 @@ impl AgentLoop {
 
         // Subagent manager + spawn tool
         let subagent_manager = Arc::new(SubagentManager::new(
-            provider.clone(),
+            subagent_provider,
             workspace.clone(),
             bus.clone(),
             subagent_model.clone(),
@@ -2515,6 +2519,7 @@ mod tests {
             workspace,
             None,
             None,
+            None,
             Some(5),
             None,
             None,
@@ -2740,6 +2745,7 @@ Write-Output "hello"
             bus,
             provider,
             dir.path().to_path_buf(),
+            None,
             None,
             None,
             Some(10),
@@ -3084,6 +3090,7 @@ Write-Output "hello"
             workspace,
             None,
             None,
+            None,
             Some(5),
             None,
             None,
@@ -3134,6 +3141,7 @@ Write-Output "hello"
             bus.clone(),
             provider,
             workspace,
+            None,
             None,
             None,
             Some(5),

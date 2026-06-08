@@ -1,8 +1,41 @@
 //! Shared CLI helpers — path expansion, response printing, version banner.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use colored::Colorize;
+
+use metis_core::config::schema::ProviderConfig;
+use metis_providers::http_provider::create_provider;
+use metis_providers::traits::LlmProvider;
+
+/// Build a dedicated LLM provider for subagents, when `subagent_model` is set.
+///
+/// Returns `None` to mean "reuse the main agent's provider" — that is the case
+/// when no subagent model is configured. When a model is configured but its
+/// provider can't be built (missing key, unknown provider), we log a warning
+/// and fall back to the main provider rather than failing startup.
+pub fn build_subagent_provider(
+    subagent_model: &str,
+    providers_map: &HashMap<String, ProviderConfig>,
+) -> Option<Arc<dyn LlmProvider>> {
+    let model = subagent_model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    match create_provider(model, providers_map) {
+        Ok(provider) => Some(Arc::new(provider) as Arc<dyn LlmProvider>),
+        Err(e) => {
+            tracing::warn!(
+                model = %model,
+                error = %e,
+                "subagent model provider unavailable; subagents will use the main agent's provider"
+            );
+            None
+        }
+    }
+}
 
 /// Expand `~` at the start of a path to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
