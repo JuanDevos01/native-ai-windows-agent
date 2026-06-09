@@ -122,6 +122,7 @@ pub async fn run() -> Result<()> {
     let workspace = helpers::expand_tilde(&defaults.workspace);
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create workspace: {}", workspace.display()))?;
+    helpers::ensure_guide_in_workspace(&workspace);
 
     // 3. Create message bus (shared between agent + channels)
     let bus = Arc::new(MessageBus::new(100));

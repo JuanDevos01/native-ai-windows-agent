@@ -214,6 +214,7 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     let workspace = helpers::expand_tilde(&defaults.workspace);
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create workspace: {}", workspace.display()))?;
+    helpers::ensure_guide_in_workspace(&workspace);
 
     // Resolve model
     let model = &defaults.model;

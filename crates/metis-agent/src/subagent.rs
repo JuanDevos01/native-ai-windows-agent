@@ -22,9 +22,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 use metis_core::bus::queue::MessageBus;
-use metis_core::bus::types::InboundMessage;
+use metis_core::bus::types::{InboundMessage, OutboundMessage};
 use metis_core::types::{Message, ToolCall};
 use metis_providers::traits::{LlmProvider, LlmRequestConfig};
+
+use crate::agent_loop::{is_chat_app_channel, tool_outcome_preview, tool_progress_preview};
 
 use crate::agent_loop::ExecToolConfig;
 use crate::context::ContextBuilder;
@@ -150,8 +152,10 @@ impl SubagentManager {
         let lbl = display_label.clone();
         let t = task.clone();
 
+        let oc = origin_channel.clone();
+        let oci = origin_chat_id.clone();
         tokio::spawn(async move {
-            let result = mgr.run_subagent(&tid, &t).await;
+            let result = mgr.run_subagent(&tid, &lbl, &t, &oc, &oci).await;
 
             match result {
                 Ok(response) => {
@@ -187,8 +191,28 @@ impl SubagentManager {
     /// This is the core execution: build an isolated context, register
     /// limited tools, and loop LLM ↔ tools until a final answer or
     /// max iterations.
-    async fn run_subagent(&self, task_id: &str, task: &str) -> Result<String> {
+    async fn run_subagent(
+        &self,
+        task_id: &str,
+        label: &str,
+        task: &str,
+        origin_channel: &str,
+        origin_chat_id: &str,
+    ) -> Result<String> {
         info!(task_id = %task_id, "subagent starting");
+
+        // Stream the subagent's progress into the originating chat (intermediate
+        // messages), so the user can watch its work instead of only the final result.
+        let stream_to_chat = is_chat_app_channel(origin_channel);
+        if stream_to_chat {
+            let mut start = OutboundMessage::new(
+                origin_channel,
+                origin_chat_id,
+                format!("🤖 Subagent [{label}] started — working…"),
+            );
+            start.metadata.insert("intermediate".into(), "true".into());
+            let _ = self.bus.publish_outbound(start).await;
+        }
 
         // Build isolated tool registry (no message, no spawn, no edit_file)
         let mut tools = ToolRegistry::new();
@@ -238,6 +262,17 @@ impl SubagentManager {
                 );
 
                 for tc in &tool_calls {
+                    if stream_to_chat {
+                        let preview = tool_progress_preview(&tc.function.name, &tc.function.arguments);
+                        let mut tick = OutboundMessage::new(
+                            origin_channel,
+                            origin_chat_id,
+                            format!("🤖 {preview}"),
+                        );
+                        tick.metadata.insert("intermediate".into(), "true".into());
+                        let _ = self.bus.publish_outbound(tick).await;
+                    }
+
                     let result = match crate::tools::base::parse_tool_params(&tc.function.arguments) {
                         Ok(params) => {
                             info!(
@@ -250,6 +285,19 @@ impl SubagentManager {
                         }
                         Err(e) => format!("Tool argument error for `{}`: {e}", tc.function.name),
                     };
+
+                    if stream_to_chat {
+                        let outcome =
+                            tool_outcome_preview(&tc.function.name, &tc.function.arguments, &result);
+                        let mut tick = OutboundMessage::new(
+                            origin_channel,
+                            origin_chat_id,
+                            format!("  ↳ {outcome}"),
+                        );
+                        tick.metadata.insert("intermediate".into(), "true".into());
+                        let _ = self.bus.publish_outbound(tick).await;
+                    }
+
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &result);
                 }
             } else {
@@ -308,7 +356,9 @@ impl SubagentManager {
     fn build_subagent_prompt(&self, task: &str) -> String {
         format!(
             "# Subagent\n\
-             You are a subagent spawned by the main agent to complete a specific task.\n\n\
+             You are a subagent spawned by the main agent to complete a specific task.\n\
+             You are running on model: {model}. If asked which model you are, report exactly \
+             this — do NOT guess a model name from your training.\n\n\
              ## Your Task\n\
              {task}\n\n\
              ## Rules\n\
@@ -328,6 +378,7 @@ impl SubagentManager {
              - Access the main agent's conversation history\n\n\
              ## Workspace\n\
              Your workspace is at: {workspace}",
+            model = self.model,
             workspace = self.workspace.display()
         )
     }
@@ -571,7 +622,9 @@ mod tests {
         let provider = Arc::new(MockSubagentProvider::simple("The answer is 42."));
         let mgr = create_test_manager(provider);
 
-        let result = mgr.run_subagent("test_id", "What is the answer?").await;
+        let result = mgr
+            .run_subagent("test_id", "test", "What is the answer?", "cli", "direct")
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "The answer is 42.");
     }
@@ -612,7 +665,9 @@ mod tests {
             LlmRequestConfig::default(),
         ));
 
-        let result = mgr.run_subagent("test_tool", "Read data.txt").await;
+        let result = mgr
+            .run_subagent("test_tool", "test", "Read data.txt", "cli", "direct")
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "File contains: important data");
     }
@@ -632,7 +687,7 @@ mod tests {
         let mgr = create_test_manager(provider);
 
         let result = mgr
-            .run_subagent("test_max", "loop forever")
+            .run_subagent("test_max", "test", "loop forever", "cli", "direct")
             .await
             .unwrap();
         assert!(result.contains("completed processing"));

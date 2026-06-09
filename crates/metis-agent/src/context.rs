@@ -37,6 +37,8 @@ pub struct ContextBuilder {
     workspace: PathBuf,
     /// Agent identity name (for the system prompt).
     agent_name: String,
+    /// The LLM model this agent is running on (for self-identification).
+    model: String,
     /// Memory store for long-term + daily notes.
     memory: MemoryStore,
     /// Skills loader for discovering and loading skill files.
@@ -52,6 +54,7 @@ impl ContextBuilder {
         Self {
             workspace,
             agent_name: agent_name.into(),
+            model: String::new(),
             memory,
             skills,
         }
@@ -60,6 +63,12 @@ impl ContextBuilder {
     /// Set the built-in skills directory (builder pattern).
     pub fn with_builtin_skills(mut self, path: PathBuf) -> Self {
         self.skills = SkillsLoader::new(&self.workspace, Some(path));
+        self
+    }
+
+    /// Set the LLM model name for self-identification (builder pattern).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
         self
     }
 
@@ -132,6 +141,11 @@ impl ContextBuilder {
         let today = Utc::now().format("%Y-%m-%d");
 
         let build = metis_core::build::version_line();
+        let model_line = if self.model.is_empty() {
+            String::new()
+        } else {
+            format!("             - **Model**: `{}`\n", self.model)
+        };
 
         format!(
             "# Identity\n\n\
@@ -139,10 +153,17 @@ impl ContextBuilder {
              - **Date/time**: {now}\n\
              - **Runtime**: Rust on {os}/{arch}\n\
              - **Build**: {build}\n\
+{model_line}\
              - **Workspace**: `{workspace}`\n\n\
              You have tools (read_file, write_file, edit_file, exec, web_search, and more). \
              Prefer tools over guessing, and investigate before you answer. \
-             If asked which version/build you are running, report the Build line above.\n\n\
+             If asked which version/build or model you are running, report the Build/Model lines above — \
+             do NOT guess a model name from your training.\n\n\
+             ## When unsure about Metis itself\n\
+             If you are unsure or doubting how Metis (you) works — your model/provider, local Ollama, \
+             subagents, cron scheduling, the heartbeat, channels, or config — READ the guide at \
+             `{workspace}/GUIDE.md` with read_file BEFORE answering or guessing. It is the authoritative \
+             reference for your own configuration and capabilities.\n\n\
              ## Operating principles\n\
              1. **Questions vs. actions.** If the user ASKS something (why / what / how / where / is it / are you), your job is to INVESTIGATE and EXPLAIN. Do NOT modify, delete, create, or \"fix\" anything to answer a question. Only change files or run state-changing commands when the user explicitly asks you to change, fix, build, or start something. When in doubt, explain instead of acting.\n\
              2. **Never take destructive actions** (deleting code, removing functions, dropping data, killing unrelated processes) unless the user explicitly and unambiguously asked for that specific change.\n\

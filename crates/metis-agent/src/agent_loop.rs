@@ -72,7 +72,7 @@ impl Default for OutboundFormatting {
     }
 }
 
-fn is_chat_app_channel(channel: &str) -> bool {
+pub(crate) fn is_chat_app_channel(channel: &str) -> bool {
     channel.eq_ignore_ascii_case("telegram")
         || channel.eq_ignore_ascii_case("discord")
         || channel.eq_ignore_ascii_case("whatsapp")
@@ -1487,7 +1487,7 @@ impl Default for ExecToolConfig {
 // ─────────────────────────────────────────────
 
 /// Build a short "starting" description for a tool call.
-fn tool_progress_preview(tool_name: &str, arguments: &str) -> String {
+pub(crate) fn tool_progress_preview(tool_name: &str, arguments: &str) -> String {
     match tool_name {
         "exec" => {
             let cmd = serde_json::from_str::<serde_json::Value>(arguments)
@@ -1533,7 +1533,7 @@ fn tool_progress_preview(tool_name: &str, arguments: &str) -> String {
 }
 
 /// Build a short "done" or "failed" outcome line after a tool call.
-fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &str) -> String {
+pub(crate) fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &str) -> String {
     if tool_name == "exec" {
         let failed = exec_report_failed(result);
         let cmd = serde_json::from_str::<serde_json::Value>(arguments)
@@ -1625,7 +1625,7 @@ impl AgentLoop {
         let sessions =
             session_manager.unwrap_or_else(|| SessionManager::new(None).expect("failed to create session manager"));
 
-        let context = ContextBuilder::new(&workspace, &agent_name);
+        let context = ContextBuilder::new(&workspace, &agent_name).with_model(&model);
 
         // Build tool registry
         let mut tools = ToolRegistry::new();

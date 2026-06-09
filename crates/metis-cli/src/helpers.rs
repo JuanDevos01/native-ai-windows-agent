@@ -1,10 +1,29 @@
 //! Shared CLI helpers — path expansion, response printing, version banner.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use colored::Colorize;
+
+/// The user/agent guide, bundled into the binary at build time.
+const GUIDE_MD: &str = include_str!("../../../GUIDE.md");
+
+/// Write the bundled `GUIDE.md` into the workspace so the agent can always read
+/// it via `read_file` at a stable path (`<workspace>/GUIDE.md`). Refreshes it
+/// when the bundled copy changes. Best-effort: logs a warning on failure.
+pub fn ensure_guide_in_workspace(workspace: &Path) {
+    let dest = workspace.join("GUIDE.md");
+    let needs_write = match std::fs::read_to_string(&dest) {
+        Ok(existing) => existing != GUIDE_MD,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Err(e) = std::fs::write(&dest, GUIDE_MD) {
+            tracing::warn!(path = %dest.display(), error = %e, "failed to write GUIDE.md to workspace");
+        }
+    }
+}
 
 use metis_core::config::schema::ProviderConfig;
 use metis_providers::http_provider::create_provider;
