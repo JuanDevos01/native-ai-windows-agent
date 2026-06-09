@@ -17,6 +17,7 @@ mod gateway;
 mod cron_cmd;
 mod channels_cmd;
 mod heartbeat_cmd;
+mod model_cmd;
 mod serve;
 
 use std::sync::Arc;
@@ -76,6 +77,12 @@ enum Commands {
 
     /// Show configuration and provider status
     Status,
+
+    /// View or change the agent model without re-running onboard
+    Model {
+        /// New model as `provider/model` (e.g. `ollama/llama3.1`). Omit to show current.
+        target: Option<String>,
+    },
 
     /// Start the gateway (all channels + agent loop)
     Gateway {
@@ -148,6 +155,7 @@ async fn main() -> Result<()> {
             profile_only,
         } => onboard::run(non_interactive, profile_only),
         Commands::Status => status::run(),
+        Commands::Model { target } => model_cmd::run(target),
         Commands::Gateway { logs, restart } => {
             init_logging(logs);
             if restart {

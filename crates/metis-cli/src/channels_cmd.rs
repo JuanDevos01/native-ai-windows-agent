@@ -297,10 +297,14 @@ fn find_bridge_dir() -> Result<std::path::PathBuf> {
     }
 
     anyhow::bail!(
-        "WhatsApp bridge not found. Expected at:\n\
+        "WhatsApp bridge not found. Expected at one of:\n\
          - {}\n\
+         - <next to the metis binary>/bridge/\n\
          - ./bridge/\n\n\
-         Copy the bridge from the nanobot project to one of these locations.",
+         The WhatsApp bridge is the Node.js helper shipped in the Metis repo under `bridge/`.\n\
+         Copy that `bridge/` folder to `{}` (or next to the metis binary), then run\n\
+         `metis channels login` again. It needs Node.js >= 20 installed.",
+        data_bridge.display(),
         data_bridge.display()
     )
 }

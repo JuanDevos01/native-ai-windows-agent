@@ -215,6 +215,10 @@ pub struct ProvidersConfig {
     /// defaults to http://localhost:11434/v1.
     #[serde(default)]
     pub ollama: ProviderConfig,
+    /// Local LM Studio server (OpenAI-compatible). No API key required;
+    /// defaults to http://localhost:1234/v1.
+    #[serde(default)]
+    pub lmstudio: ProviderConfig,
 }
 
 impl ProvidersConfig {
@@ -234,6 +238,7 @@ impl ProvidersConfig {
             "minimax" => Some(&self.minimax),
             "aihubmix" => Some(&self.aihubmix),
             "ollama" => Some(&self.ollama),
+            "lmstudio" => Some(&self.lmstudio),
             _ => None,
         }
     }
@@ -255,6 +260,7 @@ impl ProvidersConfig {
             ("minimax", &self.minimax),
             ("aihubmix", &self.aihubmix),
             ("ollama", &self.ollama),
+            ("lmstudio", &self.lmstudio),
         ];
         for (name, config) in entries {
             map.insert(name.to_string(), (*config).clone());

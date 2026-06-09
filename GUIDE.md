@@ -7,7 +7,24 @@ gateway after editing config.
 > Subscriptions vs. API: ChatGPT Plus/Pro and Claude Pro/Max are for the consumer
 > apps only. Metis talks to the **developer API**, which uses a separate, pay-as-you-go
 > **API key** (from platform.openai.com / console.anthropic.com). Your chat
-> subscription does **not** work with the API.
+> subscription does **not** work with the standard API.
+
+### "Can I use my Plus/Pro/Ultra subscription instead of paying per token?" (OAuth)
+
+Short answer: **not in a way Metis supports, and not recommended.**
+
+- The standard OpenAI/Anthropic APIs that Metis uses authenticate with **API
+  keys** (Bearer tokens), billed per token. There is no OAuth for them.
+- First-party tools (Anthropic's *Claude Code*, OpenAI's *Codex CLI*) do let
+  subscribers sign in via OAuth and use their plan — but those use **special
+  endpoints tied to those specific products**. Re-using that OAuth from a
+  third-party app like Metis is **against the providers' Terms of Service**,
+  can get your account rate-limited or banned, and breaks whenever they rotate
+  the flow. For that reason Metis does **not** implement it.
+- **The cost-free, safe alternative is local models** — run Ollama or LM Studio
+  (sections below). They're free, offline, and fully supported. A common setup
+  is a small paid API key for the main agent plus a **local subagent model** to
+  keep token usage low (see §3), or run everything locally.
 
 ---
 
@@ -43,7 +60,9 @@ Set `agents.defaults.model` to `provider/model`, and put the key under `provider
 | ZhiPu      | `glm-4-flash`                            | `providers.zhipu.apiKey` |
 | DashScope  | `qwen-turbo`                             | `providers.dashscope.apiKey` |
 | AiHubMix   | `aihubmix/...` (gateway)                 | `providers.aihubmix.apiKey` |
+| Moonshot/Kimi | `moonshot/kimi-k2-0905-preview`       | `providers.moonshot.apiKey` |
 | **Ollama** | `ollama/llama3.1` (**local, no key**)    | `providers.ollama.apiBase` (optional) |
+| **LM Studio** | `lmstudio/<model>` (**local, no key**) | `providers.lmstudio.apiBase` (optional) |
 | vLLM       | `vllm/...` (local)                       | `providers.vllm.apiBase` |
 
 All cloud providers authenticate with an **API key** (`Authorization: Bearer <key>`).
@@ -70,6 +89,39 @@ There is no OAuth flow. A custom endpoint can be set per provider with
 
 The `ollama/` prefix is stripped automatically, so the bare model name (e.g.
 `llama3.1`) is sent to the Ollama server.
+
+### LM Studio (local, free)
+
+LM Studio also exposes an OpenAI-compatible server. Load a model in LM Studio,
+start its local server, then:
+
+```json
+{ "agents": { "defaults": { "model": "lmstudio/qwen2.5-7b-instruct" } } }
+```
+
+- Default endpoint is `http://localhost:1234/v1` — no API key.
+- Only the leading `lmstudio/` token is stripped, so `org/model` identifiers
+  survive (e.g. `lmstudio/lmstudio-community/Meta-Llama-3.1-8B-Instruct`).
+- Custom host/port: `{ "providers": { "lmstudio": { "apiBase": "http://localhost:1234/v1" } } }`.
+
+> Use the exact model id LM Studio shows for the loaded model.
+
+---
+
+## Changing the model later (no re-onboarding)
+
+You don't need to re-run `metis onboard` just to switch models. Use `metis model`:
+
+```bash
+metis model                                   # show current model + provider status
+metis model anthropic/claude-sonnet-4-20250514
+metis model ollama/llama3.1                   # local, no key
+metis model lmstudio/qwen2.5-7b-instruct      # local, no key
+```
+
+It updates `agents.defaults.model` in your config and warns if no provider/key
+matches yet. Restart the gateway/agent to apply. Inside the interactive REPL
+(`metis agent`) you can also type `/model` (show) or `/model <provider/model>` (set).
 
 ---
 

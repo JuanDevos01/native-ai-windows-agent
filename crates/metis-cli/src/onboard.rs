@@ -426,8 +426,18 @@ fn configure_channels(config: &mut Config) -> Result<bool> {
         println!("  {} Discord token saved", "✓".green());
     }
 
+    println!(
+        "  {}",
+        "WhatsApp uses a small Node.js bridge (in the Metis repo under `bridge/`). After onboarding,"
+            .dimmed()
+    );
+    println!(
+        "  {}",
+        "run `metis channels login` to scan the QR code. The URL below is where Metis connects to that bridge."
+            .dimmed()
+    );
     let wa = read_line(
-        "  WhatsApp bridge URL (Enter to skip, or type default for ws://localhost:3001): ",
+        "  Enable WhatsApp? Type 'default' for ws://localhost:3001, a custom URL, or Enter to skip: ",
     )?;
     if wa.eq_ignore_ascii_case("default") || wa.eq_ignore_ascii_case("d") {
         config.channels.whatsapp.bridge_url = "ws://localhost:3001".to_string();

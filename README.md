@@ -527,6 +527,7 @@ Config file: `~/.metis/config.json`
 | `zhipu` | LLM (Zhipu GLM) | [open.bigmodel.cn](https://open.bigmodel.cn) |
 | `vllm` | LLM (local, any OpenAI-compatible server) | — |
 | `ollama` | LLM (**local, no API key**; defaults to `http://localhost:11434/v1`) | — |
+| `lmstudio` | LLM (**local, no API key**; defaults to `http://localhost:1234/v1`) | — |
 
 > [!TIP]
 > **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
@@ -578,6 +579,7 @@ See [SECURITY.md](SECURITY.md) for comprehensive security guidance.
 | `Metis gateway` | Start all channels + cron + heartbeat |
 | `Metis serve` | Local HTTP API for the agent (Axum; see [HTTP-SERVER.md](HTTP-SERVER.md)) |
 | `Metis status` | Show config & provider status |
+| `Metis model [provider/model]` | Show or change the agent model (no re-onboard) |
 | `Metis channels status` | Show channel status |
 | `Metis channels login` | Link WhatsApp (scan QR) |
 | `Metis cron list` | List scheduled jobs |

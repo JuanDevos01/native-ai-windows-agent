@@ -260,7 +260,8 @@ pub static PROVIDERS: &[ProviderSpec] = &[
         keywords: &["ollama"],
         env_key: "OLLAMA_API_KEY",
         display_name: "Ollama",
-        // Send the bare model name to Ollama (strip the "ollama/" routing prefix).
+        // Send the bare model name to Ollama (the leading "ollama/" routing
+        // token is stripped for local providers in resolve_model_name).
         prefix: None,
         skip_prefixes: &[],
         is_gateway: false,
@@ -268,7 +269,23 @@ pub static PROVIDERS: &[ProviderSpec] = &[
         detect_by_key_prefix: None,
         detect_by_base_keyword: Some("11434"),
         default_api_base: Some("http://localhost:11434/v1"),
-        strip_model_prefix: true,
+        strip_model_prefix: false,
+        model_overrides: &[],
+    },
+    // 12c. LM Studio — local, OpenAI-compatible server (no API key required)
+    ProviderSpec {
+        name: "lmstudio",
+        keywords: &["lmstudio", "lm-studio", "lm_studio", "lmstudio/"],
+        env_key: "LMSTUDIO_API_KEY",
+        display_name: "LM Studio",
+        prefix: None,
+        skip_prefixes: &[],
+        is_gateway: false,
+        is_local: true,
+        detect_by_key_prefix: None,
+        detect_by_base_keyword: Some("1234"),
+        default_api_base: Some("http://localhost:1234/v1"),
+        strip_model_prefix: false,
         model_overrides: &[],
     },
     // 12. Groq
@@ -301,6 +318,17 @@ pub static PROVIDERS: &[ProviderSpec] = &[
 /// Returns the first match in priority order.
 pub fn find_by_model(model: &str) -> Option<&'static ProviderSpec> {
     let model_lower = model.to_lowercase();
+
+    // 1. An explicit "<provider>/..." routing prefix is authoritative. This
+    //    avoids collisions where a model id contains another provider's keyword
+    //    (e.g. `lmstudio/qwen2.5...` must route to LM Studio, not DashScope).
+    if let Some((head, _)) = model_lower.split_once('/') {
+        if let Some(spec) = PROVIDERS.iter().find(|s| !s.is_gateway && s.name == head) {
+            return Some(spec);
+        }
+    }
+
+    // 2. Otherwise, match by keyword in priority order.
     PROVIDERS.iter().find(|spec| {
         !spec.is_gateway
             && spec
@@ -369,6 +397,16 @@ pub fn find_gateway(
 /// - If a prefix is defined and the model doesn't already start with a skip_prefix, prepend it.
 pub fn resolve_model_name(model: &str, spec: &ProviderSpec) -> String {
     let mut resolved = model.to_string();
+
+    // Local providers (Ollama, LM Studio, vLLM): strip only the leading
+    // "<name>/" routing token, preserving any inner slashes (e.g. LM Studio
+    // "org/model" identifiers). The local server expects the bare id.
+    if spec.is_local {
+        let token = format!("{}/", spec.name);
+        if let Some(rest) = resolved.strip_prefix(token.as_str()) {
+            resolved = rest.to_string();
+        }
+    }
 
     // Strip existing prefix (AiHubMix quirk)
     if spec.strip_model_prefix {
@@ -677,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_provider_count() {
-        assert_eq!(PROVIDERS.len(), 13);
+        assert_eq!(PROVIDERS.len(), 14);
     }
 
     #[test]
@@ -699,5 +737,35 @@ mod tests {
         providers.insert("ollama".to_string(), ProviderConfig::default());
         let (_cfg, spec) = match_provider("ollama/llama3.1", &providers).unwrap();
         assert_eq!(spec.name, "ollama");
+    }
+
+    #[test]
+    fn test_find_by_model_lmstudio() {
+        let spec = find_by_model("lmstudio/qwen2.5-7b-instruct").unwrap();
+        assert_eq!(spec.name, "lmstudio");
+    }
+
+    #[test]
+    fn test_lmstudio_resolve_preserves_org_model() {
+        let spec = find_by_name("lmstudio").unwrap();
+        // Only the leading "lmstudio/" token is stripped; inner slashes survive.
+        assert_eq!(
+            resolve_model_name("lmstudio/lmstudio-community/Meta-Llama-3.1-8B-Instruct", spec),
+            "lmstudio-community/Meta-Llama-3.1-8B-Instruct"
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_matches_without_api_key() {
+        let mut providers = HashMap::new();
+        providers.insert("lmstudio".to_string(), ProviderConfig::default());
+        let (_cfg, spec) = match_provider("lmstudio/some-model", &providers).unwrap();
+        assert_eq!(spec.name, "lmstudio");
+    }
+
+    #[test]
+    fn test_find_by_model_kimi_k2() {
+        let spec = find_by_model("moonshot/kimi-k2-0905-preview").unwrap();
+        assert_eq!(spec.name, "moonshot");
     }
 }

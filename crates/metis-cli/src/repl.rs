@@ -55,6 +55,21 @@ pub async fn run(
             break;
         }
 
+        // `/model [provider/model]` — view or change the model without onboarding.
+        if trimmed == "/model" || trimmed.starts_with("/model ") {
+            let _ = editor.add_history_entry(&input);
+            let arg = trimmed.strip_prefix("/model").unwrap_or("").trim();
+            let result = if arg.is_empty() {
+                crate::model_cmd::show_model()
+            } else {
+                crate::model_cmd::set_model(arg)
+            };
+            if let Err(e) = result {
+                eprintln!("\n❌ Error: {e}\n");
+            }
+            continue;
+        }
+
         // Add to history
         let _ = editor.add_history_entry(&input);
 
