@@ -126,9 +126,15 @@ impl Default for CronPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
+    /// Scheduled but not yet run (or queued for its first run).
+    Pending,
     Ok,
     Error,
     Skipped,
+    /// Any unrecognized status from an older/newer store — kept so loading
+    /// the store never fails wholesale on a single unexpected value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Mutable state for a cron job.
@@ -505,6 +511,30 @@ mod tests {
         assert!(!p.deliver);
         assert!(p.channel.is_none());
         assert!(p.to.is_none());
+    }
+
+    #[test]
+    fn test_job_status_pending_deserializes() {
+        let s: JobStatus = serde_json::from_str("\"pending\"").unwrap();
+        assert_eq!(s, JobStatus::Pending);
+    }
+
+    #[test]
+    fn test_job_status_unknown_does_not_fail() {
+        // A status value from a different/older build must not break loading.
+        let s: JobStatus = serde_json::from_str("\"weird_future_value\"").unwrap();
+        assert_eq!(s, JobStatus::Unknown);
+    }
+
+    #[test]
+    fn test_state_with_pending_status_roundtrips() {
+        let state = CronJobState {
+            last_status: Some(JobStatus::Pending),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: CronJobState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_status, Some(JobStatus::Pending));
     }
 
     #[test]

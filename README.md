@@ -526,9 +526,13 @@ Config file: `~/.metis/config.json`
 | `moonshot` | LLM (Moonshot/Kimi) | [platform.moonshot.cn](https://platform.moonshot.cn) |
 | `zhipu` | LLM (Zhipu GLM) | [open.bigmodel.cn](https://open.bigmodel.cn) |
 | `vllm` | LLM (local, any OpenAI-compatible server) | — |
+| `ollama` | LLM (**local, no API key**; defaults to `http://localhost:11434/v1`) | — |
 
 > [!TIP]
 > **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+
+> [!NOTE]
+> For a full how-to on **models, local Ollama, subagents (a second/cheaper model), cron scheduling, and the heartbeat**, see **[GUIDE.md](GUIDE.md)**.
 
 ### Environment Variables
 
