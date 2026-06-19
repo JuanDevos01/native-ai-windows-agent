@@ -106,7 +106,7 @@ fn migrate_config(raw: &mut serde_json::Value) {
         }
     }
 
-    // Migration: legacy OxiBot data directory → Metis (~/.oxibot/workspace → ~/.metis/workspace, etc.)
+    // Migration: legacy data directory paths → Metis (~/.oxibot/workspace → ~/.metis/workspace, etc.)
     if let Some(agents) = raw.get_mut("agents") {
         if let Some(defaults) = agents.get_mut("defaults") {
             if let Some(ws) = defaults.get_mut("workspace") {
@@ -116,7 +116,7 @@ fn migrate_config(raw: &mut serde_json::Value) {
                         warn!(
                             old = %s,
                             new = %new_ws,
-                            "migrated workspace path: .oxibot → .metis (update ~/.metis/config.json to remove .oxibot)"
+                            "migrated legacy workspace path to Metis data directory"
                         );
                         *ws = serde_json::json!(new_ws);
                     }

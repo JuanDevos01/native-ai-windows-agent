@@ -140,10 +140,23 @@ enum Commands {
 // Entrypoint
 // ─────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Desktop runs its own tokio runtime for background agent calls and blocks on
+    // eframe — must not start inside #[tokio::main] (nested runtime panic).
+    if let Commands::Desktop { logs } = cli.command {
+        return desktop::run(logs);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start async runtime")?
+        .block_on(run_async(cli))
+}
+
+async fn run_async(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Agent {
             message,
@@ -183,7 +196,7 @@ async fn main() -> Result<()> {
             api_key,
             logs,
         } => serve::run(host, port, api_key, logs).await,
-        Commands::Desktop { logs } => desktop::run(logs),
+        Commands::Desktop { .. } => unreachable!("desktop is handled in sync main()"),
     }
 }
 

@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/RAM-<%208MB-blue" alt="RAM">
     <img src="https://img.shields.io/badge/binary-static%20single%20file-blue" alt="Binary">
   </p>
-  <p><em>Metis is a Native Windows enhanced Rust reimplementation of <a href="https://github.com/HKUDS/nanobot">nanobot</a> created by oxibot for educational and research purposes.</em></p>
+  <p><em>Metis is a Native Windows enhanced Rust reimplementation of <a href="https://github.com/HKUDS/nanobot">nanobot</a> for educational and research purposes.</em></p>
 </div>
 
 ---
@@ -721,6 +721,6 @@ PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 [MIT](LICENSE)
 
 <p align="center">
-  <sub>Metis is a Native Windows enhanced Rust reimplementation of <a href="https://github.com/HKUDS/nanobot">nanobot</a> created by oxibot for educational and research purposes.</sub>
+  <sub>Metis is a Native Windows enhanced Rust reimplementation of <a href="https://github.com/HKUDS/nanobot">nanobot</a> for educational and research purposes.</sub>
 
 </p>

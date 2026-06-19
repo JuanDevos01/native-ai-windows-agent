@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────
-# core_agent_lines.sh — Count lines of code in OxiBot
+# core_agent_lines.sh — Count lines of code in Metis
 # Usage: ./core_agent_lines.sh [--detail]
 # ─────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ RESET="\033[0m"
 detail=false
 [[ "${1:-}" == "--detail" ]] && detail=true
 
-echo -e "${BOLD}🦀 OxiBot — Lines of Code${RESET}"
+echo -e "${BOLD}🦀 Metis — Lines of Code${RESET}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 total_rust=0
@@ -72,8 +72,8 @@ printf "  ${DIM}Test functions:        %6d${RESET}\n" "${test_lines:-0}"
 
 # Count skills
 skill_count=0
-if [[ -d "$CRATES_DIR/oxibot-agent/skills" ]]; then
-    skill_count=$(find "$CRATES_DIR/oxibot-agent/skills" -name '*.md' | wc -l)
+if [[ -d "$CRATES_DIR/metis-agent/skills" ]]; then
+    skill_count=$(find "$CRATES_DIR/metis-agent/skills" -name '*.md' | wc -l)
 fi
 printf "  ${DIM}Bundled skills:        %6d${RESET}\n" "$skill_count"
 echo ""

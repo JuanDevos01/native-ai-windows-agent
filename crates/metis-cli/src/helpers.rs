@@ -5,14 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use colored::Colorize;
+use metis_core::config::schema::ProviderConfig;
+use metis_providers::http_provider::create_provider;
+use metis_providers::traits::LlmProvider;
 
 /// The user/agent guide, bundled into the binary at build time.
 const GUIDE_MD: &str = include_str!("../../../GUIDE.md");
 
 /// Write the bundled `GUIDE.md` into the workspace so the agent can always read
 /// it via `read_file` at a stable path (`<workspace>/GUIDE.md`). Refreshes it
-/// when the bundled copy changes. Best-effort: logs a warning on failure.
+/// when the bundled copy changes. Also updates legacy OxiBot branding in bootstrap
+/// files. Best-effort: logs a warning on failure.
 pub fn ensure_guide_in_workspace(workspace: &Path) {
+    migrate_legacy_branding_in_workspace(workspace);
+
     let dest = workspace.join("GUIDE.md");
     let needs_write = match std::fs::read_to_string(&dest) {
         Ok(existing) => existing != GUIDE_MD,
@@ -25,9 +31,65 @@ pub fn ensure_guide_in_workspace(workspace: &Path) {
     }
 }
 
-use metis_core::config::schema::ProviderConfig;
-use metis_providers::http_provider::create_provider;
-use metis_providers::traits::LlmProvider;
+/// Bootstrap files that may still contain legacy OxiBot naming from older installs.
+const BOOTSTRAP_BRANDING_FILES: &[&str] = &[
+    "AGENTS.md",
+    "USER.md",
+    "SOUL.md",
+    "IDENTITY.md",
+    "HEARTBEAT.md",
+    "memory/MEMORY.md",
+];
+
+/// Replace legacy OxiBot/Oxibot strings with Metis in workspace bootstrap files.
+pub fn migrate_legacy_branding_in_workspace(workspace: &Path) {
+    for rel in BOOTSTRAP_BRANDING_FILES {
+        let path = workspace.join(rel);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let updated = rebrand_legacy_text(&content);
+        if updated == content {
+            continue;
+        }
+        match std::fs::write(&path, &updated) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "updated legacy branding to Metis"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to update legacy branding"
+            ),
+        }
+    }
+}
+
+/// Targeted replacements — avoids touching `.oxibot` path segments.
+fn rebrand_legacy_text(content: &str) -> String {
+    let mut out = content.to_string();
+    const REPLACEMENTS: &[(&str, &str)] = &[
+        ("Tell Oxibot about", "Tell Metis about"),
+        ("Tell OxiBot about", "Tell Metis about"),
+        ("I am Oxibot,", "I am Metis,"),
+        ("I am OxiBot,", "I am Metis,"),
+        ("Oxibot persists", "Metis persists"),
+        ("OxiBot persists", "Metis persists"),
+        ("# Metis (formerly OxiBot)", "# Metis"),
+        ("# Metis (formerly Oxibot)", "# Metis"),
+        ("- **Name**: Oxibot", "- **Name**: Metis"),
+        ("- **Name**: OxiBot", "- **Name**: Metis"),
+        ("your OxiBot agent", "your Metis agent"),
+        ("your Oxibot agent", "your Metis agent"),
+    ];
+    for (from, to) in REPLACEMENTS {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    out
+}
 
 /// Build a dedicated LLM provider for subagents, when `subagent_model` is set.
 ///
@@ -173,6 +235,15 @@ mod tests {
 
         let name = load_agent_name(dir.path());
         assert_eq!(name.as_deref(), Some("Nova"));
+    }
+
+    #[test]
+    fn rebrand_legacy_text_updates_oxibot_phrases() {
+        let input = "Tell Oxibot about yourself.\nOxibot persists important information here.";
+        let out = rebrand_legacy_text(input);
+        assert!(out.contains("Tell Metis about"));
+        assert!(out.contains("Metis persists"));
+        assert!(!out.contains("Oxibot"));
     }
 
     #[test]

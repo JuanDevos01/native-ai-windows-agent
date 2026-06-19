@@ -600,9 +600,7 @@ pub fn run(logs: bool) -> Result<()> {
     }
 
     let runtime = Runtime::new()?;
-    let agent = Arc::new(runtime.block_on(async {
-        build_agent_loop(&metis_config)
-    })?);
+    let agent = Arc::new(build_agent_loop(&metis_config)?);
     let sessions = Arc::new(SessionManager::new(None)?);
 
     let title = desktop_config.agent_title.clone();
