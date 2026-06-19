@@ -9,7 +9,7 @@ use metis_core::config::load_config;
 use metis_core::heartbeat::HeartbeatService;
 
 use crate::helpers;
-use crate::build_agent_loop;
+use crate::agent_builder::build_agent_loop;
 
 /// Run a single heartbeat tick against the configured workspace.
 #[derive(Args)]

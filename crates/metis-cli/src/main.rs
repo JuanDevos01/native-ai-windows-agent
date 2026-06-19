@@ -8,7 +8,9 @@
 //! - `Metis onboard` — initialize config + workspace
 //! - `Metis status` — show configuration and provider status
 //! - `Metis serve` — local HTTP API for the agent (Axum; loopback by default)
+//! - `Metis desktop` — native GUI mission control + chat
 
+mod agent_builder;
 mod helpers;
 mod onboard;
 mod repl;
@@ -19,18 +21,13 @@ mod channels_cmd;
 mod heartbeat_cmd;
 mod model_cmd;
 mod serve;
+mod desktop;
 
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
-
-use metis_agent::{AgentLoop, ExecToolConfig, OutboundFormatting};
-use metis_core::bus::queue::MessageBus;
-use metis_core::config::{load_config, Config};
-use metis_core::session::SessionManager;
-use metis_providers::http_provider::create_provider;
+use anyhow::{Context, Result};
+use agent_builder::{build_agent_loop, init_logging};
+use metis_core::config::load_config;
 
 // ─────────────────────────────────────────────
 // CLI definition
@@ -130,6 +127,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         logs: bool,
     },
+
+    /// Open the native desktop GUI (mission control + chat)
+    Desktop {
+        /// Enable debug logging
+        #[arg(long, default_value_t = false)]
+        logs: bool,
+    },
 }
 
 // ─────────────────────────────────────────────
@@ -179,6 +183,7 @@ async fn main() -> Result<()> {
             api_key,
             logs,
         } => serve::run(host, port, api_key, logs).await,
+        Commands::Desktop { logs } => desktop::run(logs),
     }
 }
 
@@ -212,84 +217,4 @@ async fn run_agent(
     }
 
     Ok(())
-}
-
-/// Build an `AgentLoop` from the loaded configuration.
-pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
-    let defaults = &config.agents.defaults;
-
-    // Resolve workspace path (expand ~)
-    let workspace = helpers::expand_tilde(&defaults.workspace);
-    std::fs::create_dir_all(&workspace)
-        .with_context(|| format!("failed to create workspace: {}", workspace.display()))?;
-    helpers::ensure_guide_in_workspace(&workspace);
-
-    // Resolve model
-    let model = &defaults.model;
-
-    // Create provider
-    let providers_map = config.providers.to_map();
-    let provider = create_provider(model, &providers_map)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let subagent_provider =
-        helpers::build_subagent_provider(&defaults.subagent_model, &providers_map);
-
-    // Brave API key
-    let brave_key = if config.tools.web.search.api_key.is_empty() {
-        None
-    } else {
-        Some(config.tools.web.search.api_key.clone())
-    };
-
-    // Build agent loop
-    let bus = Arc::new(MessageBus::new(100));
-    let session_manager = SessionManager::new(None)
-        .context("failed to create session manager")?;
-
-    let agent_name = helpers::load_agent_name(&workspace);
-    let exec_cfg = ExecToolConfig {
-        timeout: config.tools.exec.timeout,
-        shell: config.tools.exec.shell.clone(),
-        permission_mode: config.tools.exec.permission_mode.clone(),
-    };
-    let outbound = OutboundFormatting {
-        log_thinking_json: defaults.log_thinking_json,
-        include_fenced_code_in_chat_apps: defaults.include_fenced_code_in_chat_apps,
-        include_exec_output_in_chat_apps: defaults.include_exec_output_in_chat_apps,
-    };
-    let agent_loop = AgentLoop::new(
-        bus,
-        Arc::new(provider),
-        workspace,
-        Some(model.to_string()),
-        Some(defaults.subagent_model.clone()),
-        subagent_provider,
-        Some(defaults.max_tool_iterations as usize),
-        None, // uses defaults for temperature/max_tokens
-        brave_key,
-        Some(exec_cfg),
-        config.tools.restrict_to_workspace,
-        Some(session_manager),
-        agent_name,
-        Some(outbound),
-    );
-
-    Ok(agent_loop)
-}
-
-/// Initialize tracing/logging.
-fn init_logging(verbose: bool) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = if verbose {
-        EnvFilter::new("Metis=debug,metis_thinking=debug,info")
-    } else {
-        EnvFilter::new("warn")
-    };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
 }

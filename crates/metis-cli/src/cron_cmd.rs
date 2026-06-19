@@ -379,7 +379,7 @@ async fn run_job(id: &str) -> Result<()> {
     );
 
     let config = metis_core::config::load_config(None);
-    let agent_loop = crate::build_agent_loop(&config)?;
+    let agent_loop = crate::agent_builder::build_agent_loop(&config)?;
 
     let response = agent_loop
         .process_direct_session("cron", &job.id, &job.payload.message)

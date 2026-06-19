@@ -23,7 +23,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::{build_agent_loop, init_logging};
+use crate::agent_builder::{build_agent_loop, init_logging};
 
 #[derive(Clone)]
 struct AppState {
