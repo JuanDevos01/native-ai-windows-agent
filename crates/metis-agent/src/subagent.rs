@@ -242,38 +242,17 @@ impl SubagentManager {
         let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
 
         let tool_defs = tools.get_definitions();
-        let tools_enabled = self.provider.supports_tool_calling(&self.model);
-        let loop_max = if tools_enabled {
-            SUBAGENT_MAX_ITERATIONS
-        } else {
-            info!(
-                model = %self.model,
-                task_id = %task_id,
-                "chat-only subagent model — single turn, no tools"
-            );
-            1
-        };
         let mut final_content: Option<String> = None;
 
-        for iteration in 0..loop_max {
+        for iteration in 0..SUBAGENT_MAX_ITERATIONS {
             debug!(task_id = %task_id, iteration = iteration, "subagent LLM call");
-
-            let tools_for_call = if tools_enabled {
-                Some(tool_defs.as_slice())
-            } else {
-                None
-            };
 
             let response = self
                 .provider
-                .chat(&messages, tools_for_call, &self.model, &self.request_config)
+                .chat(&messages, Some(&tool_defs), &self.model, &self.request_config)
                 .await;
 
             if response.has_tool_calls() {
-                if !tools_enabled {
-                    final_content = response.content;
-                    break;
-                }
                 let tool_calls =
                     crate::tools::base::sanitize_tool_calls_for_history(response.tool_calls.clone());
                 ContextBuilder::add_assistant_message(

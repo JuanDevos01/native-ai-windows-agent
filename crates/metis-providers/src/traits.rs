@@ -56,11 +56,4 @@ pub trait LlmProvider: Send + Sync {
 
     /// Display name for logging.
     fn display_name(&self) -> &str;
-
-    /// Whether this model accepts OpenAI-style tool definitions (function calling).
-    /// Chat-only local models (e.g. Ollama gemma3) return false.
-    fn supports_tool_calling(&self, model: &str) -> bool {
-        let _ = model;
-        true
-    }
 }

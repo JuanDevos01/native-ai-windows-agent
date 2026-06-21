@@ -15,7 +15,7 @@ use metis_core::types::{
     ChatCompletionResponse, LlmResponse, Message, ToolDefinition,
 };
 
-use crate::ollama::{ollama_model_supports_tools, ollama_model_supports_tools_sync};
+use crate::ollama::ollama_model_supports_tools;
 use crate::registry::{
     apply_model_overrides, resolve_model_name, ProviderConfig, ProviderSpec,
 };
@@ -362,15 +362,6 @@ impl LlmProvider for HttpProvider {
 
     fn display_name(&self) -> &str {
         self.spec.display_name
-    }
-
-    fn supports_tool_calling(&self, model: &str) -> bool {
-        if self.spec.name == "ollama" {
-            let resolved = self.resolve_model(model);
-            ollama_model_supports_tools_sync(&self.api_base, &resolved).unwrap_or(true)
-        } else {
-            true
-        }
     }
 }
 
