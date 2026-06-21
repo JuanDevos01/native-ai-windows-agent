@@ -9,11 +9,17 @@ use metis_core::bus::queue::MessageBus;
 use metis_core::config::Config;
 use metis_core::session::SessionManager;
 use metis_providers::http_provider::create_provider;
+use metis_providers::LlmProvider;
 
 use crate::helpers;
 
 /// Build an `AgentLoop` from the loaded configuration.
-pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
+///
+/// Pass a shared [`SessionManager`] when the caller also reads/writes sessions (e.g. desktop UI).
+pub fn build_agent_loop(
+    config: &Config,
+    sessions: Option<Arc<SessionManager>>,
+) -> Result<AgentLoop> {
     let defaults = &config.agents.defaults;
 
     let workspace = helpers::expand_tilde(&defaults.workspace);
@@ -34,7 +40,9 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     };
 
     let bus = Arc::new(MessageBus::new(100));
-    let session_manager = SessionManager::new(None).context("failed to create session manager")?;
+    let session_manager = sessions.unwrap_or_else(|| {
+        Arc::new(SessionManager::new(None).expect("failed to create session manager"))
+    });
 
     let agent_name = helpers::load_agent_name(&workspace);
     let exec_cfg = ExecToolConfig {
@@ -64,6 +72,14 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         agent_name,
         Some(outbound),
     ))
+}
+
+/// Create an LLM provider for the given model id using config credentials.
+pub fn provider_for_model(config: &Config, model: &str) -> Result<Arc<dyn LlmProvider>> {
+    let providers_map = config.providers.to_map();
+    create_provider(model, &providers_map)
+        .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Initialize tracing/logging.

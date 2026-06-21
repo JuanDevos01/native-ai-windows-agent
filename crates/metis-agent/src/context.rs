@@ -72,6 +72,11 @@ impl ContextBuilder {
         self
     }
 
+    /// Update the model name used in the system prompt.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = model.into();
+    }
+
     /// Get a reference to the memory store.
     pub fn memory(&self) -> &MemoryStore {
         &self.memory

@@ -8,12 +8,14 @@
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::Response;
 use tracing::{debug, error, warn};
 
 use metis_core::types::{
-    ChatCompletionRequest, ChatCompletionResponse, LlmResponse, Message, ToolDefinition,
+    ChatCompletionResponse, LlmResponse, Message, ToolDefinition,
 };
 
+use crate::ollama::ollama_model_supports_tools;
 use crate::registry::{
     apply_model_overrides, resolve_model_name, ProviderConfig, ProviderSpec,
 };
@@ -108,8 +110,10 @@ impl HttpProvider {
             }
         }
 
+        let timeout_secs = if spec.is_local { 600 } else { 120 };
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -138,6 +142,98 @@ impl HttpProvider {
             resolved
         }
     }
+
+    /// Local models: cap generation size to reduce GPU/RAM pressure.
+    fn effective_max_tokens(&self, config: &LlmRequestConfig) -> u32 {
+        if self.spec.is_local {
+            config.max_tokens.min(2048)
+        } else {
+            config.max_tokens
+        }
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        // Ollama/LM Studio on localhost do not need auth; dummy keys can confuse some setups.
+        if self.spec.is_local {
+            req
+        } else if self.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.api_key)
+        }
+    }
+
+    fn build_request_json(
+        &self,
+        resolved_model: &str,
+        messages: &[Message],
+        tools_to_send: Option<&[ToolDefinition]>,
+        config: &LlmRequestConfig,
+        temperature: f64,
+    ) -> serde_json::Value {
+        let max_tokens = self.effective_max_tokens(config);
+        let mut body = serde_json::json!({
+            "model": resolved_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        });
+        if let Some(tools) = tools_to_send {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools);
+                body["tool_choice"] = serde_json::json!("auto");
+            }
+        }
+        // Keep the model loaded between agent tool-loop turns (Ollama OpenAI API extension).
+        if self.spec.name == "ollama" {
+            body["keep_alive"] = serde_json::json!("15m");
+        }
+        body
+    }
+
+    async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<Response, reqwest::Error> {
+        let max_attempts = if self.spec.name == "ollama" { 3 } else { 1 };
+        let mut last_err: Option<reqwest::Error> = None;
+        for attempt in 0..max_attempts {
+            match self
+                .apply_auth(self.client.post(url))
+                .headers(self.extra_headers.clone())
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    let retry = self.spec.name == "ollama"
+                        && attempt + 1 < max_attempts
+                        && (e.is_connect() || e.is_timeout() || e.is_request());
+                    if retry {
+                        warn!(
+                            provider = self.spec.display_name,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "Ollama request failed; retrying after model load"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.expect("ollama retry loop exited without error"))
+    }
+
+    fn ollama_transport_error(model: &str, url: &str, err: &reqwest::Error) -> String {
+        format!(
+            "Ollama connection failed ({url}): {err}\n\
+             The model `{model}` may still be loading into GPU/RAM (high CPU/GPU for ~1–2 min is normal on first use).\n\
+             • Wait and try again\n\
+             • Pre-load: run `ollama run {model}` in a terminal, then send your message\n\
+             • For full agent tools, use MiniMax as main model and a tool-capable Ollama model (e.g. qwen2.5:7b) as subagent"
+        )
+    }
 }
 
 #[async_trait]
@@ -160,31 +256,39 @@ impl LlmProvider for HttpProvider {
             "Calling LLM"
         );
 
-        let request_body = ChatCompletionRequest {
-            model: resolved_model.clone(),
-            messages: messages.to_vec(),
-            tools: tools.map(|t| t.to_vec()),
-            tool_choice: tools.map(|_| "auto".to_string()),
-            max_tokens: Some(config.max_tokens),
-            temperature: Some(temperature),
-        };
+        let mut tools_to_send = tools;
+        if self.spec.name == "ollama" {
+            if tools.map_or(false, |t| !t.is_empty())
+                && !ollama_model_supports_tools(&self.client, &self.api_base, &resolved_model).await
+            {
+                debug!(
+                    model = %resolved_model,
+                    "Ollama model does not support tools; sending chat without tools"
+                );
+                tools_to_send = None;
+            }
+        }
+
+        let request_body = self.build_request_json(
+            &resolved_model,
+            messages,
+            tools_to_send,
+            config,
+            temperature,
+        );
 
         let url = self.completions_url();
 
-        let result = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .headers(self.extra_headers.clone())
-            .json(&request_body)
-            .send()
-            .await;
-
-        let response = match result {
+        let response = match self.post_json(&url, &request_body).await {
             Ok(resp) => resp,
             Err(e) => {
                 error!(provider = self.spec.display_name, error = %e, "HTTP request failed");
-                return LlmResponse::error(format!("Error calling LLM: {}", e));
+                let msg = if self.spec.name == "ollama" {
+                    Self::ollama_transport_error(&resolved_model, &url, &e)
+                } else {
+                    format!("Error calling LLM: {e}")
+                };
+                return LlmResponse::error(msg);
             }
         };
 
@@ -194,6 +298,29 @@ impl LlmProvider for HttpProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Failed to read error body".to_string());
+            if self.spec.name == "ollama"
+                && tools.is_some()
+                && error_text.contains("does not support tools")
+            {
+                debug!(
+                    model = %resolved_model,
+                    "Ollama rejected tools; retrying without tools"
+                );
+                let retry_body = self.build_request_json(
+                    &resolved_model,
+                    messages,
+                    None,
+                    config,
+                    temperature,
+                );
+                if let Ok(retry_resp) = self.post_json(&url, &retry_body).await {
+                    if retry_resp.status().is_success() {
+                        if let Ok(chat_resp) = retry_resp.json::<ChatCompletionResponse>().await {
+                            return chat_resp.into();
+                        }
+                    }
+                }
+            }
             error!(
                 provider = self.spec.display_name,
                 status = %status,

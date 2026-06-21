@@ -105,6 +105,12 @@ impl SessionManager {
         }
     }
 
+    /// Drop a session from the in-memory cache so the next read reloads from disk.
+    pub fn invalidate_cache(&self, key: &str) {
+        let mut cache = self.cache.write().unwrap();
+        cache.remove(key);
+    }
+
     /// Get the last `max_messages` from a session's history.
     ///
     /// Returns messages in LLM format (role + content).

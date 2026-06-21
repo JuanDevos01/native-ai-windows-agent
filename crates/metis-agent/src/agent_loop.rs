@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use serde_json::json;
@@ -1564,11 +1564,11 @@ pub struct AgentLoop {
     /// Message bus for inbound/outbound messages.
     bus: Arc<MessageBus>,
     /// LLM provider.
-    provider: Arc<dyn LlmProvider>,
+    provider: RwLock<Arc<dyn LlmProvider>>,
     /// Workspace root.
     _workspace: PathBuf,
     /// Model to use (overrides provider default if set).
-    model: String,
+    model: RwLock<String>,
     /// Max LLM ↔ tool iterations per message.
     max_iterations: usize,
     /// LLM request config (temperature, max_tokens).
@@ -1576,9 +1576,9 @@ pub struct AgentLoop {
     /// Tool registry.
     tools: ToolRegistry,
     /// Context builder.
-    context: ContextBuilder,
+    context: RwLock<ContextBuilder>,
     /// Session manager.
-    sessions: SessionManager,
+    sessions: Arc<SessionManager>,
     /// Reference to the message tool (for set_context).
     message_tool: Arc<MessageTool>,
     /// Spawn tool reference (for set_context).
@@ -1605,7 +1605,7 @@ impl AgentLoop {
         brave_api_key: Option<String>,
         exec_config: Option<ExecToolConfig>,
         restrict_to_workspace: bool,
-        session_manager: Option<SessionManager>,
+        session_manager: Option<Arc<SessionManager>>,
         agent_name: Option<String>,
         outbound_formatting: Option<OutboundFormatting>,
     ) -> Self {
@@ -1622,8 +1622,9 @@ impl AgentLoop {
         let exec_config = exec_config.unwrap_or_default();
         let agent_name = agent_name.unwrap_or_else(|| "Metis".into());
         let outbound = outbound_formatting.unwrap_or_default();
-        let sessions =
-            session_manager.unwrap_or_else(|| SessionManager::new(None).expect("failed to create session manager"));
+        let sessions = session_manager.unwrap_or_else(|| {
+            Arc::new(SessionManager::new(None).expect("failed to create session manager"))
+        });
 
         let context = ContextBuilder::new(&workspace, &agent_name).with_model(&model);
 
@@ -1685,19 +1686,34 @@ impl AgentLoop {
 
         Self {
             bus,
-            provider,
+            provider: RwLock::new(provider),
             _workspace: workspace,
-            model,
+            model: RwLock::new(model),
             max_iterations,
             request_config,
             tools,
-            context,
+            context: RwLock::new(context),
             sessions,
             message_tool,
             spawn_tool,
             subagent_manager,
             outbound,
         }
+    }
+
+    fn active_model(&self) -> String {
+        self.model.read().unwrap().clone()
+    }
+
+    fn active_provider(&self) -> Arc<dyn LlmProvider> {
+        self.provider.read().unwrap().clone()
+    }
+
+    /// Switch the LLM model (and provider) used for subsequent chat turns.
+    pub fn set_active_model(&self, model: String, provider: Arc<dyn LlmProvider>) {
+        *self.model.write().unwrap() = model.clone();
+        *self.provider.write().unwrap() = provider;
+        self.context.write().unwrap().set_model(model);
     }
 
     fn log_llm_thinking_json(
@@ -1980,7 +1996,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // system prompt (build_identity). Task-specific overrides here previously hijacked
         // questions into "start the server / fix it" behavior.
         let user_text = msg.content.clone();
-        let mut messages = self.context.build_messages(
+        let mut messages = self.context.read().unwrap().build_messages(
             &history,
             &user_text,
             &media_paths,
@@ -2033,11 +2049,11 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             };
 
             let response = self
-                .provider
+                .active_provider()
                 .chat(
                     &messages,
                     tools_for_call,
-                    &self.model,
+                    &self.active_model(),
                     &self.request_config,
                 )
                 .await;
@@ -2341,9 +2357,13 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         let history = self.sessions.get_history(&session_key, 50);
 
         // Build messages with the subagent result as the "user" message
-        let mut messages =
-            self.context
-                .build_messages(&history, &msg.content, &[], &origin_channel, &origin_chat_id);
+        let mut messages = self.context.read().unwrap().build_messages(
+            &history,
+            &msg.content,
+            &[],
+            &origin_channel,
+            &origin_chat_id,
+        );
 
         let tool_defs = self.tools.get_definitions();
         let mut final_content: Option<String> = None;
@@ -2353,8 +2373,8 @@ Call the tool now to actually do it (or, if this was only a question, just answe
             debug!(iteration = iteration, "system message LLM call");
 
             let response = self
-                .provider
-                .chat(&messages, Some(&tool_defs), &self.model, &self.request_config)
+                .active_provider()
+                .chat(&messages, Some(&tool_defs), &self.active_model(), &self.request_config)
                 .await;
 
             self.log_llm_thinking_json(
@@ -2437,14 +2457,26 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         Ok(response.content)
     }
 
+    /// Interactive chat entry point for desktop/CLI-style sessions.
+    pub async fn process_chat_session(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        text: &str,
+    ) -> Result<String> {
+        let msg = InboundMessage::new(channel, "user", chat_id, text);
+        let response = self.process_message(&msg).await?;
+        Ok(response.content)
+    }
+
     /// Get a reference to the tool registry (for testing/extension).
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
     }
 
-    /// Get the model name.
-    pub fn model(&self) -> &str {
-        &self.model
+    /// Get the active model name.
+    pub fn model(&self) -> String {
+        self.model.read().unwrap().clone()
     }
 }
 

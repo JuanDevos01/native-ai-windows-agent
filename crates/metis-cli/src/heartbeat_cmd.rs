@@ -25,7 +25,7 @@ pub async fn run(args: HeartbeatArgs) -> Result<()> {
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create workspace: {}", workspace.display()))?;
 
-    let agent = Arc::new(build_agent_loop(&config)?);
+    let agent = Arc::new(build_agent_loop(&config, None)?);
     let callback: metis_core::heartbeat::OnHeartbeatFn = Arc::new(move |prompt| {
         let agent = agent.clone();
         Box::pin(async move {

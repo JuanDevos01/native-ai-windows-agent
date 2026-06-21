@@ -93,7 +93,7 @@ pub async fn run(
         );
     }
 
-    let agent = Arc::new(build_agent_loop(&config)?);
+    let agent = Arc::new(build_agent_loop(&config, None)?);
     let model = agent.model().to_string();
     let state = AppState {
         agent,

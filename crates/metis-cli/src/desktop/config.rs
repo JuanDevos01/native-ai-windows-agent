@@ -18,6 +18,9 @@ pub struct DesktopConfig {
     pub pinned_sessions: Vec<String>,
     #[serde(default = "default_true")]
     pub save_window_geometry: bool,
+    /// Custom model ids the user added via the desktop UI (kept across sessions).
+    #[serde(default)]
+    pub extra_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +47,7 @@ impl Default for DesktopConfig {
             agent_title: "METIS AGENT".into(),
             pinned_sessions: Vec::new(),
             save_window_geometry: true,
+            extra_models: Vec::new(),
         }
     }
 }

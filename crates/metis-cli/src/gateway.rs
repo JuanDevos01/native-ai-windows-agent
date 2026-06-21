@@ -143,8 +143,9 @@ pub async fn run() -> Result<()> {
     };
 
     // 6. Create session manager
-    let session_manager = SessionManager::new(None)
-        .context("failed to create session manager")?;
+    let session_manager = Arc::new(
+        SessionManager::new(None).context("failed to create session manager")?,
+    );
 
     // 7. Create agent loop (Arc-wrapped for sharing with cron callback)
     let agent_name = helpers::load_agent_name(&workspace);
