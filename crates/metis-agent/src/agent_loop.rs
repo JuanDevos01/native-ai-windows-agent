@@ -2006,6 +2006,17 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
 
         // Get tool definitions
         let tool_defs = self.tools.get_definitions();
+        let model_name = self.active_model();
+        let tools_enabled = self.active_provider().supports_tool_calling(&model_name);
+        let loop_max = if tools_enabled {
+            self.max_iterations
+        } else {
+            info!(
+                model = %model_name,
+                "chat-only model — single LLM turn, no tool loop"
+            );
+            1
+        };
 
         // Agent loop: LLM ↔ tool calling
         let mut final_content: Option<String> = None;
@@ -2030,22 +2041,22 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             let _ = self.bus.publish_outbound(goal_msg).await;
         }
 
-        for iteration in 0..self.max_iterations {
+        for iteration in 0..loop_max {
             debug!(iteration = iteration, "LLM call");
 
             // On the final allowed iteration, force a clean wrap-up: disable tools and ask
             // the model to write a structured answer that addresses the original question.
             // The model has full context (everything it read/ran), so it can answer properly
             // instead of us synthesising a hardcoded summary.
-            let is_last_iteration = iteration + 1 >= self.max_iterations;
+            let is_last_iteration = iteration + 1 >= loop_max;
             if is_last_iteration && !task_steps.is_empty() && !wrapup_injected {
                 messages.push(Message::user(WRAPUP_INSTRUCTION));
                 wrapup_injected = true;
             }
-            let tools_for_call = if is_last_iteration && wrapup_injected {
-                None
-            } else {
+            let tools_for_call = if tools_enabled && !(is_last_iteration && wrapup_injected) {
                 Some(tool_defs.as_slice())
+            } else {
+                None
             };
 
             let response = self
@@ -2066,6 +2077,10 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             }
 
             if response.has_tool_calls() {
+                if !tools_enabled {
+                    final_content = response.content;
+                    break;
+                }
                 // Add assistant message with tool calls (sanitize invalid JSON for next API round-trip)
                 let tool_calls = sanitize_tool_calls_for_history(response.tool_calls.clone());
                 // Publish any narration text the model sent alongside the tool calls.
@@ -2200,7 +2215,7 @@ Run the next command in a follow-up message, or combine steps into one script."
                     && (response_is_plan_without_tools(content_text)
                         || response_identified_problem_without_fix(content_text));
 
-                if still_failing || said_will_act_but_didnt {
+                if tools_enabled && (still_failing || said_will_act_but_didnt) {
                     ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
                     let nudge = if still_failing {
                         let hint = last_exec_failure_hint(&exec_tool_outputs);
