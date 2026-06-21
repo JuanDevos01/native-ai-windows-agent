@@ -10,14 +10,12 @@
 //! - [`http_provider::create_provider`] — convenience builder from model name + config
 
 pub mod http_provider;
-pub mod ollama;
 pub mod registry;
 pub mod traits;
 pub mod transcription;
 
 // Re-export main types for convenience
 pub use http_provider::{create_provider, HttpProvider};
-pub use ollama::{ollama_model_supports_tools, ollama_model_supports_tools_sync, ollama_root_from_api_base};
 pub use registry::{ProviderConfig, ProviderSpec, PROVIDERS};
 pub use traits::{LlmProvider, LlmRequestConfig};
 pub use transcription::{

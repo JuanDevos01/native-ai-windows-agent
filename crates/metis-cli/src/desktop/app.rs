@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use eframe::egui;
 use metis_agent::AgentLoop;
-use metis_core::config::{load_config, save_config};
+use metis_core::config::load_config;
 use metis_core::session::{SessionManager, SessionSummary};
 use metis_core::types::{Message, MessageContent};
 use metis_cron::types::{CronJob, CronStore};
@@ -15,9 +15,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use super::config::{desktop_config_path, load_desktop_config, save_desktop_config, DesktopConfig};
-use super::models::discover_available_models;
-use super::models::model_menu_label;
-use crate::agent_builder::{build_agent_loop, provider_for_model};
+use crate::agent_builder::build_agent_loop;
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 102, 204);
 const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(248, 249, 251);
@@ -57,15 +55,11 @@ pub struct MetisDesktopApp {
     cron_jobs: Vec<CronJob>,
     sessions_cache: Vec<SessionSummary>,
     last_refresh: f64,
-    selected_model: String,
-    model_choices: Vec<String>,
-    last_model_refresh: f64,
 }
 
 impl MetisDesktopApp {
     fn new(
         config: DesktopConfig,
-        selected_model: String,
         agent: Arc<AgentLoop>,
         sessions: Arc<SessionManager>,
         runtime: Runtime,
@@ -74,8 +68,6 @@ impl MetisDesktopApp {
             "desktop:{}",
             chrono::Utc::now().format("%Y%m%d-%H%M%S")
         );
-        let metis_config = load_config(None);
-        let model_choices = discover_available_models(&metis_config, &config);
         let mut app = Self {
             config,
             agent,
@@ -91,9 +83,6 @@ impl MetisDesktopApp {
             cron_jobs: load_cron_jobs(),
             sessions_cache: Vec::new(),
             last_refresh: 0.0,
-            selected_model,
-            model_choices,
-            last_model_refresh: 0.0,
         };
         app.refresh_sessions();
         app.load_session_history();
@@ -161,7 +150,7 @@ impl MetisDesktopApp {
         self.runtime.spawn(async move {
             let (channel, chat_id) = split_session_key(&session_key);
             let result = agent
-                .process_chat_session(&channel, &chat_id, &text)
+                .process_direct_session(&channel, &chat_id, &text)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
@@ -175,30 +164,19 @@ impl MetisDesktopApp {
 
     fn poll_pending(&mut self, ctx: &egui::Context) {
         let mut finished: Option<Result<String, String>> = None;
-        let mut dropped = false;
         if let Some(pending) = self.pending.as_mut() {
-            match pending.rx.try_recv() {
-                Ok(result) => finished = Some(result),
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => dropped = true,
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            if let Ok(result) = pending.rx.try_recv() {
+                finished = Some(result);
             }
-        }
-        if dropped {
-            self.pending = None;
-            self.status_line = "Error: agent task failed unexpectedly".into();
-            ctx.request_repaint();
-            return;
         }
         if let Some(result) = finished {
             let pending = self.pending.take().unwrap();
             match result {
                 Ok(reply) => {
-                    if !reply.trim().is_empty() {
-                        self.chat_lines.push(ChatLine {
-                            role: "Agent",
-                            text: reply,
-                        });
-                    }
+                    self.chat_lines.push(ChatLine {
+                        role: "Agent",
+                        text: reply,
+                    });
                     self.status_line.clear();
                 }
                 Err(err) => {
@@ -212,53 +190,6 @@ impl MetisDesktopApp {
             ctx.request_repaint();
         } else if self.pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
-        }
-    }
-
-    fn refresh_model_choices(&mut self) {
-        let metis_config = load_config(None);
-        self.model_choices = discover_available_models(&metis_config, &self.config);
-        if !self.selected_model.is_empty()
-            && !self.model_choices.iter().any(|m| m == &self.selected_model)
-        {
-            self.model_choices.insert(0, self.selected_model.clone());
-        }
-    }
-
-    fn remember_custom_model(&mut self, model: &str) {
-        let model = model.trim();
-        if model.is_empty() {
-            return;
-        }
-        if !self.config.extra_models.iter().any(|m| m == model) {
-            self.config.extra_models.push(model.to_string());
-            let _ = save_desktop_config(&self.config);
-        }
-    }
-
-    fn apply_model(&mut self, model: String) {
-        let model = model.trim().to_string();
-        if model.is_empty() || model == self.agent.model() {
-            self.selected_model = model;
-            return;
-        }
-        let mut config = load_config(None);
-        match provider_for_model(&config, &model) {
-            Ok(provider) => {
-                self.agent.set_active_model(model.clone(), provider);
-                config.agents.defaults.model = model.clone();
-                if let Err(e) = save_config(&config, None) {
-                    self.status_line = format!("Model active, but config save failed: {e}");
-                } else {
-                    self.status_line = format!("Model: {model}");
-                }
-                self.selected_model = model.clone();
-                self.remember_custom_model(&model);
-                self.refresh_model_choices();
-            }
-            Err(e) => {
-                self.status_line = format!("Model error: {e}");
-            }
         }
     }
 
@@ -294,41 +225,9 @@ impl eframe::App for MetisDesktopApp {
             self.cron_jobs = load_cron_jobs();
             self.last_refresh = now;
         }
-        if now - self.last_model_refresh > 30.0 {
-            self.refresh_model_choices();
-            self.last_model_refresh = now;
-        }
 
         egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
             ui.add_space(8.0);
-            let metis_config = load_config(None);
-            let selected_label = model_menu_label(&self.selected_model, &metis_config);
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Model").small().weak());
-                let mut pick: Option<String> = None;
-                egui::ComboBox::from_id_salt("desktop_model")
-                    .selected_text(truncate(&selected_label, 56))
-                    .width(320.0)
-                    .show_ui(ui, |ui| {
-                        for model in &self.model_choices {
-                            let label = model_menu_label(model, &metis_config);
-                            if ui
-                                .selectable_label(self.selected_model == *model, label)
-                                .clicked()
-                            {
-                                pick = Some(model.clone());
-                            }
-                        }
-                    });
-                if let Some(model) = pick {
-                    self.apply_model(model);
-                }
-                if ui.small_button("↻").on_hover_text("Refresh installed models").clicked() {
-                    self.refresh_model_choices();
-                    self.last_model_refresh = ctx.input(|i| i.time);
-                }
-            });
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
                 let w = ui.available_width() - 80.0;
@@ -338,17 +237,18 @@ impl eframe::App for MetisDesktopApp {
                         .desired_width(w)
                         .desired_rows(2),
                 );
-                let enter_send = ui.input(|i| {
-                    i.key_pressed(egui::Key::Enter) && !i.modifiers.shift && !i.modifiers.ctrl
-                });
                 let send = ui
                     .add_enabled(
                         self.pending.is_none() && !self.input.trim().is_empty(),
                         egui::Button::new("Send"),
                     )
                     .clicked();
-                if (enter_send && response.has_focus()) || send {
-                    self.send_message();
+                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || send
+                {
+                    if !ui.input(|i| i.modifiers.shift) {
+                        self.send_message();
+                    }
                 }
                 if !self.status_line.is_empty() {
                     ui.label(
@@ -538,7 +438,7 @@ impl MetisDesktopApp {
                 "Drop a file path, a traceback, or a rough idea. I'll investigate, suggest next steps, and keep things reversible.",
             );
             ui.label(
-                egui::RichText::new(format!("Session: {} · Model: {}", self.active_session, self.selected_model))
+                egui::RichText::new(format!("Session: {}", self.active_session))
                     .small()
                     .weak(),
             );
@@ -694,17 +594,14 @@ pub fn run(logs: bool) -> Result<()> {
     crate::agent_builder::init_logging(logs);
 
     let metis_config = load_config(None);
-    let selected_model = metis_config.agents.defaults.model.clone();
     let desktop_config = load_desktop_config();
     if !desktop_config_path().exists() {
         let _ = save_desktop_config(&desktop_config);
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = Runtime::new()?;
+    let agent = Arc::new(build_agent_loop(&metis_config)?);
     let sessions = Arc::new(SessionManager::new(None)?);
-    let agent = Arc::new(build_agent_loop(&metis_config, Some(Arc::clone(&sessions)))?);
 
     let title = desktop_config.agent_title.clone();
     let width = desktop_config.window.width;
@@ -724,7 +621,6 @@ pub fn run(logs: bool) -> Result<()> {
             setup_theme(&cc.egui_ctx);
             Ok(Box::new(MetisDesktopApp::new(
                 desktop_config,
-                selected_model,
                 agent,
                 sessions,
                 runtime,

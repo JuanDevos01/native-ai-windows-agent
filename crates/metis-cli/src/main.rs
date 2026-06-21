@@ -211,7 +211,7 @@ async fn run_agent(
     show_logs: bool,
 ) -> Result<()> {
     let config = load_config(None);
-    let agent_loop = build_agent_loop(&config, None)?;
+    let agent_loop = build_agent_loop(&config)?;
 
     match message {
         Some(msg) => {
