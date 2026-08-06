@@ -277,8 +277,34 @@ impl Tool for EditFileTool {
         std::fs::write(&path, &updated)
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
 
+        // Read the file back and prove the edit actually landed, rather than
+        // trusting that the write succeeded. Without this the tool reports
+        // "Successfully edited" on faith — and a model that then says "Done"
+        // to the user has no way to know better. Verification belongs here,
+        // in the tool, not in an instruction asking the model to be careful.
+        let verify = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "Edit wrote to {} but the file could not be read back to verify: {e}",
+                path.display()
+            )
+        })?;
+        if verify != updated {
+            anyhow::bail!(
+                "Edit to {} did NOT apply — the file on disk differs from what was written \
+                 (something else may have modified it). Re-read the file and try again.",
+                path.display()
+            );
+        }
+        if !new_text.is_empty() && !verify.contains(&new_text) {
+            anyhow::bail!(
+                "Edit to {} did NOT apply — new_text is not present in the file after writing. \
+                 Re-read the file and try again.",
+                path.display()
+            );
+        }
+
         Ok(format!(
-            "{warning}Successfully edited {}",
+            "{warning}Successfully edited {} (verified: file re-read, new_text confirmed present)",
             path.display()
         ))
     }

@@ -10,17 +10,20 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::json;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use metis_core::bus::queue::MessageBus;
 use metis_core::bus::types::{InboundMessage, OutboundMessage};
+use metis_core::memory_db::MemoryDb;
 use metis_core::session::manager::SessionManager;
-use metis_core::types::{Message, LlmResponse};
+use metis_core::types::{Message, MessageContent, LlmResponse};
 use metis_providers::traits::{LlmProvider, LlmRequestConfig};
 
 use crate::context::ContextBuilder;
+use crate::memory_index::MemoryIndex;
 use crate::subagent::SubagentManager;
 use crate::tools::base::{parse_tool_params, sanitize_tool_calls_for_history};
+use crate::tools::memory::{MemorySaveTool, MemorySearchTool};
 use crate::tools::message::MessageTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::browser::BrowserTool;
@@ -34,6 +37,32 @@ use std::sync::OnceLock;
 
 /// Default maximum LLM ↔ tool iterations per user message.
 const DEFAULT_MAX_ITERATIONS: usize = 20;
+
+// Direct chat mode (local chat-only models, e.g. Ollama gemma3) runs on the
+// user's own hardware, where every context token is paid for in CPU time.
+// These bounds keep system + history + reply inside one context window so the
+// server's prefix cache keeps hitting turn after turn.
+
+/// Default context window to load the local model with. Ollama's default is
+/// 4096, which a re-sent conversation overflows within a few exchanges —
+/// after which every message re-evaluates the whole history. Overridable via
+/// `agents.defaults.chatContextLength` ([`AgentLoop::with_direct_chat_context`]).
+const DIRECT_CHAT_NUM_CTX: u32 = 8192;
+
+/// Response cap for direct chat. Long free-form generations are slow on CPU
+/// and eat context budget; chat replies don't need the agent-mode allowance.
+const DIRECT_CHAT_MAX_TOKENS: u32 = 1024;
+
+/// How long the local server keeps the model loaded between messages, so a
+/// pause in the conversation doesn't pay the model-load penalty again.
+const DIRECT_CHAT_KEEP_ALIVE: &str = "30m";
+
+/// Automatic memory recall budget for direct chat. At ~20 tokens/second of
+/// CPU prompt evaluation, each injected character costs real wall-clock time
+/// on every turn, so recall is limited to a couple of short snippets; the
+/// window dedupe means repeats cost nothing.
+const DIRECT_CHAT_RECALL_HITS: usize = 2;
+const DIRECT_CHAT_RECALL_SNIPPET_CHARS: usize = 250;
 
 /// Substring present in every real `exec` tool result (`tools/shell.rs`).
 const EXEC_RESULT_MARKER: &str = "<<<EXEC_RESULT>>>";
@@ -60,6 +89,9 @@ pub struct OutboundFormatting {
     /// When false (default), `<<<EXEC_RESULT>>>` blocks (and stdout/stderr tails) are replaced
     /// with a one-line summary on Telegram, Discord, and WhatsApp. Session history is unchanged.
     pub include_exec_output_in_chat_apps: bool,
+    /// When true (default), a small token-usage footer (input/output tokens, LLM call count for
+    /// the turn) is appended to outbound replies. Session history is unchanged.
+    pub show_token_usage: bool,
 }
 
 impl Default for OutboundFormatting {
@@ -68,8 +100,142 @@ impl Default for OutboundFormatting {
             log_thinking_json: true,
             include_fenced_code_in_chat_apps: false,
             include_exec_output_in_chat_apps: false,
+            show_token_usage: true,
         }
     }
+}
+
+// ─────────────────────────────────────────────
+// Per-turn token usage
+// ─────────────────────────────────────────────
+
+/// Accumulated token usage across all LLM calls in one turn
+/// (main loop iterations + the compaction call, when it fires).
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    llm_calls: u32,
+}
+
+impl TurnUsage {
+    fn record(&mut self, usage: Option<&metis_core::types::UsageInfo>) {
+        self.llm_calls += 1;
+        if let Some(u) = usage {
+            self.prompt_tokens += u.prompt_tokens as u64;
+            self.completion_tokens += u.completion_tokens as u64;
+        }
+    }
+
+    fn has_tokens(&self) -> bool {
+        self.prompt_tokens > 0 || self.completion_tokens > 0
+    }
+}
+
+/// Compact token count for the usage footer (e.g. `842`, `12.3k`).
+fn format_token_count(n: u64) -> String {
+    if n < 10_000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+// ─────────────────────────────────────────────
+// Semantic memory settings
+// ─────────────────────────────────────────────
+
+/// Settings for the semantic memory system (SQLite store + compaction + recall).
+///
+/// Built from `config.memory` by the CLI; attach with [`AgentLoop::with_memory`].
+#[derive(Clone)]
+pub struct MemorySettings {
+    /// Master switch. When false, no store is opened and no tools registered.
+    pub enabled: bool,
+    /// Store path. `None` = `~/.metis/memory.db`.
+    pub db_path: Option<PathBuf>,
+    /// Provider used for embeddings (may differ from the chat provider,
+    /// e.g. local Ollama). `None` = keyword-only search.
+    pub embed_provider: Option<Arc<dyn LlmProvider>>,
+    /// Embedding model identifier (e.g. `"ollama/nomic-embed-text"`).
+    pub embed_model: String,
+    /// Compact a session once it exceeds this many messages (0 = never).
+    pub compaction_threshold: usize,
+    /// Messages kept verbatim after compaction.
+    pub keep_recent: usize,
+    /// Recalled memories injected into context per message.
+    pub top_k: usize,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db_path: None,
+            embed_provider: None,
+            embed_model: String::new(),
+            compaction_threshold: 40,
+            keep_recent: 20,
+            top_k: 5,
+        }
+    }
+}
+
+/// System prompt for the compaction summarization call.
+const COMPACTION_PROMPT: &str = "You are compacting a long conversation to free context space. \
+Summarize the following earlier conversation messages into concise notes. Capture: durable facts \
+about the user, decisions made, preferences, project/task state, and unresolved items. Omit \
+greetings, chit-chat, and anything transient. Reply with ONLY the summary as short bullet points.";
+
+/// Max characters of transcript sent to the compaction summarizer.
+const COMPACTION_TRANSCRIPT_MAX_CHARS: usize = 24_000;
+/// Max characters per message inside the compaction transcript.
+const COMPACTION_MESSAGE_MAX_CHARS: usize = 1_500;
+
+/// Extract plain text from a session message for the compaction transcript.
+fn message_plain_text(msg: &Message) -> Option<(&'static str, String)> {
+    match msg {
+        Message::User { content } => match content {
+            MessageContent::Text(t) => Some(("User", t.clone())),
+            MessageContent::Parts(parts) => {
+                let text: Vec<String> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        metis_core::types::ContentPart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Some(("User", text.join(" ")))
+            }
+        },
+        Message::Assistant { content, .. } => {
+            content.as_ref().map(|t| ("Assistant", t.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Render old session messages as a plain-text transcript, capped in size.
+fn render_compaction_transcript(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        let Some((role, text)) = message_plain_text(msg) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(&truncate_chars(text, COMPACTION_MESSAGE_MAX_CHARS));
+        out.push('\n');
+        if out.len() >= COMPACTION_TRANSCRIPT_MAX_CHARS {
+            out.push_str("(… transcript truncated …)\n");
+            break;
+        }
+    }
+    out
 }
 
 pub(crate) fn is_chat_app_channel(channel: &str) -> bool {
@@ -138,6 +304,20 @@ pub fn exec_report_failed(block: &str) -> bool {
     exec_output_has_custom_failure_marker(exec_process_output_tail(block))
 }
 
+/// Whether a non-`exec` tool's result string represents a failure. All
+/// non-exec tools (`browser`, `web_fetch`, `read_file`, …) report errors as
+/// plain text via `ToolRegistry::execute`'s `"Error executing {name}: {e}"`
+/// wrapper (see `registry.rs`), so this is the shared sniff used to decide
+/// between a "✓ done" and a "✗ failed" outcome line.
+fn non_exec_tool_failed(result: &str) -> bool {
+    let lower = result.to_lowercase();
+    lower.starts_with("tool argument error")
+        || lower.starts_with("error:")
+        || lower.starts_with("error executing")
+        || lower.contains("no such file")
+        || lower.contains("failed to")
+}
+
 fn first_stderr_summary_line(block: &str) -> Option<String> {
     let mut in_stderr = false;
     for line in block.lines() {
@@ -177,8 +357,33 @@ fn first_failure_summary_line(block: &str) -> Option<String> {
     None
 }
 
+/// True when an exec tool result is an approval prompt or policy block
+/// rather than an actual execution. These carry no `<<<EXEC_RESULT>>>` block,
+/// which is precisely what distinguishes "nothing ran" from "ran and
+/// succeeded" — without this check they were being rendered to the user as
+/// `✓ Ran (unknown command)`, i.e. as a success.
+pub fn exec_result_needs_approval(result: &str) -> bool {
+    !result.contains(EXEC_RESULT_MARKER)
+        && (result.contains("Approval token:") || result.contains("Permission required"))
+}
+
+/// Pull the approval token out of an exec approval prompt, so the retry
+/// nudge can hand the model the exact token instead of hoping it re-reads it.
+pub fn extract_approval_token(result: &str) -> Option<String> {
+    let rest = result.split("Approval token:").nth(1)?;
+    let token = rest.split_whitespace().next()?.trim_matches('"').to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 /// One-line summary of an `<<<EXEC_RESULT>>>` report (header + optional stderr hint).
 pub fn summarize_exec_block(block: &str) -> String {
+    if exec_result_needs_approval(block) {
+        return "⚠ NOT executed — needs approval (agent must retry with approve_token)".to_string();
+    }
     let mut command = None;
     let mut exit_code = None;
     let mut status = None;
@@ -1037,12 +1242,7 @@ impl TaskStep {
             };
             TaskStep { label, ok: !failed, detail }
         } else {
-            // Non-exec tools: treat an explicit "Tool argument error" / "error:" as failure.
-            let lower = result.to_lowercase();
-            let failed = lower.starts_with("tool argument error")
-                || lower.starts_with("error:")
-                || lower.contains("no such file")
-                || lower.contains("failed to");
+            let failed = non_exec_tool_failed(result);
             let detail = if failed {
                 Some(truncate_chars(result.lines().next().unwrap_or("failed"), 100))
             } else {
@@ -1399,6 +1599,230 @@ fn looks_like_unexecuted_exec_narration(content: &str) -> bool {
     has_progress_words && has_command_hint
 }
 
+/// MiniMax-M2.7's native tool-call output is `<minimax:tool_call><invoke
+/// name="...">...</invoke></minimax:tool_call>` XML — only auto-parsed into
+/// a structured `tool_calls` response by specific serving stacks (vLLM/SGLang
+/// OpenAI-compatible endpoints). Against MiniMax's own hosted API this
+/// sometimes surfaces as plain text instead, and — worse — sometimes as an
+/// entirely invented pseudo-syntax the model free-hands when it isn't sure
+/// how to represent a call (observed live: `[TOOL_CALL] {tool => "x", args
+/// => {...}} [/TOOL_CALL]`, matching no documented format at all). Either
+/// way the intent is clear (attempted tool call, never executed) — catch
+/// both the documented and the free-hand shape here.
+fn looks_like_fake_tool_call_syntax(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("[tool_call]")
+        || lower.contains("<minimax:tool_call>")
+        || lower.contains("<invoke name=")
+        || (lower.contains("tool =>") && lower.contains("args =>"))
+        || (lower.contains("\"tool\"") && lower.contains("\"args\""))
+}
+
+/// Given the byte index of an opening `{`, find the matching closing `}`,
+/// respecting quoted strings (so a brace inside a quoted value doesn't throw
+/// off the depth count). Byte-indexed but UTF-8-safe: it only branches on
+/// single-byte ASCII markers (`"` `\` `{` `}`), and any multi-byte UTF-8
+/// continuation byte is >= 0x80 so it never matches one by accident.
+fn find_matching_brace(s: &str, open_idx: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(open_idx) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_quotes = false;
+    let mut i = open_idx;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quotes {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_quotes = false;
+            }
+        } else {
+            match b {
+                b'"' => in_quotes = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Undo `\X` -> `X` escaping (handles `\"` and the doubled `\\` a model
+/// commonly emits for a Windows path inside its own free-hand quoted text).
+fn unescape_backslash_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+static TOOL_NAME_ARROW_RE: OnceLock<Regex> = OnceLock::new();
+fn tool_name_arrow_re() -> &'static Regex {
+    TOOL_NAME_ARROW_RE.get_or_init(|| Regex::new(r#"tool\s*=>\s*"([^"]*)""#).expect("tool arrow regex"))
+}
+
+static ARG_FLAG_QUOTED_RE: OnceLock<Regex> = OnceLock::new();
+fn arg_flag_quoted_re() -> &'static Regex {
+    ARG_FLAG_QUOTED_RE
+        .get_or_init(|| Regex::new(r#"--([A-Za-z][\w-]*)\s+"((?:\\.|[^"\\])*)""#).expect("arg flag regex"))
+}
+
+static INVOKE_NAME_RE: OnceLock<Regex> = OnceLock::new();
+fn invoke_name_re() -> &'static Regex {
+    INVOKE_NAME_RE.get_or_init(|| Regex::new(r#"<invoke name="([^"]+)">"#).expect("invoke name regex"))
+}
+
+static INVOKE_PARAM_RE: OnceLock<Regex> = OnceLock::new();
+fn invoke_param_re() -> &'static Regex {
+    INVOKE_PARAM_RE.get_or_init(|| {
+        Regex::new(r#"(?s)<parameter name="([^"]+)">(.*?)</parameter>"#).expect("invoke param regex")
+    })
+}
+
+/// Best-effort recovery for a tool call the model wrote as text instead of
+/// invoking for real (paired with `looks_like_fake_tool_call_syntax`).
+/// Tries, in order: a plain JSON object, the free-hand `{tool => "x", args
+/// => {...}}` hash-arrow shape observed live, and MiniMax's own documented
+/// `<invoke name="x"><parameter name="y">z</parameter></invoke>` XML.
+/// Returns `None` (never guesses) when nothing parses cleanly, so the caller
+/// falls back to nudging the model to call it for real instead.
+fn try_recover_fake_tool_call(content: &str) -> Option<metis_core::types::ToolCall> {
+    try_recover_json_tool_call(content)
+        .or_else(|| try_recover_hash_arrow_tool_call(content))
+        .or_else(|| try_recover_invoke_xml_tool_call(content))
+}
+
+fn try_recover_json_tool_call(content: &str) -> Option<metis_core::types::ToolCall> {
+    let start = content.find('{')?;
+    let end = find_matching_brace(content, start)?;
+    let value: serde_json::Value = serde_json::from_str(&content[start..=end]).ok()?;
+    let obj = value.as_object()?;
+    let name = obj.get("tool").or_else(|| obj.get("name"))?.as_str()?.to_string();
+    let args = obj
+        .get("args")
+        .or_else(|| obj.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let args_str = serde_json::to_string(&args).ok()?;
+    Some(metis_core::types::ToolCall::new("recovered-1", name, args_str))
+}
+
+fn try_recover_hash_arrow_tool_call(content: &str) -> Option<metis_core::types::ToolCall> {
+    let name_caps = tool_name_arrow_re().captures(content)?;
+    let name = name_caps.get(1)?.as_str().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after_name = name_caps.get(0)?.end();
+    let args_kw = content[after_name..].find("args")? + after_name;
+    let brace_open = content[args_kw..].find('{')? + args_kw;
+    let brace_close = find_matching_brace(content, brace_open)?;
+    let args_block = &content[brace_open + 1..brace_close];
+
+    let mut args = serde_json::Map::new();
+    for cap in arg_flag_quoted_re().captures_iter(args_block) {
+        let key = cap.get(1)?.as_str().to_string();
+        let raw_val = cap.get(2)?.as_str();
+        args.insert(key, serde_json::Value::String(unescape_backslash_quotes(raw_val)));
+    }
+    if args.is_empty() {
+        return None;
+    }
+    let args_str = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
+    Some(metis_core::types::ToolCall::new("recovered-1", name, args_str))
+}
+
+fn try_recover_invoke_xml_tool_call(content: &str) -> Option<metis_core::types::ToolCall> {
+    let name_caps = invoke_name_re().captures(content)?;
+    let name = name_caps.get(1)?.as_str().to_string();
+    let invoke_start = name_caps.get(0)?.end();
+    let invoke_end = content[invoke_start..]
+        .find("</invoke>")
+        .map(|i| invoke_start + i)
+        .unwrap_or(content.len());
+    let body = &content[invoke_start..invoke_end];
+
+    let mut args = serde_json::Map::new();
+    for cap in invoke_param_re().captures_iter(body) {
+        let key = cap.get(1)?.as_str().to_string();
+        let val = cap.get(2)?.as_str().trim().to_string();
+        args.insert(key, serde_json::Value::String(val));
+    }
+    let args_str = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
+    Some(metis_core::types::ToolCall::new("recovered-1", name, args_str))
+}
+
+/// Marker that opens the internal tool ledger stored in session history.
+const TOOL_LEDGER_MARKER: &str = "[Record of tools I actually ran";
+
+/// Remove any internal tool-ledger block the model has echoed back into its
+/// reply. The ledger is bookkeeping for the model, never for the user — it
+/// was observed verbatim in a Telegram reply, so this strips it on the way
+/// out regardless of why it got there.
+pub fn strip_tool_ledger_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(TOOL_LEDGER_MARKER) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find(']') {
+            Some(end) => rest = &after[end + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// True when a reply only asserts that the work/answer already happened,
+/// rather than containing the answer itself — e.g. "I already answered that
+/// above", "no further action needed". Such a reply is worthless on its own
+/// and must never be allowed to replace the substantive answer it followed.
+fn is_meta_non_answer(content: &str) -> bool {
+    let cleaned = strip_all_exec_reports_from_text(content);
+    let trimmed = cleaned.trim();
+    // A long reply is carrying real content even if it opens with "I already…".
+    if trimmed.chars().count() > 400 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let claims_already_done = lower.contains("already answered")
+        || lower.contains("already did")
+        || lower.contains("already told you")
+        || lower.contains("already provided")
+        || lower.contains("as stated above")
+        || lower.contains("see above")
+        || lower.contains("no further action")
+        || lower.contains("no further searching")
+        || lower.contains("nothing further")
+        || lower.contains("no tool call needed")
+        || lower.contains("i did call");
+    claims_already_done
+}
+
 fn looks_like_powershell_cmdlet(token: &str) -> bool {
     let mut parts = token.splitn(2, '-');
     let Some(verb) = parts.next() else {
@@ -1542,6 +1966,9 @@ pub(crate) fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &st
             .unwrap_or_default();
         let preview: String = cmd.chars().take(60).collect();
         let ellipsis = if cmd.len() > 60 { "…" } else { "" };
+        if exec_result_needs_approval(result) {
+            return format!("⚠ `{preview}{ellipsis}` — NOT executed, needs approval");
+        }
         if failed {
             let err = first_failure_summary_line(result)
                 .unwrap_or_else(|| "command failed".to_string());
@@ -1550,8 +1977,14 @@ pub(crate) fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &st
             format!("✓ `{preview}{ellipsis}`")
         }
     } else {
-        let short: String = result.lines().next().unwrap_or("done").chars().take(60).collect();
-        format!("done — {short}")
+        let line = result.lines().next().unwrap_or("");
+        let short: String = line.chars().take(60).collect();
+        let ellipsis = if line.chars().count() > 60 { "…" } else { "" };
+        if non_exec_tool_failed(result) {
+            format!("✗ failed — {short}{ellipsis}")
+        } else {
+            format!("done — {short}{ellipsis}")
+        }
     }
 }
 
@@ -1588,6 +2021,14 @@ pub struct AgentLoop {
     subagent_manager: Arc<SubagentManager>,
     /// Outbound formatting (thinking logs, fenced-code stripping for chat apps).
     outbound: OutboundFormatting,
+    /// Semantic memory index (None = disabled or failed to open).
+    memory: Option<Arc<MemoryIndex>>,
+    /// Compaction/recall parameters (only meaningful when `memory` is set).
+    memory_settings: MemorySettings,
+    /// Context window (num_ctx) requested from the local server in direct
+    /// chat mode. Matching it to the server's own default avoids a model
+    /// reload every time the user switches between Metis and another client.
+    direct_chat_num_ctx: u32,
 }
 
 impl AgentLoop {
@@ -1656,6 +2097,14 @@ impl AgentLoop {
             workspace.clone(),
             restrict_to_workspace,
         )));
+        // Lets a text-only agent model still handle images (see vision.rs).
+        tools.register(Arc::new(crate::tools::vision::VisionTool::new(
+            workspace.clone(),
+        )));
+        // Gives the "write down what worked" instruction an actual mechanism.
+        tools.register(Arc::new(crate::tools::skill_writer::SaveSkillTool::new(
+            workspace.clone(),
+        )));
 
         let message_tool = Arc::new(MessageTool::new(None));
         tools.register(message_tool.clone());
@@ -1697,7 +2146,348 @@ impl AgentLoop {
             spawn_tool,
             subagent_manager,
             outbound,
+            memory: None,
+            memory_settings: MemorySettings::default(),
+            direct_chat_num_ctx: DIRECT_CHAT_NUM_CTX,
         }
+    }
+
+    /// Set the context window requested from the local server in direct chat
+    /// mode (chat-only models). `0` keeps the built-in default.
+    pub fn with_direct_chat_context(mut self, num_ctx: u32) -> Self {
+        if num_ctx > 0 {
+            self.direct_chat_num_ctx = num_ctx;
+        }
+        self
+    }
+
+    /// Attach the semantic memory system (SQLite store, recall, compaction)
+    /// and register the `memory_save` / `memory_search` tools.
+    ///
+    /// Not attaching (or `enabled: false`) leaves memory off entirely — the
+    /// agent then behaves exactly as before this feature existed.
+    pub fn with_memory(mut self, settings: MemorySettings) -> Self {
+        if !settings.enabled {
+            self.memory = None;
+            self.memory_settings = settings;
+            return self;
+        }
+
+        let db_path = settings
+            .db_path
+            .clone()
+            .unwrap_or_else(|| metis_core::utils::get_data_path().join("memory.db"));
+
+        let db = match MemoryDb::open(&db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                error!(path = %db_path.display(), error = %e, "failed to open memory db; semantic memory disabled");
+                self.memory = None;
+                self.memory_settings = settings;
+                return self;
+            }
+        };
+
+        let index = Arc::new(MemoryIndex::new(
+            db,
+            settings.embed_provider.clone(),
+            settings.embed_model.clone(),
+        ));
+        self.tools.register(Arc::new(MemorySaveTool::new(index.clone())));
+        self.tools.register(Arc::new(MemorySearchTool::new(index.clone())));
+
+        info!(
+            path = %db_path.display(),
+            entries = index.count(),
+            vector_search = index.has_embedder(),
+            compaction_threshold = settings.compaction_threshold,
+            "semantic memory enabled"
+        );
+
+        self.memory = Some(index);
+        self.memory_settings = settings;
+        self
+    }
+
+    /// Compact the session if it has grown past the configured threshold:
+    /// summarize the oldest messages (one LLM call), store the summary in the
+    /// memory DB, and replace the old messages with the summary in-session.
+    ///
+    /// Deliberately lazy — this only ever runs piggy-backed on a real message,
+    /// so it costs tokens only when a session actually grows, never on a
+    /// schedule. On any failure the session is left untouched.
+    ///
+    /// Returns the usage of the summarization call when one was made, so the
+    /// turn's token footer stays honest.
+    async fn maybe_compact_session(&self, session_key: &str) -> Option<metis_core::types::UsageInfo> {
+        let index = self.memory.as_ref()?;
+        let threshold = self.memory_settings.compaction_threshold;
+        if threshold == 0 {
+            return None;
+        }
+
+        let session = self.sessions.get_or_create(session_key);
+        let len = session.messages.len();
+        if len <= threshold {
+            return None;
+        }
+
+        let keep = self.memory_settings.keep_recent.min(len);
+        let split = len - keep;
+        if split == 0 {
+            return None;
+        }
+
+        let transcript = render_compaction_transcript(&session.messages[..split]);
+        if transcript.trim().is_empty() {
+            return None;
+        }
+
+        // On chat-only local models (CPU-bound, e.g. Ollama gemma3), the
+        // summarization is a *second* multi-minute LLM call piggy-backed on
+        // this turn — doubling the reply latency the user already waits on.
+        // Skip it: trim the session structurally so it stays bounded, and
+        // keep the dropped span searchable by storing the raw transcript
+        // (no LLM, and no embedding cost when no embedder is configured).
+        let supports_tools = self.provider.supports_tools(&self.model).await;
+        if !supports_tools {
+            self.compact_session_without_llm(session_key, index, &session.messages, split, keep)
+                .await;
+            return None;
+        }
+
+        info!(session = session_key, messages = split, "compacting session history");
+        let prompt = vec![
+            Message::system(COMPACTION_PROMPT),
+            Message::user(&transcript),
+        ];
+        // Chat-only local models need the same runtime options here as in the
+        // main loop — the transcript being summarized is exactly the kind of
+        // prompt that overflows Ollama's default context window.
+        let request_config = if self.provider.supports_tools(&self.model).await {
+            self.request_config.clone()
+        } else {
+            self.direct_chat_request_config()
+        };
+        let response = self
+            .provider
+            .chat(&prompt, None, &self.model, &request_config)
+            .await;
+        let spent = response.usage.clone();
+
+        if llm_response_is_api_error(&response) {
+            error!(session = session_key, "compaction summarization failed; keeping full history");
+            return spent;
+        }
+        let Some(summary) = response.content.filter(|s| !s.trim().is_empty()) else {
+            error!(session = session_key, "compaction produced empty summary; keeping full history");
+            return spent;
+        };
+        let summary = summary.trim().to_string();
+
+        // Persist to searchable memory FIRST — only rewrite the session once
+        // the summary is safely stored.
+        if let Err(e) = index
+            .save(
+                &format!("Conversation summary ({session_key}):\n{summary}"),
+                "compaction",
+                session_key,
+            )
+            .await
+        {
+            error!(session = session_key, error = %e, "failed to store compaction summary; keeping full history");
+            return spent;
+        }
+
+        let mut new_messages = Vec::with_capacity(keep + 1);
+        new_messages.push(Message::user(format!(
+            "[Archived background context from earlier in this conversation — NOT a new message from the \
+             user, and nothing here needs a reply. It may mention things that were left unresolved at the \
+             time; only act on them if they are still relevant to the user's ACTUAL latest message below. \
+             Always address that latest message first.]\n{summary}"
+        )));
+        new_messages.extend_from_slice(&session.messages[split..]);
+        self.sessions.replace_messages(session_key, new_messages);
+        info!(
+            session = session_key,
+            compacted = split,
+            kept = keep,
+            "session compacted into memory"
+        );
+        spent
+    }
+
+    /// Cheap compaction for chat-only local models: bound the session without
+    /// the extra summarization LLM call. The dropped messages are stored
+    /// verbatim as a searchable memory (truncated to a sane size) so recall
+    /// still works, and the session keeps a short marker plus the recent tail.
+    ///
+    /// Best-effort: a memory-store failure leaves the session untouched rather
+    /// than dropping messages that were never persisted anywhere.
+    async fn compact_session_without_llm(
+        &self,
+        session_key: &str,
+        index: &MemoryIndex,
+        messages: &[Message],
+        split: usize,
+        keep: usize,
+    ) {
+        // Cap what we store: a long transcript embedded on every recall would
+        // reintroduce the cost we are trying to avoid. Keep the tail, which is
+        // the most recent (and usually most relevant) of the dropped span.
+        const MAX_STORED_CHARS: usize = 4000;
+        let mut transcript = render_compaction_transcript(&messages[..split]);
+        if transcript.chars().count() > MAX_STORED_CHARS {
+            let start = transcript
+                .char_indices()
+                .rev()
+                .nth(MAX_STORED_CHARS - 1)
+                .map_or(0, |(i, _)| i);
+            transcript = format!("…{}", &transcript[start..]);
+        }
+
+        if let Err(e) = index
+            .save(
+                &format!("Earlier conversation ({session_key}):\n{transcript}"),
+                "compaction-raw",
+                session_key,
+            )
+            .await
+        {
+            error!(session = session_key, error = %e, "cheap compaction: memory store failed; keeping full history");
+            return;
+        }
+
+        let mut new_messages = Vec::with_capacity(keep + 1);
+        new_messages.push(Message::user(
+            "[Earlier messages were moved to long-term memory to keep replies fast. \
+             Use memory_search if you need them.]",
+        ));
+        new_messages.extend_from_slice(&messages[split..]);
+        self.sessions.replace_messages(session_key, new_messages);
+        info!(
+            session = session_key,
+            compacted = split,
+            kept = keep,
+            "session compacted without LLM (chat-only model)"
+        );
+    }
+
+    /// Turn a recovered tool output into a direct answer to the user's
+    /// question, with one LLM call (no tools).
+    ///
+    /// Used when the model narrated a command instead of calling the tool: the
+    /// recovery guard runs the command deterministically, but the raw output
+    /// is not an answer. Reasoning models (e.g. MiniMax) hit this often, and
+    /// without this the user just sees "✓ Ran … SUCCESS" and no result.
+    ///
+    /// Records its own token usage so the footer stays honest. Returns `None`
+    /// on API error or empty output, so the caller can fall back to the raw
+    /// text rather than dropping the recovery result entirely.
+    async fn answer_from_tool_output(
+        &self,
+        question: &str,
+        tool_output: &str,
+        request_config: &LlmRequestConfig,
+        turn_usage: &mut TurnUsage,
+    ) -> Option<String> {
+        let prompt = vec![
+            Message::system(
+                "Answer the user's question directly using the tool output below. \
+                 Be concise and helpful. Do not show the raw command or the raw output \
+                 unless the user asked to see it.",
+            ),
+            Message::user(format!(
+                "User's question:\n{question}\n\nTool output:\n{tool_output}"
+            )),
+        ];
+        let response = self
+            .provider
+            .chat(&prompt, None, &self.model, request_config)
+            .await;
+        turn_usage.record(response.usage.as_ref());
+        if llm_response_is_api_error(&response) {
+            warn!("synthesis-from-tool-output call failed; using raw output");
+            return None;
+        }
+        response.content.filter(|s| !s.trim().is_empty())
+    }
+
+    /// Token-usage footer for outbound replies, or `None` when disabled or
+    /// when the provider reported no usage numbers.
+    fn token_usage_footer(&self, usage: &TurnUsage) -> Option<String> {
+        if !self.outbound.show_token_usage || !usage.has_tokens() {
+            return None;
+        }
+        let calls = if usage.llm_calls == 1 {
+            "1 LLM call".to_string()
+        } else {
+            format!("{} LLM calls", usage.llm_calls)
+        };
+        Some(format!(
+            "\n\n📊 {} in / {} out tokens · {calls}",
+            format_token_count(usage.prompt_tokens),
+            format_token_count(usage.completion_tokens),
+        ))
+    }
+
+    /// Request config for direct chat mode: chat-sized response cap plus
+    /// Ollama runtime options (context window, keep-alive) so the local
+    /// server's prefix cache keeps hitting as the conversation grows.
+    fn direct_chat_request_config(&self) -> LlmRequestConfig {
+        LlmRequestConfig {
+            max_tokens: self.request_config.max_tokens.min(DIRECT_CHAT_MAX_TOKENS),
+            num_ctx: Some(self.direct_chat_num_ctx),
+            keep_alive: Some(DIRECT_CHAT_KEEP_ALIVE.to_string()),
+            ..self.request_config.clone()
+        }
+    }
+
+    /// Retrieve memories relevant to the incoming message, formatted for the
+    /// system prompt. `None` when memory is disabled or nothing relevant.
+    ///
+    /// `max_hits` / `snippet_chars` bound the injected block: recall runs on
+    /// every message, and on a CPU-bound local model every injected token
+    /// costs tens of milliseconds of prompt evaluation per turn.
+    ///
+    /// Memories whose snippet is already visible in the session window are
+    /// skipped: recall runs on every message, and (in direct chat mode) the
+    /// injected block is persisted with it — re-injecting the same memory
+    /// each turn would pile duplicate text into every prompt.
+    async fn recall_memories(
+        &self,
+        query: &str,
+        history: &[Message],
+        max_hits: usize,
+        snippet_chars: usize,
+    ) -> Option<String> {
+        let index = self.memory.as_ref()?;
+        let top_k = self.memory_settings.top_k.min(max_hits);
+        if top_k == 0 || query.trim().len() < 4 {
+            return None;
+        }
+        let hits = index.search(query, top_k).await;
+        let window_text: String = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User {
+                    content: MessageContent::Text(t),
+                } => Some(t.as_str()),
+                Message::Assistant {
+                    content: Some(c), ..
+                } => Some(c.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fresh: Vec<_> = hits
+            .into_iter()
+            .filter(|h| {
+                !window_text
+                    .contains(&crate::memory_index::recall_snippet(&h.text, snippet_chars))
+            })
+            .collect();
+        MemoryIndex::format_recall_block_capped(&fresh, snippet_chars)
     }
 
     fn log_llm_thinking_json(
@@ -1810,8 +2600,19 @@ impl AgentLoop {
             .set_context(&msg.channel, &msg.chat_id)
             .await;
 
+        // Every "fast path" below is a keyword heuristic that bypasses the
+        // LLM entirely and answers from one hardcoded tool call. They all
+        // read ONLY `msg.content` — but a channel appends an attachment
+        // marker to that same text (Telegram: "[image: C:\…\photo.jpg]"),
+        // so an image whose caption merely contains "show"/"read"/"output"
+        // was being routed into `read_file` against the JPG itself, which
+        // returns binary garbage the model then has to explain away. An
+        // attachment means the request is about the attachment: never let a
+        // text-keyword guess hijack it — send it to the model instead.
+        let has_media = !msg.media.is_empty();
+
         // Fast path for explicit requests to output the long-term memory file.
-        if is_memory_file_request(&msg.content) {
+        if !has_media && is_memory_file_request(&msg.content) {
             let mut params: HashMap<String, serde_json::Value> = HashMap::new();
             let memory_path = self._workspace.join("memory").join("MEMORY.md");
             params.insert(
@@ -1827,7 +2628,7 @@ impl AgentLoop {
         }
 
         // Fast path for natural-language read-file requests with explicit path.
-        if is_read_file_request(&msg.content) {
+        if !has_media && is_read_file_request(&msg.content) {
             if let Some(path) = extract_probable_file_path(&msg.content) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
@@ -1843,7 +2644,7 @@ impl AgentLoop {
         // Fast path for direct shell commands.
         // This ensures command-style messages produce deterministic exec output
         // (including EXIT_CODE), instead of relying on LLM tool selection.
-        if looks_like_direct_shell_command(&msg.content) {
+        if !has_media && looks_like_direct_shell_command(&msg.content) {
             let mut params: HashMap<String, serde_json::Value> = HashMap::new();
             params.insert(
                 "command".to_string(),
@@ -1859,7 +2660,7 @@ impl AgentLoop {
 
         // Script-file mode for explicit "run this PowerShell script" requests.
         // We write one .ps1 and execute exactly one command (`powershell -File ...`).
-        if should_use_script_file_mode(&msg.content) {
+        if !has_media && should_use_script_file_mode(&msg.content) {
             if let Some(script_body) = extract_powershell_code_block(&msg.content) {
                 let script_path = self._workspace.join("agent_script_run.ps1");
                 if let Err(e) = std::fs::write(&script_path, script_body.as_bytes()) {
@@ -1887,7 +2688,7 @@ impl AgentLoop {
 
         // Deterministic Windows fast path: install whisper.cpp + model via one script execution.
         // This avoids narration-only "installed ✅" replies for this common workflow.
-        if cfg!(target_os = "windows") && is_whisper_cpp_install_request(&msg.content) {
+        if !has_media && cfg!(target_os = "windows") && is_whisper_cpp_install_request(&msg.content) {
             let script = r#"$ErrorActionPreference = "Stop"
 $root = "C:\whisper-cpp"
 $bin = Join-Path $root "bin"
@@ -1971,25 +2772,100 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
-        // Get session history
-        let history = self.sessions.get_history(&session_key, 50);
+        // Per-turn token accounting (main loop + compaction call).
+        let mut turn_usage = TurnUsage::default();
+
+        // Compact oversized session history into long-term memory before loading it.
+        if let Some(u) = self.maybe_compact_session(&session_key).await {
+            turn_usage.record(Some(&u));
+        }
+
+        // Chat-only models (no tool support) get DIRECT CHAT MODE: a ~200-token
+        // lite prompt and trimmed history instead of the full agent briefing.
+        // On CPU-bound local models this is the difference between seconds and
+        // minutes of prompt evaluation per message.
+        let supports_tools = self.provider.supports_tools(&self.model).await;
+
+        // Get session history. In direct chat mode the window must be
+        // append-only for the local server's prefix cache to hit — a sliding
+        // window changes the sequence start every turn and forces a full
+        // re-evaluation. Compaction already bounds session growth, so take
+        // everything up to the compaction ceiling; without compaction, fall
+        // back to a small window (slow but bounded).
+        let history_limit = if supports_tools {
+            50
+        } else if self.memory.is_some() && self.memory_settings.compaction_threshold > 0 {
+            self.memory_settings.compaction_threshold + self.memory_settings.keep_recent
+        } else {
+            12
+        };
+        let history = self.sessions.get_history(&session_key, history_limit);
+
+        // Recall relevant long-term memories for this message. Direct chat
+        // (CPU-bound local models) gets a lean recall; tool-capable models
+        // get the full configured budget.
+        let recalled = if supports_tools {
+            self.recall_memories(
+                &msg.content,
+                &history,
+                self.memory_settings.top_k,
+                crate::memory_index::RECALL_SNIPPET_MAX_CHARS,
+            )
+            .await
+        } else {
+            self.recall_memories(
+                &msg.content,
+                &history,
+                DIRECT_CHAT_RECALL_HITS,
+                DIRECT_CHAT_RECALL_SNIPPET_CHARS,
+            )
+            .await
+        };
 
         // Build LLM messages
         let media_paths: Vec<String> = msg.media.iter().map(|m| m.path.clone()).collect();
         // No per-message instruction injection: the general operating principles live in the
         // system prompt (build_identity). Task-specific overrides here previously hijacked
         // questions into "start the server / fix it" behavior.
-        let user_text = msg.content.clone();
-        let mut messages = self.context.build_messages(
-            &history,
-            &user_text,
-            &media_paths,
-            &msg.channel,
-            &msg.chat_id,
-        );
+        // Direct chat gets its own request config: a response cap suited to
+        // chat (not agent work), plus Ollama runtime options so the model is
+        // loaded with a context window the conversation actually fits in.
+        let request_config = if supports_tools {
+            self.request_config.clone()
+        } else {
+            self.direct_chat_request_config()
+        };
 
-        // Get tool definitions
-        let tool_defs = self.tools.get_definitions();
+        let user_text = msg.content.clone();
+        let mut messages = if supports_tools {
+            self.context.build_messages_with_memories(
+                &history,
+                &user_text,
+                &media_paths,
+                &msg.channel,
+                &msg.chat_id,
+                recalled.as_deref(),
+            )
+        } else {
+            info!(model = %self.model, "direct chat mode (model has no tool support)");
+            self.context.build_messages_lite(
+                &history,
+                &user_text,
+                &media_paths,
+                &msg.channel,
+                &msg.chat_id,
+                recalled.as_deref(),
+                request_config.num_ctx,
+                request_config.max_tokens,
+            )
+        };
+
+        // Get tool definitions (none in direct chat mode)
+        let tool_defs = if supports_tools {
+            self.tools.get_definitions()
+        } else {
+            Vec::new()
+        };
 
         // Agent loop: LLM ↔ tool calling
         let mut final_content: Option<String> = None;
@@ -1999,6 +2875,13 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let max_exec_calls = max_exec_calls_for_message(&msg.content);
         let mut exec_calls_executed: usize = 0;
         let mut wrapup_injected = false;
+        // Best substantive answer seen before any nudge was injected. The
+        // nudge heuristics sometimes fire on a reply that was already a
+        // perfectly good answer; the model then responds to the nudge with a
+        // meta-reply ("I already answered that above") which would otherwise
+        // become the final answer and throw the real one away. A nudge must
+        // be able to improve the reply, never destroy it.
+        let mut pre_nudge_answer: Option<String> = None;
 
         // For any non-trivial request, post a visible "goal" line up-front so the user can see
         // what the agent set out to do (helps when work takes a while). Marked intermediate so
@@ -2026,23 +2909,46 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                 messages.push(Message::user(WRAPUP_INSTRUCTION));
                 wrapup_injected = true;
             }
-            let tools_for_call = if is_last_iteration && wrapup_injected {
+            let tools_for_call = if !supports_tools || (is_last_iteration && wrapup_injected) {
                 None
             } else {
                 Some(tool_defs.as_slice())
             };
 
-            let response = self
+            let mut response = self
                 .provider
                 .chat(
                     &messages,
                     tools_for_call,
                     &self.model,
-                    &self.request_config,
+                    &request_config,
                 )
                 .await;
+            turn_usage.record(response.usage.as_ref());
 
             self.log_llm_thinking_json(&msg.channel, &msg.chat_id, &session_key, iteration, &response);
+
+            // Some models (MiniMax-M2.7 observed live) intermittently write a
+            // tool call as text instead of invoking it for real — sometimes
+            // their own documented native format, sometimes a free-hand
+            // invention matching no format at all. Try to recover the
+            // intended call and actually run it before falling back to a
+            // "that wasn't real, try again" nudge (below) — turns a dead end
+            // into the action actually getting done.
+            if tools_for_call.is_some() && !response.has_tool_calls() {
+                if let Some(content) = response.content.as_deref() {
+                    if looks_like_fake_tool_call_syntax(content) {
+                        if let Some(recovered) = try_recover_fake_tool_call(content) {
+                            info!(
+                                tool = %recovered.function.name,
+                                iteration = iteration,
+                                "recovered a tool call the model wrote as text instead of invoking for real"
+                            );
+                            response.tool_calls = vec![recovered];
+                        }
+                    }
+                }
+            }
 
             if llm_response_is_api_error(&response) {
                 final_content = response.content;
@@ -2175,6 +3081,16 @@ Run the next command in a follow-up message, or combine steps into one script."
                 let still_failing = remaining_exec_budget
                     && has_unresolved_exec_failures(&exec_tool_outputs);
 
+                // The same signal for NON-exec tools: if the last tool call
+                // this turn failed (a rejected edit_file, an unreadable
+                // image, …) and the model stopped anyway, it is about to
+                // report success for work that did not happen — the "the
+                // edit failed but I still said Done" case. Only the LAST
+                // step counts, so an earlier failure that was subsequently
+                // fixed does not re-trigger.
+                let last_tool_failed = iteration < 3
+                    && task_steps.last().is_some_and(|s| !s.ok);
+
                 // Behavioural signal: the model SAID it would act ("let me…", "I'll fix…",
                 // "I see the problem…") on an early iteration but called no tool. Nudge it to
                 // actually act. This keys off the model's own stated intent, not task keywords,
@@ -2184,25 +3100,113 @@ Run the next command in a follow-up message, or combine steps into one script."
                     && (response_is_plan_without_tools(content_text)
                         || response_identified_problem_without_fix(content_text));
 
-                if still_failing || said_will_act_but_didnt {
+                // Reasoning models (e.g. MiniMax) sometimes write the command
+                // as prose instead of emitting a structured tool call. Catch
+                // that in-loop and nudge for a real call, so the normal
+                // execute→synthesize flow runs — rather than breaking out to
+                // the post-loop recovery, which can only bolt an answer on.
+                let narrated_command_without_tool = exec_calls_executed == 0
+                    && iteration < 3
+                    && (looks_like_unexecuted_exec_narration(content_text)
+                        || looks_like_unexecuted_read_narration(content_text));
+
+                // Not gated on exec_calls_executed==0 like the narration
+                // check above — a faked tool call can be for any tool, not
+                // just exec, and can plausibly follow a real tool call in
+                // the same turn. Still bounded by iteration to avoid an
+                // infinite nudge loop if the model can't self-correct.
+                let faked_tool_call_syntax =
+                    iteration < 3 && looks_like_fake_tool_call_syntax(content_text);
+
+                // An approval prompt is not a result — the command never ran.
+                // Models routinely treat it as a dead end and hand the token
+                // to the user ("run this in your terminal"), stranding the
+                // task. Push them to complete the round trip themselves.
+                let awaiting_approval_retry = exec_tool_outputs
+                    .last()
+                    .is_some_and(|o| exec_result_needs_approval(o));
+
+                // In direct chat mode there are no tools to nudge toward —
+                // nudging would only burn slow local-model iterations.
+                if supports_tools
+                    && (still_failing
+                        || last_tool_failed
+                        || said_will_act_but_didnt
+                        || narrated_command_without_tool
+                        || faked_tool_call_syntax
+                        || awaiting_approval_retry)
+                {
                     ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
-                    let nudge = if still_failing {
+                    let nudge = if last_tool_failed && !still_failing {
+                        let step = task_steps.last().expect("last_tool_failed implies a step");
+                        let detail = step.detail.clone().unwrap_or_else(|| "it failed".to_string());
+                        format!(
+                            "Your last tool call did NOT succeed: {} — {detail}. \
+Do not tell the user it is done. Fix the cause and retry (for a failed edit_file, re-read the file \
+first to get the exact current text). If it genuinely cannot be done, say plainly what failed and why.",
+                            step.label
+                        )
+                    } else if awaiting_approval_retry {
+                        let token = exec_tool_outputs
+                            .last()
+                            .and_then(|o| extract_approval_token(o))
+                            .unwrap_or_default();
+                        format!(
+                            "That command has NOT run yet — it returned an approval prompt, not a result. \
+Call the `exec` tool again right now with the exact same `command` and the argument \
+`approve_token`: \"{token}\". Do not paste the token into chat and do not ask the user to run \
+anything themselves."
+                        )
+                    } else if still_failing {
                         let hint = last_exec_failure_hint(&exec_tool_outputs);
                         format!(
                             "A step did not succeed yet — {hint}. \
 Continue: call the next tool to fix it. If you are genuinely blocked, stop and explain exactly \
 what is blocking and the next step — do not stop silently."
                         )
+                    } else if faked_tool_call_syntax {
+                        "Your last reply contained text written to look like a tool call \
+(e.g. \"[TOOL_CALL]\", \"<invoke>\") instead of an actual one. That is never executed — it's just \
+text the user would see as-is. Call the tool for real using the actual tool-calling mechanism, \
+not as text in your reply."
+                            .to_string()
                     } else {
                         "You said what you would do but did not call a tool. \
 Call the tool now to actually do it (or, if this was only a question, just answer it directly)."
                             .to_string()
                     };
-                    messages.push(Message::user(&nudge));
+                    // Keep the answer we are nudging away from, in case the
+                    // nudge was a false positive and the next reply adds
+                    // nothing.
+                    if pre_nudge_answer.is_none() {
+                        if let Some(prev) = response.content.as_deref() {
+                            let cleaned = strip_all_exec_reports_from_text(prev);
+                            if cleaned.chars().count() >= 80 {
+                                pre_nudge_answer = Some(prev.to_string());
+                            }
+                        }
+                    }
+
+                    // Marked as machine-generated. These nudges are injected
+                    // with the `user` role (providers reject a bare system
+                    // turn mid-conversation), so without a marker the model
+                    // reads them as the user scolding it and replies "You're
+                    // right — I didn't do that…", which then leaks into the
+                    // chat as a reply to something the user never said.
+                    messages.push(Message::user(format!(
+                        "[Metis automatic check — the user did NOT send this. Do not apologise or \
+                         reply to it as if they had; just do the action.]\n{nudge}"
+                    )));
                     continue;
                 }
-                // No tool calls and nothing pending → final answer.
-                final_content = response.content;
+                // No tool calls and nothing pending → final answer. If a
+                // nudge fired earlier and this reply is just an
+                // acknowledgement ("I already answered that"), keep the
+                // substantive answer it replaced.
+                final_content = match (response.content, pre_nudge_answer.take()) {
+                    (Some(latest), Some(earlier)) if is_meta_non_answer(&latest) => Some(earlier),
+                    (latest, _) => latest,
+                };
                 break;
             }
         }
@@ -2237,7 +3241,15 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
                 let recovered = self.tools.execute("read_file", params).await;
-                content = format!("{content}\n\n---\n\n{recovered}");
+                // Synthesize an answer from the file we just read, instead of
+                // dumping raw file contents with no reply.
+                content = match self
+                    .answer_from_tool_output(&msg.content, &recovered, &request_config, &mut turn_usage)
+                    .await
+                {
+                    Some(answer) => answer,
+                    None => format!("{content}\n\n---\n\n{recovered}"),
+                };
             }
         }
         if exec_tool_outputs.is_empty() && looks_like_unexecuted_exec_narration(&content) {
@@ -2245,7 +3257,17 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("command".to_string(), serde_json::Value::String(command));
                 let recovered = self.tools.execute("exec", params).await;
-                content = format!("{content}\n\n---\n\n{recovered}");
+                // The model narrated a command instead of calling the tool. We
+                // ran it; now turn the result into an actual answer rather than
+                // leaving the user with just "✓ Ran … SUCCESS".
+                exec_tool_outputs.push(recovered.clone());
+                content = match self
+                    .answer_from_tool_output(&msg.content, &recovered, &request_config, &mut turn_usage)
+                    .await
+                {
+                    Some(answer) => answer,
+                    None => format!("{content}\n\n---\n\n{recovered}"),
+                };
             }
         }
         // User challenged a false "running" claim — prefer real exec failure output over guardrail noise.
@@ -2294,14 +3316,74 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         }
 
         content = enforce_truthful_status_reply(content, &exec_tool_outputs, compact_exec);
+        // Internal bookkeeping must never surface in the user's reply.
+        content = strip_tool_ledger_blocks(&content);
 
-        // Save conversation to session
+        // Save conversation to session. In direct chat mode the user message
+        // is stored exactly as it was sent (recall block included): the next
+        // turn re-sends it as history, and the local server's prefix cache
+        // only hits on byte-identical prompts.
+        let stored_user_text = if supports_tools {
+            msg.content.clone()
+        } else {
+            crate::context::lite_user_text(&msg.content, recalled.as_deref())
+        };
         self.sessions
-            .add_message(&session_key, Message::user(&msg.content));
+            .add_message(&session_key, Message::user(&stored_user_text));
+
+        // Persist a compact record of the tools that actually ran this turn.
+        //
+        // Only the user message and the final answer used to be saved — the
+        // whole tool round trip was discarded when the turn ended. On the
+        // NEXT turn the model therefore had no evidence it had ever run
+        // anything, which is why it would: deny its own tool use ("I didn't
+        // use a tool, I made it up") right after a successful call; re-create
+        // a cron job it had already created; and lose a pending approval
+        // token between messages. Full tool_call/tool_result message pairs
+        // are deliberately NOT stored — providers reject an assistant
+        // tool_calls message that isn't followed by exactly matching tool
+        // results, and old tool payloads (page trees, exec dumps) are huge.
+        // A short factual ledger gives the model continuity at ~1 line each.
+        if !task_steps.is_empty() {
+            let mut record =
+                String::from("[Record of tools I actually ran for the message above:\n");
+            for step in &task_steps {
+                record.push_str(&step.render());
+                record.push('\n');
+            }
+            if let Some(token) = exec_tool_outputs.last().and_then(|o| extract_approval_token(o)) {
+                record.push_str(&format!(
+                    "  ⚠ A command is still awaiting approval. To run it, call `exec` again with \
+                     the same command plus approve_token: \"{token}\".\n"
+                ));
+            }
+            record.push_str(
+                "These calls really happened, so do not deny using a tool you just used. This is \
+                 INTERNAL BOOKKEEPING about a PREVIOUS message: never quote, repeat or mention it \
+                 in a reply, and never treat it as evidence that the current request is already \
+                 handled. It records only that calls happened — NOT that the user was given an \
+                 answer, and NOT that a new request has been satisfied. Answer the user's newest \
+                 message on its own terms, in full.]",
+            );
+            // Stored as a `system` message, not `assistant`. As an assistant
+            // message the model read it as its own prior speech to the user,
+            // so it both echoed the raw block into chat and concluded the
+            // work was already reported ("Already completed. No further
+            // action needed") for unrelated later questions.
+            self.sessions
+                .add_message(&session_key, Message::system(record));
+        }
+
         self.sessions
             .add_message(&session_key, Message::assistant(&content));
 
-        Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content))
+        // Token footer goes on the wire only — session history stays clean so
+        // the model never sees (or pays for) old usage footers.
+        let mut outbound = self.outbound_message(&msg.channel, &msg.chat_id, &content);
+        if let Some(footer) = self.token_usage_footer(&turn_usage) {
+            outbound.content.push_str(&footer);
+        }
+        Ok(outbound)
     }
 
     /// Process a system message (from a subagent or cron).
@@ -2337,6 +3419,14 @@ Call the tool now to actually do it (or, if this was only a question, just answe
             .set_context(&origin_channel, &origin_chat_id)
             .await;
 
+        // Per-turn token accounting (main loop + compaction call).
+        let mut turn_usage = TurnUsage::default();
+
+        // Compact oversized session history into long-term memory before loading it.
+        if let Some(u) = self.maybe_compact_session(&session_key).await {
+            turn_usage.record(Some(&u));
+        }
+
         // Load the original session
         let history = self.sessions.get_history(&session_key, 50);
 
@@ -2356,6 +3446,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 .provider
                 .chat(&messages, Some(&tool_defs), &self.model, &self.request_config)
                 .await;
+            turn_usage.record(response.usage.as_ref());
 
             self.log_llm_thinking_json(
                 &origin_channel,
@@ -2408,8 +3499,12 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         self.sessions
             .add_message(&session_key, Message::assistant(&content));
 
-        // Route response to the original channel/chat
-        Ok(self.outbound_message(&origin_channel, &origin_chat_id, &content))
+        // Route response to the original channel/chat (usage footer on the wire only)
+        let mut outbound = self.outbound_message(&origin_channel, &origin_chat_id, &content);
+        if let Some(footer) = self.token_usage_footer(&turn_usage) {
+            outbound.content.push_str(&footer);
+        }
+        Ok(outbound)
     }
 
     /// Direct processing mode (CLI entry point).
@@ -2458,16 +3553,49 @@ mod tests {
     use async_trait::async_trait;
     use metis_core::types::{LlmResponse, ToolCall, ToolDefinition};
 
+    #[test]
+    fn test_tool_outcome_preview_marks_non_exec_error_as_failed() {
+        // Regression: `ToolRegistry::execute`'s error wrapper is
+        // "Error executing {name}: {e}" — it must be recognized as a
+        // failure, not shown as "done — Error executing …" (looks like a
+        // success line even though the tool errored).
+        let result = "Error executing browser: navigation failed: Unable to make method call: connection closed";
+        let outcome = tool_outcome_preview("browser", "{}", result);
+        assert!(outcome.starts_with('✗'), "outcome: {outcome}");
+    }
+
+    #[test]
+    fn test_tool_outcome_preview_adds_ellipsis_when_truncated() {
+        let result = "Error executing browser: navigation failed: Unable to make method call: connection closed";
+        let outcome = tool_outcome_preview("browser", "{}", result);
+        assert!(outcome.ends_with('…'), "outcome: {outcome}");
+    }
+
+    #[test]
+    fn test_tool_outcome_preview_no_ellipsis_when_short() {
+        let outcome = tool_outcome_preview("browser", "{}", "opened page");
+        assert_eq!(outcome, "done — opened page");
+    }
+
     /// A mock LLM provider that returns canned responses.
     struct MockProvider {
         /// Responses to return in sequence.
         responses: std::sync::Mutex<Vec<LlmResponse>>,
+        /// When true, `supports_tools()` reports false (chat-only model).
+        no_tools: bool,
+        /// System prompt of the most recent chat call.
+        last_system: std::sync::Mutex<String>,
+        /// Whether the most recent chat call included tool definitions.
+        last_had_tools: std::sync::Mutex<Option<bool>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<LlmResponse>) -> Self {
             Self {
                 responses: std::sync::Mutex::new(responses),
+                no_tools: false,
+                last_system: std::sync::Mutex::new(String::new()),
+                last_had_tools: std::sync::Mutex::new(None),
             }
         }
 
@@ -2477,17 +3605,29 @@ mod tests {
                 ..Default::default()
             }])
         }
+
+        /// A provider whose model does not support tools.
+        fn chat_only(text: &str) -> Self {
+            let mut p = Self::simple(text);
+            p.no_tools = true;
+            p
+        }
     }
 
     #[async_trait]
     impl LlmProvider for MockProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
-            _tools: Option<&[ToolDefinition]>,
+            messages: &[Message],
+            tools: Option<&[ToolDefinition]>,
             _model: &str,
             _config: &LlmRequestConfig,
         ) -> LlmResponse {
+            if let Some(Message::System { content }) = messages.first() {
+                *self.last_system.lock().unwrap() = content.clone();
+            }
+            *self.last_had_tools.lock().unwrap() = Some(tools.is_some());
+
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 LlmResponse {
@@ -2497,6 +3637,10 @@ mod tests {
             } else {
                 responses.remove(0)
             }
+        }
+
+        async fn supports_tools(&self, _model: &str) -> bool {
+            !self.no_tools
         }
 
         fn default_model(&self) -> &str {
@@ -2532,12 +3676,406 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_narrated_command_yields_real_answer_not_raw_dump() {
+        // A tool-capable model that NARRATES a command (no structured tool
+        // call) — the exact MiniMax-M3 failure that produced "✓ Ran … SUCCESS"
+        // with no answer. Whether resolved by the in-loop nudge (model then
+        // answers) or the post-loop recovery + synthesis, the user must get a
+        // real answer, never a bare command dump.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.txt"), "the secret is 42").unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // Narration: progress word + a runnable command line, no tool call.
+            LlmResponse {
+                content: Some("Running: the command below.\ncat note.txt".into()),
+                ..Default::default()
+            },
+            // The follow-up: a real answer (as the model gives once nudged, or
+            // as synthesized from the recovered tool output).
+            LlmResponse {
+                content: Some("The note says the secret is 42.".into()),
+                ..Default::default()
+            },
+        ]));
+
+        let bus = Arc::new(MessageBus::new(32));
+        let agent = AgentLoop::new(
+            bus, provider, ws, None, None, None, Some(5), None, None, None, false, None, None, None,
+        );
+
+        let reply = agent.process_direct("what is in note.txt?").await.unwrap();
+        assert!(
+            reply.contains("42"),
+            "expected a real answer, got: {reply}"
+        );
+        // Never a raw command dump.
+        assert!(!reply.contains("<<<EXEC_RESULT>>>"), "raw exec block leaked: {reply}");
+        assert!(!reply.contains("✓ Ran"), "bare command summary leaked: {reply}");
+    }
+
+    #[tokio::test]
     async fn test_agent_simple_response() {
         let provider = Arc::new(MockProvider::simple("Hello from Metis!"));
         let agent = create_test_loop(provider);
 
         let result = agent.process_direct("Hi").await.unwrap();
         assert_eq!(result, "Hello from Metis!");
+    }
+
+    fn usage_response(text: &str, prompt: u32, completion: u32) -> LlmResponse {
+        LlmResponse {
+            content: Some(text.into()),
+            usage: Some(metis_core::types::UsageInfo {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn create_isolated_loop(
+        provider: Arc<dyn LlmProvider>,
+        dir: &std::path::Path,
+        outbound: Option<OutboundFormatting>,
+    ) -> AgentLoop {
+        let sessions = SessionManager::new(Some(dir.join("sessions"))).unwrap();
+        let bus = Arc::new(MessageBus::new(32));
+        let workspace = dir.join("ws");
+        let _ = std::fs::create_dir_all(&workspace);
+        AgentLoop::new(
+            bus,
+            provider,
+            workspace,
+            None,
+            None,
+            None,
+            Some(5),
+            None,
+            None,
+            None,
+            false,
+            Some(sessions),
+            None,
+            outbound,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_direct_chat_mode_for_chat_only_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::chat_only("Hola!"));
+        let agent = create_isolated_loop(provider.clone(), dir.path(), None);
+
+        let result = agent.process_direct("hi").await.unwrap();
+        assert!(result.starts_with("Hola!"), "reply: {result}");
+
+        // No tool definitions were sent…
+        assert_eq!(*provider.last_had_tools.lock().unwrap(), Some(false));
+        // …and the lite prompt replaced the full agent briefing.
+        let system = provider.last_system.lock().unwrap().clone();
+        assert!(system.contains("DIRECT CHAT MODE"), "system: {system}");
+        assert!(
+            !system.contains("## Operating principles"),
+            "full briefing should be absent"
+        );
+        assert!(
+            !system.contains("# Skills"),
+            "skills catalog should be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_capable_model_gets_full_briefing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::simple("Hi!"));
+        let agent = create_isolated_loop(provider.clone(), dir.path(), None);
+
+        let _ = agent.process_direct("hi").await.unwrap();
+        assert_eq!(*provider.last_had_tools.lock().unwrap(), Some(true));
+        let system = provider.last_system.lock().unwrap().clone();
+        assert!(system.contains("## Operating principles"));
+        assert!(!system.contains("DIRECT CHAT MODE"));
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_footer_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![usage_response("Answer.", 1200, 45)]));
+        let agent = create_isolated_loop(provider, dir.path(), None);
+
+        let result = agent.process_direct("what is up?").await.unwrap();
+        assert!(result.starts_with("Answer."), "reply first: {result}");
+        assert!(result.contains("📊 1200 in / 45 out tokens · 1 LLM call"), "footer: {result}");
+
+        // Footer must NOT be persisted in session history.
+        let history = agent.sessions.get_history("cli:direct", 10);
+        match history.last().unwrap() {
+            Message::Assistant { content: Some(t), .. } => assert!(!t.contains("📊")),
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_footer_multiple_calls_and_compact_format() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two LLM calls: first requests a tool, second answers.
+        let tc = ToolCall::new("call_1", "list_dir", r#"{"path":"."}"#);
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                tool_calls: vec![tc],
+                usage: Some(metis_core::types::UsageInfo {
+                    prompt_tokens: 9_000,
+                    completion_tokens: 30,
+                    total_tokens: 9_030,
+                }),
+                ..Default::default()
+            },
+            usage_response("Done.", 11_500, 70),
+        ]));
+        let agent = create_isolated_loop(provider, dir.path(), None);
+
+        let result = agent.process_direct("list stuff").await.unwrap();
+        // 9000 + 11500 = 20500 → "20.5k"; 30 + 70 = 100; 2 calls
+        assert!(result.contains("📊 20.5k in / 100 out tokens · 2 LLM calls"), "footer: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_footer_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![usage_response("Answer.", 100, 10)]));
+        let agent = create_isolated_loop(
+            provider,
+            dir.path(),
+            Some(OutboundFormatting {
+                show_token_usage: false,
+                ..Default::default()
+            }),
+        );
+
+        let result = agent.process_direct("hi there").await.unwrap();
+        assert!(!result.contains("📊"), "no footer expected: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_footer_absent_without_usage_data() {
+        let dir = tempfile::tempdir().unwrap();
+        // Provider reports no usage (e.g. some local servers) → no footer noise.
+        let provider = Arc::new(MockProvider::simple("Plain answer."));
+        let agent = create_isolated_loop(provider, dir.path(), None);
+        let result = agent.process_direct("hi there").await.unwrap();
+        assert_eq!(result, "Plain answer.");
+    }
+
+    #[test]
+    fn test_format_token_count() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(9_999), "9999");
+        assert_eq!(format_token_count(10_000), "10.0k");
+        assert_eq!(format_token_count(20_500), "20.5k");
+    }
+
+    /// Build a fully isolated loop (temp sessions dir + temp memory db).
+    fn create_memory_test_loop(
+        provider: Arc<dyn LlmProvider>,
+        dir: &std::path::Path,
+        sessions: SessionManager,
+        compaction_threshold: usize,
+        keep_recent: usize,
+    ) -> AgentLoop {
+        let bus = Arc::new(MessageBus::new(32));
+        let workspace = dir.join("ws");
+        let _ = std::fs::create_dir_all(&workspace);
+        AgentLoop::new(
+            bus,
+            provider,
+            workspace,
+            None,
+            None,
+            None,
+            Some(5),
+            None,
+            None,
+            None,
+            false,
+            Some(sessions),
+            None,
+            None,
+        )
+        .with_memory(MemorySettings {
+            enabled: true,
+            db_path: Some(dir.join("memory.db")),
+            embed_provider: None,
+            embed_model: String::new(),
+            compaction_threshold,
+            keep_recent,
+            top_k: 5,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_with_memory_registers_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::new(Some(dir.path().join("sessions"))).unwrap();
+        let provider = Arc::new(MockProvider::simple("ok"));
+        let agent = create_memory_test_loop(provider, dir.path(), sessions, 40, 20);
+        assert!(agent.tools().has("memory_save"));
+        assert!(agent.tools().has("memory_search"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_disabled_no_tools() {
+        let provider = Arc::new(MockProvider::simple("ok"));
+        let agent = create_test_loop(provider).with_memory(MemorySettings {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(!agent.tools().has("memory_save"));
+        assert!(!agent.tools().has("memory_search"));
+    }
+
+    #[tokio::test]
+    async fn test_session_compaction_into_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::new(Some(dir.path().join("sessions"))).unwrap();
+        // Pre-fill session past the threshold (24 messages > 10).
+        for i in 0..12 {
+            sessions.add_message(
+                "cli:direct",
+                Message::user(format!("note {i} about project phoenix")),
+            );
+            sessions.add_message("cli:direct", Message::assistant(format!("ack {i}")));
+        }
+        // 1st canned response = compaction summary, 2nd = the actual reply.
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                content: Some("- project phoenix listens on port 9999".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("final reply".into()),
+                ..Default::default()
+            },
+        ]));
+        let agent = create_memory_test_loop(provider, dir.path(), sessions, 10, 4);
+
+        let reply = agent.process_direct("hello again").await.unwrap();
+        assert_eq!(reply, "final reply");
+
+        // Session rewritten: 1 summary + 4 kept + 2 from this turn.
+        let history = agent.sessions.get_history("cli:direct", 100);
+        assert_eq!(history.len(), 7);
+        match &history[0] {
+            Message::User { content: MessageContent::Text(t) } => {
+                assert!(t.contains("Archived background context"));
+                assert!(t.contains("port 9999"));
+            }
+            other => panic!("expected summary user message, got {other:?}"),
+        }
+
+        // The summary is searchable in the memory DB.
+        let hits = agent
+            .memory
+            .as_ref()
+            .unwrap()
+            .search("project phoenix port", 5)
+            .await;
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].source, "compaction");
+        assert!(hits[0].text.contains("9999"));
+    }
+
+    #[tokio::test]
+    async fn test_compaction_skipped_on_llm_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::new(Some(dir.path().join("sessions"))).unwrap();
+        for i in 0..12 {
+            sessions.add_message("cli:direct", Message::user(format!("msg {i}")));
+        }
+        // Summarization call errors → session must stay intact (plus this turn's 2 messages).
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse::error("Error calling LLM: 500"),
+            LlmResponse {
+                content: Some("reply".into()),
+                ..Default::default()
+            },
+        ]));
+        let agent = create_memory_test_loop(provider, dir.path(), sessions, 10, 4);
+
+        let _ = agent.process_direct("hi").await.unwrap();
+        let history = agent.sessions.get_history("cli:direct", 100);
+        assert_eq!(history.len(), 14); // 12 originals + user + assistant, nothing dropped
+    }
+
+    #[tokio::test]
+    async fn test_chat_only_compaction_skips_llm_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::new(Some(dir.path().join("sessions"))).unwrap();
+        for i in 0..12 {
+            sessions.add_message("cli:direct", Message::user(format!("older msg {i}")));
+        }
+        // A chat-only model provides exactly ONE response: the reply. If
+        // compaction tried to summarize via the LLM, the loop would consume a
+        // second response and this single-response provider would misbehave.
+        let provider = Arc::new(MockProvider::chat_only("reply"));
+        let agent = create_memory_test_loop(provider, dir.path(), sessions, 10, 4);
+
+        let _ = agent.process_direct("hi").await.unwrap();
+
+        // Session was bounded structurally: marker + keep_recent(4) + this
+        // turn's user & assistant = 7. The old span did not survive verbatim.
+        let history = agent.sessions.get_history("cli:direct", 100);
+        assert_eq!(history.len(), 7);
+        assert!(matches!(&history[0], Message::User { .. }));
+
+        // The dropped span was preserved as a searchable memory, no LLM used.
+        let hits = agent.memory.as_ref().unwrap().search("older msg", 5).await;
+        assert!(
+            hits.iter().any(|h| h.source == "compaction-raw"),
+            "expected a raw-compaction memory entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_memories_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::new(Some(dir.path().join("sessions"))).unwrap();
+        let provider = Arc::new(MockProvider::simple("ok"));
+        let agent = create_memory_test_loop(provider, dir.path(), sessions, 40, 20);
+
+        let index = agent.memory.as_ref().unwrap();
+        index
+            .save("User's cat is named Miso.", "manual", "")
+            .await
+            .unwrap();
+
+        let snip = crate::memory_index::RECALL_SNIPPET_MAX_CHARS;
+        let block = agent
+            .recall_memories("what is my cat called?", &[], 5, snip)
+            .await
+            .unwrap();
+        assert!(block.contains("Miso"));
+        assert!(block.contains("Recalled Memories"));
+
+        // Irrelevant queries and too-short queries recall nothing.
+        assert!(agent
+            .recall_memories("kubernetes cluster scaling", &[], 5, snip)
+            .await
+            .is_none());
+        assert!(agent.recall_memories("hi", &[], 5, snip).await.is_none());
+
+        // A memory whose snippet is already visible in the session window is
+        // not re-injected.
+        let window = vec![Message::user(
+            "# Recalled Memories\n- [2026-07-06] User's cat is named Miso.\n---\nearlier question",
+        )];
+        assert!(agent
+            .recall_memories("what is my cat called?", &window, 5, snip)
+            .await
+            .is_none());
     }
 
     #[test]
@@ -2602,6 +4140,112 @@ Get-Content "C:\Users\chack\.metis\workspace\memory\MEMORY.md"
 Reading back now! 📩"#;
         assert!(looks_like_unexecuted_read_narration(sample));
         assert!(!looks_like_unexecuted_read_narration("All done, no verification command."));
+    }
+
+    #[test]
+    fn test_strip_tool_ledger_blocks() {
+        // Exact shape that leaked into a Telegram reply.
+        let leaked = "[Record of tools I actually ran for the message above:\n  ✓ analyze_image: path=\"C:\\x.jpg\"\nTreat this as fact.]\n\nThe image shows the skill file.";
+        assert_eq!(strip_tool_ledger_blocks(leaked), "The image shows the skill file.");
+
+        // Untouched when absent.
+        assert_eq!(strip_tool_ledger_blocks("A normal answer."), "A normal answer.");
+
+        // Unterminated block is dropped rather than half-emitted.
+        assert_eq!(
+            strip_tool_ledger_blocks("Answer here.\n[Record of tools I actually ran and no close"),
+            "Answer here."
+        );
+    }
+
+    #[test]
+    fn test_is_meta_non_answer() {
+        // Exact shapes seen live, where the real answer was discarded.
+        assert!(is_meta_non_answer(
+            "I already answered that above — no tool call needed since I reported from the in-memory catalogue."
+        ));
+        assert!(is_meta_non_answer(
+            "I already answered your question from the analyze_image tool I called above."
+        ));
+        assert!(is_meta_non_answer("I did call it — here's the result again."));
+        assert!(is_meta_non_answer("No further searching needed."));
+
+        // Real answers must never be mistaken for acknowledgements.
+        assert!(!is_meta_non_answer(
+            "The image shows a backup console: Selected backup 21 Jun 2026, site status Active."
+        ));
+        assert!(!is_meta_non_answer("Here are your skills: kayak-flight-search, tts-telegram."));
+        // Long replies carry content even if they open with "I already…".
+        let long = format!("I already answered part of this, but here is the full detail. {}", "x".repeat(420));
+        assert!(!is_meta_non_answer(&long));
+    }
+
+    #[test]
+    fn test_looks_like_fake_tool_call_syntax() {
+        // The exact free-hand pseudo-syntax observed live from MiniMax-M2.7.
+        let observed = "[TOOL_CALL]\n{tool => \"list_dir\", args => {\n  --path \"C:\\\\Users\\\\chack\\\\.metis\\\\workspace\"\n}}\n[/TOOL_CALL]";
+        assert!(looks_like_fake_tool_call_syntax(observed));
+
+        // MiniMax-M2.7's own documented native XML format, in case it leaks
+        // through as raw text instead of being auto-parsed.
+        let native_xml = "<minimax:tool_call>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">.</parameter>\n</invoke>\n</minimax:tool_call>";
+        assert!(looks_like_fake_tool_call_syntax(native_xml));
+
+        // A generic JSON-ish free-hand attempt.
+        let json_ish = "I'll call: {\"tool\": \"exec\", \"args\": {\"command\": \"ls\"}}";
+        assert!(looks_like_fake_tool_call_syntax(json_ish));
+
+        // Ordinary answers must not false-positive.
+        assert!(!looks_like_fake_tool_call_syntax("Here are the files you asked for."));
+        assert!(!looks_like_fake_tool_call_syntax(
+            "The tool returned an error, so args need adjusting."
+        ));
+    }
+
+    #[test]
+    fn test_recover_hash_arrow_tool_call_list_dir() {
+        // Exact text observed live.
+        let content = "[TOOL_CALL]\n{tool => \"list_dir\", args => {\n  --path \"C:\\\\Users\\\\chack\\\\.metis\\\\workspace\"\n}}\n[/TOOL_CALL]";
+        let tc = try_recover_fake_tool_call(content).expect("should recover a tool call");
+        assert_eq!(tc.function.name, "list_dir");
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["path"], "C:\\Users\\chack\\.metis\\workspace");
+    }
+
+    #[test]
+    fn test_recover_hash_arrow_tool_call_exec() {
+        // Exact text observed live for the cron-remove attempt.
+        let content = "[TOOL_CALL]\n{tool => \"exec\", args => {\n  --command \"C:\\\\codding\\\\Metis-main\\\\target\\\\release\\\\metis.exe cron remove f37c91b8\"\n}}\n[/TOOL_CALL]";
+        let tc = try_recover_fake_tool_call(content).expect("should recover a tool call");
+        assert_eq!(tc.function.name, "exec");
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(
+            args["command"],
+            "C:\\codding\\Metis-main\\target\\release\\metis.exe cron remove f37c91b8"
+        );
+    }
+
+    #[test]
+    fn test_recover_json_tool_call() {
+        let content = "I'll call: {\"tool\": \"exec\", \"args\": {\"command\": \"ls\"}}";
+        let tc = try_recover_fake_tool_call(content).expect("should recover a tool call");
+        assert_eq!(tc.function.name, "exec");
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["command"], "ls");
+    }
+
+    #[test]
+    fn test_recover_invoke_xml_tool_call() {
+        let content = "<minimax:tool_call>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">.</parameter>\n</invoke>\n</minimax:tool_call>";
+        let tc = try_recover_fake_tool_call(content).expect("should recover a tool call");
+        assert_eq!(tc.function.name, "list_dir");
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["path"], ".");
+    }
+
+    #[test]
+    fn test_recover_returns_none_for_ordinary_text() {
+        assert!(try_recover_fake_tool_call("Here are the files you asked for.").is_none());
     }
 
     #[test]
@@ -3058,9 +4702,11 @@ Write-Output "hello"
         assert!(!names.contains(&"web_search".into()));
         assert!(names.contains(&"web_fetch".into()));
         assert!(names.contains(&"browser".into()));
+        assert!(names.contains(&"analyze_image".into()));
+        assert!(names.contains(&"save_skill".into()));
         assert!(names.contains(&"message".into()));
         assert!(names.contains(&"spawn".into()));
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

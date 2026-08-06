@@ -239,15 +239,25 @@ impl TranscriptionProvider for WhisperCppTranscriber {
             return Ok(String::new());
         }
 
-        // Avoid trying to convert/transcribe non-audio files (common when a platform
-        // provides a "media" attachment that isn't actually an audio stream).
-        if !file_has_audio_stream(file_path) {
+        // `file_has_audio_stream` (ffprobe) and `convert_to_wav` (ffmpeg) shell
+        // out with the blocking `std::process` API. Run them on the blocking
+        // pool so they don't stall an async runtime worker — on a single busy
+        // gateway that stall would freeze other tasks (typing indicator, other
+        // chats) for the duration of the conversion.
+        let probe_path = file_path.to_path_buf();
+        let has_audio = tokio::task::spawn_blocking(move || file_has_audio_stream(&probe_path))
+            .await
+            .unwrap_or(false);
+        if !has_audio {
             warn!(path = %file_path.display(), "transcription: file has no detectable audio stream");
             return Ok(String::new());
         }
 
         // Convert audio to WAV format if needed (whisper.cpp requires WAV)
-        let audio_file = convert_to_wav(file_path)?;
+        let convert_path = file_path.to_path_buf();
+        let audio_file = tokio::task::spawn_blocking(move || convert_to_wav(&convert_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("wav conversion task failed: {e}"))??;
         debug!(audio = %audio_file.display(), "using audio file for transcription");
 
         // whisper.cpp's `-of` expects an output prefix; it will append `.txt` when used with `-otxt`.

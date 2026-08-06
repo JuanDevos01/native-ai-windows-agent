@@ -174,6 +174,22 @@ fn normalize_cli_value(value: &str) -> String {
     out
 }
 
+/// Upgrade a standard 5-field Unix cron expression ("min hour day month dow")
+/// to the 6-field form the `cron` crate actually requires ("sec min hour day
+/// month dow"), by assuming seconds=0. 6- and 7-field expressions (explicit
+/// seconds, optional trailing year) pass through unchanged. This is what
+/// makes `--cron "0 9 * * *"` — the format everyone reaches for, and what the
+/// help text and system prompt document — actually work instead of failing
+/// with "Invalid cron expression".
+fn normalize_cron_expr(expr: &str) -> String {
+    let fields = expr.split_whitespace().count();
+    if fields == 5 {
+        format!("0 {expr}")
+    } else {
+        expr.to_string()
+    }
+}
+
 // ─────────────────────────────────────────────
 // Command implementations
 // ─────────────────────────────────────────────
@@ -268,6 +284,13 @@ async fn add_job(
     let schedule = if let Some(secs) = every {
         CronSchedule::every((secs * 1000) as i64)
     } else if let Some(expr) = cron_expr {
+        // The underlying `cron` crate requires 6 fields (leading seconds:
+        // "sec min hour day month dow"), not the standard 5-field Unix
+        // crontab format ("min hour day month dow") that the --cron help
+        // text advertises and that anyone would naturally type. Auto-upgrade
+        // a 5-field expression by assuming seconds=0, so "0 9 * * *" works
+        // as documented instead of failing with "Invalid cron expression".
+        let expr = normalize_cron_expr(&expr);
         // Validate cron expression
         let _ = expr
             .parse::<cron::Schedule>()
@@ -378,6 +401,26 @@ async fn run_job(id: &str) -> Result<()> {
         id.cyan()
     );
 
+    // Channel delivery only works inside the long-running `metis gateway`
+    // process — that is where the Telegram/Discord/etc. channels and the
+    // outbound dispatcher live. A CLI `cron run` builds its own MessageBus
+    // with nobody consuming the outbound side, so `deliver=true` publishes
+    // into a void and the job still reports success. Say so plainly: the
+    // agent was reading this output and telling the user "delivered, check
+    // your Telegram" when nothing had been sent.
+    let delivers_to_channel = job.payload.deliver && job.payload.to.is_some();
+    if delivers_to_channel {
+        let channel = job.payload.channel.clone().unwrap_or_else(|| "telegram".into());
+        let to = job.payload.to.clone().unwrap_or_default();
+        println!(
+            "  {} DELIVERY SKIPPED: this is a CLI test run, not the gateway. The result below was \
+             NOT sent to {channel} chat {to}. Channel delivery happens only when the job runs \
+             inside `metis gateway` (its next scheduled run will deliver normally).",
+            "⚠".yellow()
+        );
+        println!();
+    }
+
     let config = metis_core::config::load_config(None);
     let agent_loop = crate::agent_builder::build_agent_loop(&config)?;
 
@@ -447,5 +490,28 @@ mod tests {
     fn test_normalize_cli_value_keeps_plain_text() {
         assert_eq!(normalize_cli_value("telegram"), "telegram");
         assert_eq!(normalize_cli_value("0 * * * *"), "0 * * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_expr_upgrades_5_field() {
+        // Standard Unix crontab format (what the help text and system prompt
+        // document) must become the 6-field form the `cron` crate requires.
+        assert_eq!(normalize_cron_expr("0 9 * * *"), "0 0 9 * * *");
+        assert_eq!(normalize_cron_expr("0 11 * * *"), "0 0 11 * * *");
+        assert_eq!(normalize_cron_expr("*/15 * * * *"), "0 */15 * * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_expr_leaves_6_and_7_field_unchanged() {
+        assert_eq!(normalize_cron_expr("0 0 9 * * *"), "0 0 9 * * *");
+        assert_eq!(normalize_cron_expr("0 0 9 * * * 2026"), "0 0 9 * * * 2026");
+    }
+
+    #[test]
+    fn test_normalize_cron_expr_upgraded_form_actually_parses() {
+        // The real bug: "0 9 * * *" rejected by cron::Schedule as-is.
+        assert!("0 9 * * *".parse::<cron::Schedule>().is_err());
+        let upgraded = normalize_cron_expr("0 9 * * *");
+        assert!(upgraded.parse::<cron::Schedule>().is_ok());
     }
 }

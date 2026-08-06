@@ -69,23 +69,41 @@ fn stop_existing_gateway_process() -> Result<bool> {
 
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("taskkill")
+        let output = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
+            .output()
             .with_context(|| "failed to run taskkill")?;
-        if !status.success() {
-            anyhow::bail!("failed to stop existing gateway pid {pid} (taskkill exit: {status})");
+        // The pid file can outlive the process it names (a previous crash,
+        // an external kill, this same pid getting reused by something else
+        // entirely) — "process not found" means the goal ("nothing is
+        // running under that pid") is already met, so it isn't a failure.
+        // Only a real problem stopping a process that IS still there
+        // (e.g. permission denied) should block starting the new gateway.
+        let already_gone = !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).to_lowercase().contains("not found");
+        if !output.status.success() && !already_gone {
+            anyhow::bail!(
+                "failed to stop existing gateway pid {pid} (taskkill exit: {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let status = std::process::Command::new("kill")
+        let output = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
-            .status()
+            .output()
             .with_context(|| "failed to run kill")?;
-        if !status.success() {
-            anyhow::bail!("failed to stop existing gateway pid {pid} (kill exit: {status})");
+        let already_gone = !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).to_lowercase().contains("no such process");
+        if !output.status.success() && !already_gone {
+            anyhow::bail!(
+                "failed to stop existing gateway pid {pid} (kill exit: {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
     }
 
@@ -157,23 +175,29 @@ pub async fn run() -> Result<()> {
         log_thinking_json: defaults.log_thinking_json,
         include_fenced_code_in_chat_apps: defaults.include_fenced_code_in_chat_apps,
         include_exec_output_in_chat_apps: defaults.include_exec_output_in_chat_apps,
+        show_token_usage: defaults.show_token_usage,
     };
-    let agent_loop = Arc::new(AgentLoop::new(
-        bus.clone(),
-        Arc::new(provider),
-        workspace.clone(),
-        Some(model.to_string()),
-        Some(defaults.subagent_model.clone()),
-        subagent_provider,
-        Some(defaults.max_tool_iterations as usize),
-        None,
-        brave_key,
-        Some(exec_cfg),
-        config.tools.restrict_to_workspace,
-        Some(session_manager),
-        agent_name,
-        Some(outbound),
-    ));
+    let memory_settings = crate::agent_builder::build_memory_settings(&config, &providers_map);
+    let agent_loop = Arc::new(
+        AgentLoop::new(
+            bus.clone(),
+            Arc::new(provider),
+            workspace.clone(),
+            Some(model.to_string()),
+            Some(defaults.subagent_model.clone()),
+            subagent_provider,
+            Some(defaults.max_tool_iterations as usize),
+            None,
+            brave_key,
+            Some(exec_cfg),
+            config.tools.restrict_to_workspace,
+            Some(session_manager),
+            agent_name,
+            Some(outbound),
+        )
+        .with_memory(memory_settings)
+        .with_direct_chat_context(defaults.chat_context_length),
+    );
 
     // 8. Create cron service
     let cron_service = Arc::new(CronService::new(bus.clone(), None));

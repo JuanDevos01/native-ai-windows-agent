@@ -66,6 +66,12 @@ pub struct HttpProvider {
     extra_headers: HeaderMap,
     /// Reference to the provider spec for model resolution and overrides.
     spec: &'static ProviderSpec,
+    /// Models that rejected tool definitions (e.g. Ollama 400 "does not
+    /// support tools"). Further requests to them are sent without tools so
+    /// plain chat keeps working instead of erroring on every message.
+    no_tool_models: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Whether Ollama's /api/tags has been probed for tool capabilities.
+    tags_probed: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for HttpProvider {
@@ -108,8 +114,17 @@ impl HttpProvider {
             }
         }
 
+        // Local backends (Ollama, LM Studio, vLLM) run models on the user's
+        // own hardware: prompt evaluation on CPU can far exceed a cloud
+        // provider's response time, so give them a much longer total timeout.
+        // A short connect timeout keeps a *dead* local server failing fast —
+        // the long timeout only applies once the server has accepted the
+        // request and is actually working.
+        let is_local_backend = matches!(spec.name, "ollama" | "lmstudio" | "vllm");
+        let request_timeout = if is_local_backend { 600 } else { 120 };
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(request_timeout))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -120,13 +135,53 @@ impl HttpProvider {
             default_model: model.to_string(),
             extra_headers,
             spec,
+            no_tool_models: std::sync::RwLock::new(std::collections::HashSet::new()),
+            tags_probed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Fetch Ollama's model list and return the names WITHOUT tool support.
+    ///
+    /// Names ending in `:latest` are also recorded without the tag, since
+    /// users typically configure `ollama/gemma3` rather than `gemma3:latest`.
+    async fn fetch_ollama_no_tool_models(&self) -> Option<Vec<String>> {
+        let base = self.api_base.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{base}/api/tags");
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+            .ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        let models = json.get("models")?.as_array()?;
+        let mut out = Vec::new();
+        for m in models {
+            let Some(name) = m["name"].as_str() else { continue };
+            let has_tools = m["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("tools")));
+            if !has_tools {
+                out.push(name.to_string());
+                if let Some(untagged) = name.strip_suffix(":latest") {
+                    out.push(untagged.to_string());
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Build the full chat completions URL.
     fn completions_url(&self) -> String {
         let base = self.api_base.trim_end_matches('/');
         format!("{}/chat/completions", base)
+    }
+
+    /// Build the full embeddings URL.
+    fn embeddings_url(&self) -> String {
+        let base = self.api_base.trim_end_matches('/');
+        format!("{}/embeddings", base)
     }
 
     /// Resolve the model name for this provider (apply prefix/strip logic).
@@ -136,6 +191,105 @@ impl HttpProvider {
             minimax_openai_model_id(&resolved)
         } else {
             resolved
+        }
+    }
+
+    /// Base URL of Ollama's native API (the OpenAI-compatible base minus `/v1`).
+    fn ollama_native_base(&self) -> String {
+        self.api_base
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string()
+    }
+
+    /// Make sure Ollama's runner for `model` matches the requested runtime
+    /// options (`num_ctx`, `keep_alive`) before the chat request goes out.
+    ///
+    /// Ollama's OpenAI-compatible endpoint silently ignores both fields, but a
+    /// native `/api/chat` call with empty `messages` loads the model with them
+    /// and returns immediately — and subsequent OpenAI-endpoint requests reuse
+    /// that runner, keeping its context size and keep-alive. Without this, the
+    /// runner stays at Ollama's default 4096-token context; once a growing
+    /// conversation overflows that, the prefix cache misses on every turn and
+    /// the whole history is re-evaluated per message (minutes on CPU).
+    ///
+    /// Best-effort: any failure is logged and the chat proceeds normally.
+    async fn ensure_ollama_runtime(&self, resolved_model: &str, config: &LlmRequestConfig) {
+        if self.spec.name != "ollama" || (config.num_ctx.is_none() && config.keep_alive.is_none())
+        {
+            return;
+        }
+        let base = self.ollama_native_base();
+
+        // Skip the (potentially model-reloading) preload when the runner is
+        // already up with a big-enough context. `/api/ps` is a ~1ms local call.
+        if let Some(wanted) = config.num_ctx {
+            let loaded_ok = async {
+                let resp = self
+                    .client
+                    .get(format!("{base}/api/ps"))
+                    .timeout(std::time::Duration::from_secs(3))
+                    .send()
+                    .await
+                    .ok()?;
+                let json: serde_json::Value = resp.json().await.ok()?;
+                let with_latest = format!("{resolved_model}:latest");
+                Some(json["models"].as_array()?.iter().any(|m| {
+                    let name = m["name"].as_str().unwrap_or("");
+                    (name == resolved_model || name == with_latest)
+                        && m["context_length"].as_u64().unwrap_or(0) >= u64::from(wanted)
+                }))
+            }
+            .await
+            .unwrap_or(false);
+            if loaded_ok {
+                return;
+            }
+        }
+
+        let mut body = serde_json::json!({
+            "model": resolved_model,
+            "messages": [],
+        });
+        if let Some(num_ctx) = config.num_ctx {
+            body["options"] = serde_json::json!({ "num_ctx": num_ctx });
+        }
+        if let Some(ref keep_alive) = config.keep_alive {
+            body["keep_alive"] = serde_json::Value::String(keep_alive.clone());
+        }
+
+        debug!(
+            model = resolved_model,
+            num_ctx = ?config.num_ctx,
+            keep_alive = ?config.keep_alive,
+            "preloading Ollama runner with requested runtime options"
+        );
+        // Loading a model from disk can take a while on CPU-only machines;
+        // on timeout/failure the chat request itself will load it (with the
+        // server-default context) so we never block chat on this.
+        let result = self
+            .client
+            .post(format!("{base}/api/chat"))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(180))
+            .send()
+            .await;
+        match result {
+            Ok(resp) if !resp.status().is_success() => {
+                warn!(
+                    model = resolved_model,
+                    status = %resp.status(),
+                    "Ollama runner preload rejected; continuing with server defaults"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    model = resolved_model,
+                    error = %e,
+                    "Ollama runner preload failed; continuing with server defaults"
+                );
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -160,33 +314,162 @@ impl LlmProvider for HttpProvider {
             "Calling LLM"
         );
 
-        let request_body = ChatCompletionRequest {
-            model: resolved_model.clone(),
-            messages: messages.to_vec(),
-            tools: tools.map(|t| t.to_vec()),
-            tool_choice: tools.map(|_| "auto".to_string()),
-            max_tokens: Some(config.max_tokens),
-            temperature: Some(temperature),
-        };
+        // Skip tool definitions for models that already rejected them
+        // (chat-only mode) — otherwise every message would 400.
+        let mut include_tools = tools.is_some()
+            && !self
+                .no_tool_models
+                .read()
+                .unwrap()
+                .contains(&resolved_model);
+
+        self.ensure_ollama_runtime(&resolved_model, config).await;
 
         let url = self.completions_url();
 
-        let result = self
+        loop {
+            let request_body = ChatCompletionRequest {
+                model: resolved_model.clone(),
+                messages: messages.to_vec(),
+                tools: if include_tools { tools.map(|t| t.to_vec()) } else { None },
+                tool_choice: if include_tools { Some("auto".to_string()) } else { None },
+                max_tokens: Some(config.max_tokens),
+                temperature: Some(temperature),
+            };
+
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .headers(self.extra_headers.clone())
+                .json(&request_body)
+                .send()
+                .await;
+
+            let response = match result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!(provider = self.spec.display_name, error = %e, "HTTP request failed");
+                    return LlmResponse::error(format!("Error calling LLM: {}", e));
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Failed to read error body".to_string());
+
+                // Model can't take tool definitions (e.g. Ollama gemma3):
+                // remember that and retry once in chat-only mode.
+                if include_tools
+                    && status.as_u16() == 400
+                    && error_text.to_lowercase().contains("does not support tools")
+                {
+                    warn!(
+                        provider = self.spec.display_name,
+                        model = %resolved_model,
+                        "model does not support tools — retrying in chat-only mode"
+                    );
+                    self.no_tool_models
+                        .write()
+                        .unwrap()
+                        .insert(resolved_model.clone());
+                    include_tools = false;
+                    continue;
+                }
+
+                error!(
+                    provider = self.spec.display_name,
+                    status = %status,
+                    body = %error_text,
+                    "API error"
+                );
+                return LlmResponse::error(format!(
+                    "Error calling LLM: {} — {}",
+                    status, error_text
+                ));
+            }
+
+            return match response.json::<ChatCompletionResponse>().await {
+                Ok(chat_resp) => {
+                    let llm_resp: LlmResponse = chat_resp.into();
+                    debug!(
+                        provider = self.spec.display_name,
+                        has_content = llm_resp.content.is_some(),
+                        tool_calls = llm_resp.tool_calls.len(),
+                        finish_reason = llm_resp.finish_reason.as_deref().unwrap_or("?"),
+                        "LLM response received"
+                    );
+                    llm_resp
+                }
+                Err(e) => {
+                    error!(
+                        provider = self.spec.display_name,
+                        error = %e,
+                        "Failed to parse LLM response"
+                    );
+                    LlmResponse::error(format!("Error parsing LLM response: {}", e))
+                }
+            };
+        }
+    }
+
+    async fn supports_tools(&self, model: &str) -> bool {
+        let resolved = self.resolve_model(model);
+        if self.no_tool_models.read().unwrap().contains(&resolved) {
+            return false;
+        }
+        // Ollama tells us capabilities up front — probe once so the agent
+        // loop can pick the lite context BEFORE the first slow request.
+        if self.spec.name == "ollama"
+            && !self
+                .tags_probed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(no_tool) = self.fetch_ollama_no_tool_models().await {
+                let mut set = self.no_tool_models.write().unwrap();
+                for m in no_tool {
+                    set.insert(m);
+                }
+            }
+            return !self.no_tool_models.read().unwrap().contains(&resolved);
+        }
+        true
+    }
+
+    async fn embeddings(&self, texts: &[String], model: &str) -> Result<Vec<Vec<f32>>, String> {
+        #[derive(serde::Deserialize)]
+        struct EmbeddingsResponse {
+            data: Vec<EmbeddingItem>,
+        }
+        #[derive(serde::Deserialize)]
+        struct EmbeddingItem {
+            embedding: Vec<f32>,
+            #[serde(default)]
+            index: usize,
+        }
+
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resolved_model = self.resolve_model(model);
+        let body = serde_json::json!({
+            "model": resolved_model,
+            "input": texts,
+        });
+
+        let response = self
             .client
-            .post(&url)
+            .post(self.embeddings_url())
             .bearer_auth(&self.api_key)
             .headers(self.extra_headers.clone())
-            .json(&request_body)
+            .json(&body)
             .send()
-            .await;
-
-        let response = match result {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(provider = self.spec.display_name, error = %e, "HTTP request failed");
-                return LlmResponse::error(format!("Error calling LLM: {}", e));
-            }
-        };
+            .await
+            .map_err(|e| format!("Embeddings request failed: {e}"))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -194,39 +477,17 @@ impl LlmProvider for HttpProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Failed to read error body".to_string());
-            error!(
-                provider = self.spec.display_name,
-                status = %status,
-                body = %error_text,
-                "API error"
-            );
-            return LlmResponse::error(format!(
-                "Error calling LLM: {} — {}",
-                status, error_text
-            ));
+            return Err(format!("Embeddings API error: {status} — {error_text}"));
         }
 
-        match response.json::<ChatCompletionResponse>().await {
-            Ok(chat_resp) => {
-                let llm_resp: LlmResponse = chat_resp.into();
-                debug!(
-                    provider = self.spec.display_name,
-                    has_content = llm_resp.content.is_some(),
-                    tool_calls = llm_resp.tool_calls.len(),
-                    finish_reason = llm_resp.finish_reason.as_deref().unwrap_or("?"),
-                    "LLM response received"
-                );
-                llm_resp
-            }
-            Err(e) => {
-                error!(
-                    provider = self.spec.display_name,
-                    error = %e,
-                    "Failed to parse LLM response"
-                );
-                LlmResponse::error(format!("Error parsing LLM response: {}", e))
-            }
-        }
+        let parsed: EmbeddingsResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse embeddings response: {e}"))?;
+
+        let mut items = parsed.data;
+        items.sort_by_key(|i| i.index);
+        Ok(items.into_iter().map(|i| i.embedding).collect())
     }
 
     fn default_model(&self) -> &str {
@@ -593,6 +854,350 @@ mod tests {
             resp.reasoning_content.as_deref(),
             Some("Let me think step by step...")
         );
+    }
+
+    #[tokio::test]
+    async fn test_chat_falls_back_to_chat_only_when_tools_rejected() {
+        let mock_server = MockServer::start().await;
+
+        // Requests WITH a tools field → Ollama-style 400 (higher priority).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"tool_choice": "auto"})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "registry.ollama.ai/library/gemma3:4b does not support tools",
+                    "type": "invalid_request_error"
+                }
+            })))
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+
+        // Requests without tools → success.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-fallback",
+                "choices": [{
+                    "message": { "content": "Hi! (chat-only)" },
+                    "finish_reason": "stop"
+                }],
+                "usage": null
+            })))
+            .with_priority(2)
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("ollama").unwrap();
+        let config = make_config("", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gemma3:4b");
+
+        let tool_def = ToolDefinition::new(
+            "exec",
+            "Run a command",
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        );
+        let messages = vec![Message::user("hi")];
+        let req_config = LlmRequestConfig::default();
+
+        // First call: 400 with tools → transparent retry without tools.
+        let resp = provider
+            .chat(&messages, Some(&[tool_def.clone()]), "gemma3:4b", &req_config)
+            .await;
+        assert_eq!(resp.content.as_deref(), Some("Hi! (chat-only)"));
+
+        // Second call: the model is remembered as chat-only → no 400 round-trip.
+        let resp = provider
+            .chat(&messages, Some(&[tool_def]), "gemma3:4b", &req_config)
+            .await;
+        assert_eq!(resp.content.as_deref(), Some("Hi! (chat-only)"));
+
+        // Exactly one 400 was consumed: 3 requests total (400 + 2 × 200).
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_supports_tools_probes_ollama_tags() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    { "name": "gemma3:4b", "capabilities": ["completion"] },
+                    { "name": "qwen2.5:latest", "capabilities": ["completion", "tools"] }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("ollama").unwrap();
+        let config = make_config("", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gemma3:4b");
+
+        assert!(!provider.supports_tools("gemma3:4b").await);
+        assert!(provider.supports_tools("qwen2.5:latest").await);
+        // Probe happens once; results are cached.
+        assert!(!provider.supports_tools("gemma3:4b").await);
+        let tag_requests = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/api/tags")
+            .count();
+        assert_eq!(tag_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn test_ollama_runtime_preload_fires_when_not_loaded() {
+        let mock_server = MockServer::start().await;
+        // Nothing loaded → the preload must fire with the runtime options.
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(serde_json::json!({
+                "keep_alive": "30m",
+                "options": { "num_ctx": 8192 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "done": true, "done_reason": "load"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x",
+                "choices": [{ "message": { "content": "ok" }, "finish_reason": "stop" }],
+                "usage": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("ollama").unwrap();
+        let config = make_config("ollama", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gemma3:4b");
+        let req = LlmRequestConfig {
+            num_ctx: Some(8192),
+            keep_alive: Some("30m".into()),
+            ..Default::default()
+        };
+        let resp = provider
+            .chat(&[Message::user("hi")], None, "gemma3:4b", &req)
+            .await;
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_ollama_runtime_preload_skipped_when_already_loaded() {
+        let mock_server = MockServer::start().await;
+        // Runner already up with a big-enough context → no preload POST.
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "gemma3:4b", "context_length": 8192 }]
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x",
+                "choices": [{ "message": { "content": "ok" }, "finish_reason": "stop" }],
+                "usage": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("ollama").unwrap();
+        let config = make_config("ollama", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gemma3:4b");
+        let req = LlmRequestConfig {
+            num_ctx: Some(8192),
+            keep_alive: Some("30m".into()),
+            ..Default::default()
+        };
+        let resp = provider
+            .chat(&[Message::user("hi")], None, "gemma3:4b", &req)
+            .await;
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_no_ollama_preload_for_cloud_providers() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x",
+                "choices": [{ "message": { "content": "ok" }, "finish_reason": "stop" }],
+                "usage": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+        // num_ctx/keep_alive set but provider is not Ollama → ignored.
+        let req = LlmRequestConfig {
+            num_ctx: Some(8192),
+            keep_alive: Some("30m".into()),
+            ..Default::default()
+        };
+        let resp = provider
+            .chat(&[Message::user("hi")], None, "gpt-4o", &req)
+            .await;
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_supports_tools_learned_from_rejection() {
+        // Non-Ollama provider: no probe, but a 400 rejection teaches it.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"tool_choice": "auto"})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "message": "model does not support tools" }
+            })))
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x",
+                "choices": [{ "message": { "content": "ok" }, "finish_reason": "stop" }],
+                "usage": null
+            })))
+            .with_priority(2)
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("vllm").unwrap();
+        let config = make_config("", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "some-model");
+
+        assert!(provider.supports_tools("some-model").await);
+        let tool_def = ToolDefinition::new("t", "d", serde_json::json!({"type":"object"}));
+        let _ = provider
+            .chat(&[Message::user("hi")], Some(&[tool_def]), "some-model", &LlmRequestConfig::default())
+            .await;
+        assert!(!provider.supports_tools("some-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_chat_other_400_errors_not_retried() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "message": "context length exceeded", "type": "invalid_request_error" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+
+        let resp = provider
+            .chat(&[Message::user("hi")], None, "gpt-4o", &LlmRequestConfig::default())
+            .await;
+        assert!(resp.content.unwrap().contains("context length exceeded"));
+        // No retry for unrelated 400s.
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(header("Authorization", "Bearer emb-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "object": "embedding", "index": 1, "embedding": [0.4, 0.5] },
+                    { "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }
+                ],
+                "model": "text-embedding-3-small"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("emb-key", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+
+        let out = provider
+            .embeddings(
+                &["first".to_string(), "second".to_string()],
+                "text-embedding-3-small",
+            )
+            .await
+            .unwrap();
+
+        // Out-of-order indices must be re-sorted
+        assert_eq!(out, vec![vec![0.1, 0.2], vec![0.4, 0.5]]);
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such model"))
+            .mount(&mock_server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some(&mock_server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+
+        let err = provider
+            .embeddings(&["text".to_string()], "bad-model")
+            .await
+            .unwrap_err();
+        assert!(err.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_empty_input() {
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some("http://127.0.0.1:1"));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+        // Must not even attempt a network call
+        let out = provider.embeddings(&[], "text-embedding-3-small").await.unwrap();
+        assert!(out.is_empty());
     }
 
     // ── create_provider ──

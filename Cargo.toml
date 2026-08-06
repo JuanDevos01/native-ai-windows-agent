@@ -40,6 +40,9 @@ async-trait = "0.1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Semantic memory store (bundled SQLite — no system dependency, keeps the single-binary story)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Local HTTP agent API (`metis serve`)
 axum = { version = "0.7", features = ["json"] }
 tower = { version = "0.4", features = ["util"] }

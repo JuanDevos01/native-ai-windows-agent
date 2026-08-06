@@ -8,13 +8,15 @@
 pub mod tools;
 pub mod context;
 pub mod memory;
+pub mod memory_index;
 pub mod skills;
 pub mod subagent;
 pub mod agent_loop;
 
-pub use agent_loop::{AgentLoop, ExecToolConfig, OutboundFormatting, THINKING_LOG_TARGET};
+pub use agent_loop::{AgentLoop, ExecToolConfig, MemorySettings, OutboundFormatting, THINKING_LOG_TARGET};
 pub use context::ContextBuilder;
 pub use memory::MemoryStore;
+pub use memory_index::MemoryIndex;
 pub use skills::SkillsLoader;
 pub use subagent::SubagentManager;
 pub use tools::{Tool, ToolRegistry};

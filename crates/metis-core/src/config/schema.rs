@@ -32,6 +32,9 @@ pub struct Config {
     /// Periodic background heartbeat (reads HEARTBEAT.md).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    /// Semantic long-term memory (SQLite store, session compaction, recall).
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 impl Default for Config {
@@ -45,6 +48,46 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             http_server: HttpServerConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            memory: MemoryConfig::default(),
+        }
+    }
+}
+
+/// Semantic long-term memory configuration.
+///
+/// Memory entries live in `~/.metis/memory.db`. When a session grows past
+/// `compactionThreshold` messages, the oldest messages are summarized by the
+/// LLM (one call, only when the threshold is crossed — no scheduled token
+/// spend), stored as a searchable memory, and replaced in the session by the
+/// summary. The `topK` most relevant memories are recalled into context on
+/// each message.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryConfig {
+    /// Whether semantic memory (store, recall, compaction) is active.
+    pub enabled: bool,
+    /// Embedding model for vector search, e.g. `"text-embedding-3-small"`
+    /// (OpenAI) or `"ollama/nomic-embed-text"` (free, local). Empty (default)
+    /// = keyword-only search; everything still works, just less fuzzy.
+    pub embedding_model: String,
+    /// Compact a session once it exceeds this many messages. Must stay below
+    /// the 50-message context window or old messages fall off before being
+    /// summarized. 0 disables compaction.
+    pub compaction_threshold: u32,
+    /// How many recent messages survive compaction verbatim.
+    pub keep_recent: u32,
+    /// How many recalled memories to inject into context per message.
+    pub top_k: u32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            embedding_model: String::new(),
+            compaction_threshold: 40,
+            keep_recent: 20,
+            top_k: 5,
         }
     }
 }
@@ -127,6 +170,21 @@ pub struct AgentDefaults {
     /// blocks with a one-line summary instead of full command output.
     #[serde(default = "default_false")]
     pub include_exec_output_in_chat_apps: bool,
+    /// When true (default), replies get a small footer with the turn's token usage
+    /// (input/output tokens and LLM call count). Wire-only; not stored in session history.
+    #[serde(default = "default_true")]
+    pub show_token_usage: bool,
+    /// Context window (num_ctx) requested from Ollama in direct chat mode
+    /// (chat-only local models, e.g. gemma3). Match this to the Ollama app's
+    /// "Context length" setting so switching between Metis and the app does
+    /// not reload the model. `0` = built-in default (8192). Larger values use
+    /// more RAM and slow down cold prompt evaluation on CPU-only machines.
+    #[serde(default = "default_chat_context_length")]
+    pub chat_context_length: u32,
+}
+
+fn default_chat_context_length() -> u32 {
+    8192
 }
 
 fn default_true() -> bool {
@@ -149,6 +207,8 @@ impl Default for AgentDefaults {
             log_thinking_json: true,
             include_fenced_code_in_chat_apps: false,
             include_exec_output_in_chat_apps: true,
+            show_token_usage: true,
+            chat_context_length: default_chat_context_length(),
         }
     }
 }
@@ -938,6 +998,29 @@ mod tests {
         assert_eq!(config.tools.web.search.max_results, 10);
         assert_eq!(config.tools.exec.timeout, 120);
         assert!(config.tools.restrict_to_workspace);
+    }
+
+    #[test]
+    fn test_memory_config_defaults_and_json() {
+        let config = Config::default();
+        assert!(config.memory.enabled);
+        assert_eq!(config.memory.compaction_threshold, 40);
+        assert_eq!(config.memory.keep_recent, 20);
+        assert_eq!(config.memory.top_k, 5);
+        assert!(config.memory.embedding_model.is_empty());
+
+        let json = serde_json::json!({
+            "memory": {
+                "embeddingModel": "ollama/nomic-embed-text",
+                "compactionThreshold": 30,
+                "enabled": true
+            }
+        });
+        let config: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(config.memory.embedding_model, "ollama/nomic-embed-text");
+        assert_eq!(config.memory.compaction_threshold, 30);
+        // Unspecified fields keep defaults
+        assert_eq!(config.memory.keep_recent, 20);
     }
 
     #[test]

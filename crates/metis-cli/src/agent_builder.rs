@@ -4,13 +4,51 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use metis_agent::{AgentLoop, ExecToolConfig, OutboundFormatting};
+use metis_agent::{AgentLoop, ExecToolConfig, MemorySettings, OutboundFormatting};
 use metis_core::bus::queue::MessageBus;
 use metis_core::config::Config;
 use metis_core::session::SessionManager;
 use metis_providers::http_provider::create_provider;
+use metis_providers::registry::ProviderConfig;
+use metis_providers::traits::LlmProvider;
 
 use crate::helpers;
+
+/// Build semantic memory settings from config, creating the embedding
+/// provider when one is configured. Embedding-provider failures degrade to
+/// keyword-only search instead of failing startup.
+pub fn build_memory_settings(
+    config: &Config,
+    providers_map: &std::collections::HashMap<String, ProviderConfig>,
+) -> MemorySettings {
+    let mc = &config.memory;
+    let embed_model = mc.embedding_model.trim().to_string();
+    let embed_provider: Option<Arc<dyn LlmProvider>> = if mc.enabled && !embed_model.is_empty() {
+        match create_provider(&embed_model, providers_map) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                tracing::warn!(
+                    model = %embed_model,
+                    error = %e,
+                    "no provider for embedding model; memory falls back to keyword search"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    MemorySettings {
+        enabled: mc.enabled,
+        db_path: None,
+        embed_provider,
+        embed_model,
+        compaction_threshold: mc.compaction_threshold as usize,
+        keep_recent: mc.keep_recent as usize,
+        top_k: mc.top_k as usize,
+    }
+}
 
 /// Build an `AgentLoop` from the loaded configuration.
 pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
@@ -46,7 +84,10 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         log_thinking_json: defaults.log_thinking_json,
         include_fenced_code_in_chat_apps: defaults.include_fenced_code_in_chat_apps,
         include_exec_output_in_chat_apps: defaults.include_exec_output_in_chat_apps,
+        show_token_usage: defaults.show_token_usage,
     };
+
+    let memory_settings = build_memory_settings(config, &providers_map);
 
     Ok(AgentLoop::new(
         bus,
@@ -63,7 +104,9 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         Some(session_manager),
         agent_name,
         Some(outbound),
-    ))
+    )
+    .with_memory(memory_settings)
+    .with_direct_chat_context(defaults.chat_context_length))
 }
 
 /// Initialize tracing/logging.

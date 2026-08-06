@@ -118,6 +118,53 @@ impl SessionManager {
         }
     }
 
+    /// Get the last `max_messages` of a session, re-reading from disk first.
+    ///
+    /// `get_history` serves from the in-memory cache, which goes stale when a
+    /// *different* SessionManager instance (e.g. the agent's, while this one
+    /// belongs to the desktop UI) writes the session file. Display code must
+    /// use this method so it always sees the latest persisted messages.
+    pub fn get_history_fresh(&self, key: &str, max_messages: usize) -> Vec<Message> {
+        if let Some(session) = self.load_from_disk(key) {
+            {
+                let mut cache = self.cache.write().unwrap();
+                cache.insert(key.to_string(), session.clone());
+            }
+            let len = session.messages.len();
+            return if len <= max_messages {
+                session.messages
+            } else {
+                session.messages[len - max_messages..].to_vec()
+            };
+        }
+        // Nothing on disk yet — fall back to in-memory state (new session).
+        self.get_history(key, max_messages)
+    }
+
+    /// Replace a session's entire message list (used by history compaction).
+    ///
+    /// The summary produced from the removed messages should already be
+    /// persisted elsewhere (e.g. the memory DB) before calling this.
+    pub fn replace_messages(&self, key: &str, messages: Vec<Message>) {
+        let mut session = self.get_or_create(key);
+        session.messages = messages;
+        session.updated_at = Utc::now();
+
+        {
+            let mut cache = self.cache.write().unwrap();
+            cache.insert(key.to_string(), session.clone());
+        }
+
+        if let Err(e) = self.save_to_disk(&session) {
+            warn!("Failed to persist compacted session {}: {}", key, e);
+        }
+    }
+
+    /// Number of messages currently stored in a session.
+    pub fn message_count(&self, key: &str) -> usize {
+        self.get_or_create(key).messages.len()
+    }
+
     /// Clear all messages in a session (reset conversation).
     pub fn clear(&self, key: &str) {
         let mut session = self.get_or_create(key);
@@ -375,6 +422,56 @@ mod tests {
 
         let history = mgr.get_history("test:1", 50);
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_get_history_fresh_sees_other_instance_writes() {
+        let dir = tempdir().unwrap();
+        // Two managers over the same directory — the desktop-UI scenario.
+        let ui = SessionManager::new(Some(dir.path().to_path_buf())).unwrap();
+        let agent = SessionManager::new(Some(dir.path().to_path_buf())).unwrap();
+
+        // UI reads first → caches the (empty) session.
+        assert!(ui.get_history("desktop:1", 200).is_empty());
+
+        // Agent writes through its own instance.
+        agent.add_message("desktop:1", Message::user("hi"));
+        agent.add_message("desktop:1", Message::assistant("hello!"));
+
+        // Cached read is stale (this is the bug get_history_fresh fixes)…
+        assert!(ui.get_history("desktop:1", 200).is_empty());
+        // …fresh read sees the messages and repairs the cache.
+        assert_eq!(ui.get_history_fresh("desktop:1", 200).len(), 2);
+        assert_eq!(ui.get_history("desktop:1", 200).len(), 2);
+    }
+
+    #[test]
+    fn test_get_history_fresh_new_session_no_file() {
+        let (mgr, _dir) = make_manager();
+        // No file on disk and nothing cached → empty, no panic.
+        assert!(mgr.get_history_fresh("brand:new", 50).is_empty());
+    }
+
+    #[test]
+    fn test_replace_messages_persists() {
+        let dir = tempdir().unwrap();
+        {
+            let mgr = SessionManager::new(Some(dir.path().to_path_buf())).unwrap();
+            for i in 0..5 {
+                mgr.add_message("test:1", Message::user(format!("msg {i}")));
+            }
+            mgr.replace_messages(
+                "test:1",
+                vec![Message::user("[summary]"), Message::user("msg 4")],
+            );
+            assert_eq!(mgr.message_count("test:1"), 2);
+        }
+        // Survives reload from disk
+        {
+            let mgr = SessionManager::new(Some(dir.path().to_path_buf())).unwrap();
+            let session = mgr.get_or_create("test:1");
+            assert_eq!(session.messages.len(), 2);
+        }
     }
 
     #[test]

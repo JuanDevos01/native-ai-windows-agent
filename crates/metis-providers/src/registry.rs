@@ -321,9 +321,12 @@ pub fn find_by_model(model: &str) -> Option<&'static ProviderSpec> {
 
     // 1. An explicit "<provider>/..." routing prefix is authoritative. This
     //    avoids collisions where a model id contains another provider's keyword
-    //    (e.g. `lmstudio/qwen2.5...` must route to LM Studio, not DashScope).
+    //    (e.g. `lmstudio/qwen2.5...` must route to LM Studio, not DashScope,
+    //    and `openrouter/gpt-4o` must route to OpenRouter, not OpenAI).
+    //    Gateways are named here too — they are excluded only from the
+    //    keyword matching below, where they stay a fallback.
     if let Some((head, _)) = model_lower.split_once('/') {
-        if let Some(spec) = PROVIDERS.iter().find(|s| !s.is_gateway && s.name == head) {
+        if let Some(spec) = PROVIDERS.iter().find(|s| s.name == head) {
             return Some(spec);
         }
     }
@@ -398,14 +401,18 @@ pub fn find_gateway(
 pub fn resolve_model_name(model: &str, spec: &ProviderSpec) -> String {
     let mut resolved = model.to_string();
 
-    // Local providers (Ollama, LM Studio, vLLM): strip only the leading
-    // "<name>/" routing token, preserving any inner slashes (e.g. LM Studio
-    // "org/model" identifiers). The local server expects the bare id.
-    if spec.is_local {
-        let token = format!("{}/", spec.name);
-        if let Some(rest) = resolved.strip_prefix(token.as_str()) {
-            resolved = rest.to_string();
-        }
+    // Strip the leading "<provider>/" routing token, preserving any inner
+    // slashes (e.g. LM Studio "org/model" or OpenRouter "vendor/model" ids).
+    // It exists to route a model to this provider, not to be sent upstream:
+    // `openai/o3-mini` must reach the OpenAI API as `o3-mini`. Providers whose
+    // wire format wants a prefix re-add it below via `spec.prefix`.
+    let token = format!("{}/", spec.name);
+    if let Some(rest) = resolved
+        .get(..token.len())
+        .filter(|p| p.eq_ignore_ascii_case(&token))
+        .map(|_| &resolved[token.len()..])
+    {
+        resolved = rest.to_string();
     }
 
     // Strip existing prefix (AiHubMix quirk)
@@ -427,6 +434,24 @@ pub fn resolve_model_name(model: &str, spec: &ProviderSpec) -> String {
     }
 
     resolved
+}
+
+/// The config-file model id for `model_id` as served by `spec`.
+///
+/// Providers report bare ids from their `/models` endpoint (`gpt-4o`,
+/// `MiniMax-M2`), but a bare id only routes back to its provider when it
+/// happens to contain one of the spec's keywords — `o3-mini` doesn't say
+/// "openai" anywhere. Qualifying it as `<provider>/<id>` always routes, and
+/// `resolve_model_name` strips that token again before the request goes out.
+///
+/// Ids that already route on their own are returned unchanged, so the common,
+/// human-readable forms (`gpt-4o`, `claude-sonnet-4`) stay as they are.
+pub fn qualified_model_id(model_id: &str, spec: &ProviderSpec) -> String {
+    let id = model_id.trim();
+    match find_by_model(id) {
+        Some(found) if found.name == spec.name => id.to_string(),
+        _ => format!("{}/{}", spec.name, id),
+    }
 }
 
 /// Apply per-model overrides to request parameters.
@@ -547,11 +572,19 @@ mod tests {
     }
 
     #[test]
-    fn test_find_by_model_skips_gateway() {
-        // "openrouter" is a gateway — should NOT match directly
-        let spec = find_by_model("openrouter/anthropic/claude-3");
-        // This matches anthropic, not openrouter (gateways are skipped)
-        assert_eq!(spec.unwrap().name, "anthropic");
+    fn test_find_by_model_gateway_only_via_explicit_prefix() {
+        // An explicit gateway prefix is honoured: the user asked for the model
+        // *through OpenRouter*, so it must not be sent straight to Anthropic
+        // (which would reject the id "openrouter/anthropic/claude-3").
+        let spec = find_by_model("openrouter/anthropic/claude-3").unwrap();
+        assert_eq!(spec.name, "openrouter");
+        assert_eq!(
+            resolve_model_name("openrouter/anthropic/claude-3", spec),
+            "openrouter/anthropic/claude-3"
+        );
+
+        // Without the prefix, keyword matching still skips gateways.
+        assert_eq!(find_by_model("anthropic/claude-3").unwrap().name, "anthropic");
     }
 
     #[test]
@@ -627,6 +660,79 @@ mod tests {
         let spec = find_by_name("aihubmix").unwrap();
         // No slash to strip → just prefix
         assert_eq!(resolve_model_name("gpt-4o", spec), "openai/gpt-4o");
+    }
+
+    #[test]
+    fn test_resolve_strips_provider_routing_token() {
+        // A "<provider>/" token routes the model; it must not be sent upstream.
+        let openai = find_by_name("openai").unwrap();
+        assert_eq!(resolve_model_name("openai/o3-mini", openai), "o3-mini");
+        assert_eq!(resolve_model_name("openai/gpt-4o", openai), "gpt-4o");
+        // Case-insensitive, and inner slashes survive.
+        let or = find_by_name("openrouter").unwrap();
+        assert_eq!(
+            resolve_model_name("OpenRouter/meta-llama/llama-3", or),
+            "openrouter/meta-llama/llama-3"
+        );
+        // Prefix-style providers are unchanged by the strip.
+        let ds = find_by_name("deepseek").unwrap();
+        assert_eq!(resolve_model_name("deepseek/deepseek-chat", ds), "deepseek/deepseek-chat");
+        assert_eq!(resolve_model_name("deepseek-chat", ds), "deepseek/deepseek-chat");
+    }
+
+    // ── qualified_model_id ──
+
+    #[test]
+    fn test_qualified_model_id_keeps_self_routing_ids() {
+        let openai = find_by_name("openai").unwrap();
+        assert_eq!(qualified_model_id("gpt-4o", openai), "gpt-4o");
+        let minimax = find_by_name("minimax").unwrap();
+        assert_eq!(qualified_model_id("MiniMax-M2", minimax), "MiniMax-M2");
+        let anthropic = find_by_name("anthropic").unwrap();
+        assert_eq!(qualified_model_id("claude-sonnet-4", anthropic), "claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_qualified_model_id_qualifies_ambiguous_ids() {
+        // "o3-mini" contains no OpenAI keyword → must be qualified to route.
+        let openai = find_by_name("openai").unwrap();
+        assert_eq!(qualified_model_id("o3-mini", openai), "openai/o3-mini");
+        // …and the qualified form both routes back and resolves to the bare id.
+        assert_eq!(find_by_model("openai/o3-mini").unwrap().name, "openai");
+        assert_eq!(resolve_model_name("openai/o3-mini", openai), "o3-mini");
+    }
+
+    #[test]
+    fn test_qualified_model_id_round_trips_for_every_provider() {
+        // Every provider's qualified id must route back to that same provider,
+        // and resolve to something free of the routing token.
+        for spec in PROVIDERS {
+            let qualified = qualified_model_id("some-model-v1", spec);
+            let routed = find_by_model(&qualified)
+                .unwrap_or_else(|| panic!("{} id '{qualified}' does not route", spec.name));
+            assert_eq!(
+                routed.name, spec.name,
+                "{} id '{qualified}' routed to {}",
+                spec.name, routed.name
+            );
+            let wire = resolve_model_name(&qualified, spec);
+            assert!(
+                !wire.contains(&format!("{}/{}", spec.name, spec.name)),
+                "{} double-prefixed: {wire}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_gateway_prefix_beats_keyword_match() {
+        // "openrouter/gpt-4o" must reach OpenRouter, not OpenAI (the "gpt"
+        // keyword would otherwise win), and go on the wire in OpenRouter form.
+        let spec = find_by_model("openrouter/gpt-4o").unwrap();
+        assert_eq!(spec.name, "openrouter");
+        assert_eq!(resolve_model_name("openrouter/gpt-4o", spec), "openrouter/gpt-4o");
+        // Gateways remain fallback-only for un-prefixed ids.
+        assert_eq!(find_by_model("gpt-4o").unwrap().name, "openai");
     }
 
     // ── apply_model_overrides ──
