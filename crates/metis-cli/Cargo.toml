@@ -19,6 +19,8 @@ slack = ["metis-channels/slack"]
 email = ["metis-channels/email"]
 
 [dependencies]
+# Pinned so a crypto provider is always compiled in; see install_crypto_provider().
+rustls = { version = "0.23", features = ["ring"] }
 metis-core = { workspace = true }
 metis-agent = { workspace = true }
 metis-providers = { workspace = true }

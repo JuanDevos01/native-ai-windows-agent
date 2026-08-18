@@ -112,7 +112,21 @@ impl WhatsAppChannel {
                 Err(e) => {
                     *self.connected.lock().await = false;
                     *self.ws_write.lock().await = None;
-                    warn!(error = %e, "whatsapp bridge error, reconnecting in {RECONNECT_DELAY_SECS}s");
+                    // "Connection refused" means the Baileys sidecar simply
+                    // is not running — by far the most common cause, and the
+                    // raw OS error says nothing about how to fix it. Spell
+                    // out the remedy once per attempt instead of emitting an
+                    // opaque error every few seconds forever.
+                    let refused = e.to_string().contains("10061")
+                        || e.to_string().to_lowercase().contains("refused");
+                    if refused {
+                        warn!(
+                            bridge_url = %self.bridge_url,
+                            "whatsapp bridge is not running at this URL — start it with                              `cd bridge && npm start` (first run prints a QR code to pair), or                              remove channels.whatsapp.bridgeUrl from config.json to disable the                              WhatsApp channel. Retrying in {RECONNECT_DELAY_SECS}s"
+                        );
+                    } else {
+                        warn!(error = %e, "whatsapp bridge error, reconnecting in {RECONNECT_DELAY_SECS}s");
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)) => {}
                         _ = self.shutdown.notified() => {

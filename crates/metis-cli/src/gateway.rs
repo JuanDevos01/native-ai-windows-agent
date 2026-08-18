@@ -469,7 +469,14 @@ pub async fn run() -> Result<()> {
     #[cfg(feature = "email")]
     {
         let em = &config.channels.email;
-        if !em.imap_host.is_empty() {
+        // A Graph mailbox has no imap_host, so gating purely on that would
+        // silently never start the channel for Office 365.
+        let graph_ready = em.provider.trim().eq_ignore_ascii_case("graph")
+            && !em.graph_tenant_id.is_empty()
+            && !em.graph_client_id.is_empty()
+            && !em.graph_client_secret.is_empty()
+            && !em.graph_user_id.is_empty();
+        if !em.imap_host.is_empty() || graph_ready {
             use metis_channels::email::EmailChannel;
             let email = EmailChannel::new(em.clone(), bus.clone());
             channel_manager.register(Arc::new(email));

@@ -25,6 +25,8 @@ pub mod slack;
 
 #[cfg(feature = "email")]
 pub mod email;
+#[cfg(feature = "email")]
+pub mod graph_mail;
 
 pub use base::Channel;
 pub use manager::ChannelManager;

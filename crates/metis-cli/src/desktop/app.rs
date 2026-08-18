@@ -6,8 +6,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use eframe::egui;
 use metis_agent::AgentLoop;
-use metis_core::config::load_config;
+use metis_core::config::{load_config, save_config};
 use metis_core::session::{SessionManager, SessionSummary};
+use metis_providers::registry::match_provider;
+use metis_providers::DiscoveredModel;
 use metis_core::types::{Message, MessageContent};
 use metis_cron::types::{CronJob, CronStore};
 use metis_core::utils::get_data_path;
@@ -24,6 +26,8 @@ const MAIN_BG: egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NavPanel {
     Chat,
+    Settings,
+    Models,
     SkillsTools,
     Messaging,
     Artifacts,
@@ -33,6 +37,13 @@ enum NavPanel {
 struct ChatLine {
     role: &'static str,
     text: String,
+}
+
+/// Result of a background model-discovery sweep across configured providers.
+struct ModelSweep {
+    models: Vec<DiscoveredModel>,
+    /// One line per provider that could not be queried (bad key, offline, …).
+    errors: Vec<String>,
 }
 
 struct PendingReply {
@@ -55,6 +66,30 @@ pub struct MetisDesktopApp {
     cron_jobs: Vec<CronJob>,
     sessions_cache: Vec<SessionSummary>,
     last_refresh: f64,
+    // ── Models panel ──
+    /// Main model field (editable, applied on "Apply & save").
+    model_main: String,
+    /// Subagent model field (empty = same as main).
+    model_sub: String,
+    /// Status/result line for the Models panel.
+    model_status: String,
+    /// Models offered by every configured provider (from `config.json`).
+    available_models: Vec<DiscoveredModel>,
+    /// Providers that could not be queried in the last sweep.
+    model_errors: Vec<String>,
+    /// In-flight model discovery sweep.
+    models_rx: Option<oneshot::Receiver<ModelSweep>>,
+    /// In-flight model health test: Ok((reply, seconds)) or Err(reason).
+    model_test_rx: Option<oneshot::Receiver<Result<(String, f64), String>>>,
+    // ── Settings panel ──
+    /// Editable mirror of config.json.
+    settings: super::settings::SettingsForm,
+    /// Which secret fields are currently revealed (ids, not values).
+    settings_reveal: std::collections::HashSet<String>,
+    /// Result of the last save/reload.
+    settings_status: String,
+    /// Shown once when the install has never been configured.
+    show_first_run: bool,
 }
 
 impl MetisDesktopApp {
@@ -68,7 +103,13 @@ impl MetisDesktopApp {
             "desktop:{}",
             chrono::Utc::now().format("%Y%m%d-%H%M%S")
         );
+        let agent_config = load_config(None);
+        let first_run = super::settings::is_first_run(&agent_config);
         let mut app = Self {
+            settings: super::settings::SettingsForm::from_config(&agent_config),
+            settings_reveal: std::collections::HashSet::new(),
+            settings_status: String::new(),
+            show_first_run: first_run,
             config,
             agent,
             sessions,
@@ -83,10 +124,128 @@ impl MetisDesktopApp {
             cron_jobs: load_cron_jobs(),
             sessions_cache: Vec::new(),
             last_refresh: 0.0,
+            model_main: agent_config.agents.defaults.model.clone(),
+            model_sub: agent_config.agents.defaults.subagent_model.clone(),
+            model_status: String::new(),
+            available_models: Vec::new(),
+            model_errors: Vec::new(),
+            models_rx: None,
+            model_test_rx: None,
         };
         app.refresh_sessions();
         app.load_session_history();
+        // Populate the model dropdowns from every configured provider (non-blocking).
+        app.discover_models();
         app
+    }
+
+    /// Candidate models for the dropdowns as `(model id, display label)`:
+    /// active model, configured main/sub, recently used, then every model
+    /// offered by a configured provider — deduplicated, in that order.
+    /// Models known to lack tool support are labelled "(chat-only)".
+    fn model_choices(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let add = |out: &mut Vec<(String, String)>, id: &str| {
+            let id = id.trim();
+            if !id.is_empty() && !out.iter().any(|(x, _)| x == id) {
+                out.push((id.to_string(), self.model_label(id)));
+            }
+        };
+        add(&mut out, self.agent.model());
+        add(&mut out, &self.model_main);
+        add(&mut out, &self.model_sub);
+        for m in &self.config.recent_models {
+            add(&mut out, m);
+        }
+        for m in &self.available_models {
+            add(&mut out, &m.id);
+        }
+        out
+    }
+
+    /// Display label for a model id: `<id> · <Provider>` plus a chat-only
+    /// marker when the provider reported no tool support.
+    fn model_label(&self, id: &str) -> String {
+        match self.available_models.iter().find(|m| m.id == id) {
+            Some(m) if m.is_chat_only() => {
+                format!("{id} · {} (chat-only)", m.provider_display)
+            }
+            Some(m) => format!("{id} · {}", m.provider_display),
+            None => id.to_string(),
+        }
+    }
+
+    /// Render a model dropdown; returns the newly picked id, if any.
+    /// The selected entry is marked with a checkmark.
+    fn model_combo(
+        ui: &mut egui::Ui,
+        id_salt: &str,
+        current: &str,
+        choices: &[(String, String)],
+        width: f32,
+    ) -> Option<String> {
+        let mut picked = None;
+        let selected_text = if current.trim().is_empty() {
+            "(same as main)".to_string()
+        } else {
+            truncate(current, 40)
+        };
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(selected_text)
+            .width(width)
+            .show_ui(ui, |ui| {
+                for (id, label) in choices {
+                    let is_selected = id == current;
+                    let text = if is_selected {
+                        format!("✓ {label}")
+                    } else {
+                        format!("   {label}")
+                    };
+                    if ui.selectable_label(is_selected, text).clicked() && !is_selected {
+                        picked = Some(id.clone());
+                    }
+                }
+            });
+        picked
+    }
+
+    /// Switch the model the chat talks to, for this app session only — no
+    /// config.json write, so the saved default is untouched. Changing the
+    /// default lives in the Models panel (`apply_models`).
+    fn switch_chat_model(&mut self, model: String) {
+        if self.pending.is_some() {
+            self.status_line = "⏳ Wait for the current reply to finish first.".into();
+            return;
+        }
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return;
+        }
+        let mut agent_config = load_config(None);
+        let providers = agent_config.providers.to_map();
+        if match_provider(&model, &providers).is_none() {
+            self.status_line = format!(
+                "✗ No configured provider for '{model}'. Add its API key via `metis onboard`."
+            );
+            return;
+        }
+        // In-memory override only: the agent is rebuilt with this model, but
+        // the config on disk keeps its saved default.
+        agent_config.agents.defaults.model = model.clone();
+        match build_agent_loop(&agent_config) {
+            Ok(new_agent) => {
+                self.agent = Arc::new(new_agent);
+                self.status_line =
+                    format!("✓ Chatting with {model} (this session; default unchanged)");
+                self.config.recent_models.retain(|x| x != &model);
+                self.config.recent_models.insert(0, model);
+                self.config.recent_models.truncate(8);
+                let _ = save_desktop_config(&self.config);
+            }
+            Err(e) => {
+                self.status_line = format!("✗ Failed to switch model: {e}");
+            }
+        }
     }
 
     fn refresh_sessions(&mut self) {
@@ -95,7 +254,10 @@ impl MetisDesktopApp {
 
     fn load_session_history(&mut self) {
         self.chat_lines.clear();
-        for msg in self.sessions.get_history(&self.active_session, 200) {
+        // Disk-fresh read: the agent writes sessions through its own manager
+        // instance, so a cached read here would show stale (often empty)
+        // history and blank the chat right after a reply arrives.
+        for msg in self.sessions.get_history_fresh(&self.active_session, 200) {
             if let Some((role, text)) = message_display(&msg) {
                 if !text.trim().is_empty() {
                     self.chat_lines.push(ChatLine { role, text });
@@ -173,11 +335,15 @@ impl MetisDesktopApp {
             let pending = self.pending.take().unwrap();
             match result {
                 Ok(reply) => {
+                    // The agent appends a token-usage footer to the wire reply
+                    // but never persists it, so the history reload below would
+                    // silently drop it — show it in the status line instead.
+                    let (text, footer) = split_usage_footer(&reply);
                     self.chat_lines.push(ChatLine {
                         role: "Agent",
-                        text: reply,
+                        text,
                     });
-                    self.status_line.clear();
+                    self.status_line = footer.unwrap_or_default();
                 }
                 Err(err) => {
                     self.status_line = format!("Error: {err}");
@@ -190,6 +356,186 @@ impl MetisDesktopApp {
             ctx.request_repaint();
         } else if self.pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Apply the Models panel fields: validate, persist to config.json, and
+    /// swap in a freshly built agent loop (same construction path as startup).
+    fn apply_models(&mut self) {
+        if self.pending.is_some() {
+            self.model_status = "⏳ Wait for the current reply to finish first.".into();
+            return;
+        }
+        let main = self.model_main.trim().to_string();
+        if main.is_empty() {
+            self.model_status = "✗ Main model cannot be empty.".into();
+            return;
+        }
+        let sub = self.model_sub.trim().to_string();
+
+        let mut agent_config = load_config(None);
+        let providers = agent_config.providers.to_map();
+        if match_provider(&main, &providers).is_none() {
+            self.model_status = format!(
+                "✗ No configured provider for '{main}'. Add its API key via `metis onboard`, \
+                 or use a local model (ollama/…, lmstudio/…)."
+            );
+            return;
+        }
+        let sub_warning = if !sub.is_empty() && match_provider(&sub, &providers).is_none() {
+            " ⚠ subagent model has no provider; subagents will fall back to the main model."
+        } else {
+            ""
+        };
+
+        agent_config.agents.defaults.model = main.clone();
+        agent_config.agents.defaults.subagent_model = sub;
+        if let Err(e) = save_config(&agent_config, None) {
+            self.model_status = format!("✗ Failed to save config: {e}");
+            return;
+        }
+
+        match build_agent_loop(&agent_config) {
+            Ok(new_agent) => {
+                self.agent = Arc::new(new_agent);
+                self.model_status = format!("✓ Switched to {main} (saved to config).{sub_warning}");
+            }
+            Err(e) => {
+                self.model_status = format!("✗ Saved config, but rebuilding the agent failed: {e}");
+            }
+        }
+    }
+
+    /// Kick off a background sweep of every provider configured in
+    /// `config.json`, listing the models each one actually offers.
+    fn discover_models(&mut self) {
+        if self.models_rx.is_some() {
+            return;
+        }
+        let providers = load_config(None).providers.to_map();
+
+        let (tx, rx) = oneshot::channel();
+        self.models_rx = Some(rx);
+        self.model_status = "Loading models from configured providers…".into();
+        self.runtime.spawn(async move {
+            let (models, errors) = metis_providers::discover_models(&providers).await;
+            let _ = tx.send(ModelSweep { models, errors });
+        });
+    }
+
+    /// Collect a finished discovery sweep, if any.
+    fn poll_model_discovery(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.models_rx.as_mut() else {
+            return;
+        };
+        let sweep = match rx.try_recv() {
+            Ok(sweep) => sweep,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.models_rx = None;
+                self.model_status = "✗ Model discovery task failed.".into();
+                return;
+            }
+        };
+        self.models_rx = None;
+
+        let count = sweep.models.len();
+        let providers: std::collections::BTreeSet<&str> =
+            sweep.models.iter().map(|m| m.provider_display).collect();
+        self.available_models = sweep.models;
+        self.model_errors = sweep.errors;
+
+        self.model_status = if count == 0 {
+            "No models found. Add a provider API key via `metis onboard`, or start Ollama.".into()
+        } else {
+            format!(
+                "✓ {count} models from {}",
+                providers.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        };
+    }
+
+    /// Health-test the model in the main-model field: one tiny real chat
+    /// completion (no tools), reporting round-trip time or the exact failure.
+    /// Catches dead servers, missing keys, and models too slow to be usable —
+    /// BEFORE you switch to them.
+    fn test_model(&mut self) {
+        if self.model_test_rx.is_some() {
+            return;
+        }
+        let model = self.model_main.trim().to_string();
+        if model.is_empty() {
+            self.model_status = "✗ Enter a model to test.".into();
+            return;
+        }
+
+        let agent_config = load_config(None);
+        let providers = agent_config.providers.to_map();
+        let provider = match metis_providers::http_provider::create_provider(&model, &providers) {
+            Ok(p) => p,
+            Err(e) => {
+                self.model_status = format!("✗ {e}");
+                return;
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.model_test_rx = Some(rx);
+        self.model_status = format!("🧪 Testing {model} (local models may take a while to load)…");
+        self.runtime.spawn(async move {
+            use metis_core::types::Message;
+            use metis_providers::traits::{LlmProvider, LlmRequestConfig};
+
+            let started = std::time::Instant::now();
+            let req = LlmRequestConfig {
+                max_tokens: 16,
+                temperature: 0.0,
+                ..Default::default()
+            };
+            let messages = vec![Message::user("Reply with exactly: OK")];
+            let resp = provider.chat(&messages, None, &model, &req).await;
+            let secs = started.elapsed().as_secs_f64();
+
+            let result = match resp.content {
+                Some(text) if text.starts_with("Error calling LLM") => Err(text),
+                Some(text) => Ok((text.trim().chars().take(40).collect::<String>(), secs)),
+                None => Err("Model returned an empty response".into()),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_model_test(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.model_test_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((reply, secs))) => {
+                self.model_test_rx = None;
+                let speed = if secs > 30.0 {
+                    " ⚠ very slow — expect multi-minute replies with the full agent prompt"
+                } else if secs > 10.0 {
+                    " ⚠ slow"
+                } else {
+                    ""
+                };
+                self.model_status =
+                    format!("✓ Model responded in {secs:.1}s: \"{reply}\"{speed}");
+            }
+            Ok(Err(e)) => {
+                self.model_test_rx = None;
+                self.model_status = format!("✗ Test failed: {e}");
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.model_test_rx = None;
+                self.model_status = "✗ Model test task failed.".into();
+            }
         }
     }
 
@@ -218,6 +564,8 @@ impl MetisDesktopApp {
 impl eframe::App for MetisDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pending(ctx);
+        self.poll_model_discovery(ctx);
+        self.poll_model_test(ctx);
 
         let now = ctx.input(|i| i.time);
         if now - self.last_refresh > 5.0 {
@@ -230,13 +578,50 @@ impl eframe::App for MetisDesktopApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                let w = ui.available_width() - 80.0;
+                let w = ui.available_width() - 270.0;
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .hint_text("Start with a goal…")
                         .desired_width(w)
                         .desired_rows(2),
                 );
+
+                // Model dropdown — switch who you're talking to, right from the chat.
+                let mut picked: Option<String> = None;
+                let mut open_models_panel = false;
+                let active_model = self.agent.model().to_string();
+                let choices = self.model_choices();
+                ui.add_enabled_ui(self.pending.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("chat_model_picker")
+                        .selected_text(
+                            egui::RichText::new(truncate(&active_model, 22)).small(),
+                        )
+                        .width(170.0)
+                        .show_ui(ui, |ui| {
+                            for (id, label) in &choices {
+                                let is_selected = *id == active_model;
+                                let text = if is_selected {
+                                    format!("✓ {label}")
+                                } else {
+                                    format!("   {label}")
+                                };
+                                if ui.selectable_label(is_selected, text).clicked() && !is_selected {
+                                    picked = Some(id.clone());
+                                }
+                            }
+                            ui.separator();
+                            if ui.selectable_label(false, "⚙ More models…").clicked() {
+                                open_models_panel = true;
+                            }
+                        });
+                });
+                if let Some(model) = picked {
+                    self.switch_chat_model(model);
+                }
+                if open_models_panel {
+                    self.nav = NavPanel::Models;
+                }
+
                 let send = ui
                     .add_enabled(
                         self.pending.is_none() && !self.input.trim().is_empty(),
@@ -277,10 +662,12 @@ impl eframe::App for MetisDesktopApp {
                 ui.add_space(4.0);
 
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Chat, "💬  Chat");
+                sidebar_nav_button(ui, &mut self.nav, NavPanel::Models, "🧠  Models");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::SkillsTools, "🛠  Skills & Tools");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Messaging, "📨  Messaging");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Artifacts, "📁  Artifacts");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::CronJobs, "⏱  Cron jobs");
+                sidebar_nav_button(ui, &mut self.nav, NavPanel::Settings, "⚙  Settings");
 
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new("Search sessions…").small().weak());
@@ -325,11 +712,14 @@ impl eframe::App for MetisDesktopApp {
                 let mut select_key: Option<String> = None;
                 let mut pin_key: Option<String> = None;
                 egui::ScrollArea::vertical()
+                    .id_salt("sessions_scroll")
                     .max_height(180.0)
                     .show(ui, |ui| {
                         for (key, selected) in &session_rows {
                             let label = session_label(key);
-                            let resp = ui.selectable_label(*selected, label);
+                            let resp = ui
+                                .push_id(key, |ui| ui.selectable_label(*selected, label))
+                                .inner;
                             if resp.clicked() {
                                 select_key = Some(key.clone());
                             }
@@ -367,7 +757,7 @@ impl eframe::App for MetisDesktopApp {
                     })
                     .collect();
                 let mut project_select: Option<String> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("projects_scroll").show(ui, |ui| {
                     let mut projects = project_rows;
                     projects.sort_by(|a, b| a.0.cmp(&b.0));
                     for (project, keys) in &projects {
@@ -382,7 +772,7 @@ impl eframe::App for MetisDesktopApp {
                         );
                         for key in keys {
                             let label = session_label(key);
-                            if ui.small_button(label).clicked() {
+                            if ui.push_id(key, |ui| ui.small_button(label)).inner.clicked() {
                                 project_select = Some(key.clone());
                             }
                         }
@@ -397,7 +787,9 @@ impl eframe::App for MetisDesktopApp {
             .frame(egui::Frame::default().fill(MAIN_BG))
             .show(ctx, |ui| match self.nav {
                 NavPanel::Chat => self.draw_chat(ui),
+                NavPanel::Models => self.draw_models(ui),
                 NavPanel::CronJobs => self.draw_cron(ui),
+                NavPanel::Settings => self.draw_settings(ui),
                 NavPanel::SkillsTools => draw_placeholder(
                     ui,
                     "Skills & Tools",
@@ -438,9 +830,13 @@ impl MetisDesktopApp {
                 "Drop a file path, a traceback, or a rough idea. I'll investigate, suggest next steps, and keep things reversible.",
             );
             ui.label(
-                egui::RichText::new(format!("Session: {}", self.active_session))
-                    .small()
-                    .weak(),
+                egui::RichText::new(format!(
+                    "Session: {}  ·  Model: {}",
+                    self.active_session,
+                    self.agent.model()
+                ))
+                .small()
+                .weak(),
             );
         });
 
@@ -462,6 +858,224 @@ impl MetisDesktopApp {
                     ui.add_space(12.0);
                 }
             });
+    }
+
+    // ── Settings panel ──
+
+    /// Back up config.json next to itself before overwriting it. A GUI that
+    /// rewrites the whole file should never be the reason a working setup is
+    /// lost, and the backup is what makes an accidental "Save" recoverable.
+    fn backup_config_file() -> Option<std::path::PathBuf> {
+        let path = metis_core::utils::get_data_path().join("config.json");
+        if !path.is_file() {
+            return None;
+        }
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let backup = path.with_extension(format!("json.bak-{stamp}"));
+        std::fs::copy(&path, &backup).ok().map(|_| backup)
+    }
+
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        if self.show_first_run {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(255, 249, 230))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("First run — Metis is not configured yet")
+                            .strong()
+                            .color(egui::Color32::from_rgb(150, 90, 0)),
+                    );
+                    ui.label("Add an API key under “Provider API keys”, set the agent model, then Save. Local models (Ollama) need no key.");
+                    if ui.button("Got it").clicked() {
+                        self.show_first_run = false;
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
+        let status = self.settings_status.clone();
+        let action = super::settings::draw(ui, &mut self.settings, &mut self.settings_reveal, &status);
+
+        match action {
+            super::settings::SettingsAction::Save => {
+                let errors = self.settings.validation_errors();
+                if !errors.is_empty() {
+                    self.settings_status = format!("Not saved — {}", errors.join(" "));
+                } else {
+                    // Re-read from disk first so a field this editor does not
+                    // expose (or something changed by the CLI meanwhile) is
+                    // preserved rather than clobbered by a stale in-memory copy.
+                    let mut cfg = load_config(None);
+                    self.settings.apply_to(&mut cfg);
+                    let backup = Self::backup_config_file();
+                    match save_config(&cfg, None) {
+                        Ok(()) => {
+                            self.show_first_run = false;
+                            self.settings_status = match backup {
+                                Some(b) => format!(
+                                    "Saved. Backup: {}. Restart the gateway to apply.",
+                                    b.file_name().unwrap_or_default().to_string_lossy()
+                                ),
+                                None => "Saved. Restart the gateway to apply.".to_string(),
+                            };
+                        }
+                        Err(e) => self.settings_status = format!("Save failed: {e}"),
+                    }
+                }
+            }
+            super::settings::SettingsAction::Reload => {
+                let cfg = load_config(None);
+                self.settings = super::settings::SettingsForm::from_config(&cfg);
+                self.settings_reveal.clear();
+                self.settings_status = "Reloaded from config.json.".to_string();
+            }
+            super::settings::SettingsAction::None => {}
+        }
+    }
+
+    fn draw_models(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Models");
+        ui.label(
+            egui::RichText::new(format!("Active main model: {}", self.agent.model()))
+                .color(ACCENT)
+                .strong(),
+        );
+        ui.add_space(12.0);
+
+        let choices = self.model_choices();
+        let busy = self.models_rx.is_some();
+
+        ui.label("Main model");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if let Some(picked) =
+                    Self::model_combo(ui, "main_model_picker", &self.model_main, &choices, 380.0)
+                {
+                    self.model_main = picked;
+                }
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.model_main)
+                    .hint_text("or type an id")
+                    .desired_width(220.0),
+            );
+        });
+
+        ui.add_space(6.0);
+        ui.label("Subagent model (empty = same as main; can be a cheap local model)");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                if let Some(picked) =
+                    Self::model_combo(ui, "sub_model_picker", &self.model_sub, &choices, 380.0)
+                {
+                    self.model_sub = picked;
+                }
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.model_sub)
+                    .hint_text("or type an id")
+                    .desired_width(220.0),
+            );
+            if ui.small_button("clear").clicked() {
+                self.model_sub.clear();
+            }
+        });
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.pending.is_none(), egui::Button::new("✅ Apply & save"))
+                .clicked()
+            {
+                self.apply_models();
+            }
+            if ui
+                .add_enabled(self.model_test_rx.is_none(), egui::Button::new("🧪 Test model"))
+                .clicked()
+            {
+                self.test_model();
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("🔄 Refresh models"))
+                .clicked()
+            {
+                self.discover_models();
+            }
+        });
+        if !self.model_status.is_empty() {
+            ui.add_space(6.0);
+            ui.label(&self.model_status);
+        }
+
+        if !self.available_models.is_empty() {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("AVAILABLE MODELS (from ~/.metis/config.json)")
+                    .small()
+                    .strong()
+                    .color(ACCENT),
+            );
+            ui.add_space(4.0);
+            let models = self.available_models.clone();
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                let mut current_provider = "";
+                for m in &models {
+                    if m.provider != current_provider {
+                        current_provider = m.provider;
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(m.provider_display)
+                                .small()
+                                .strong()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(&m.raw_id);
+                        if m.is_chat_only() {
+                            ui.label(
+                                egui::RichText::new("⚠ chat-only (no tool support)")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(180, 120, 0)),
+                            );
+                        }
+                        if ui.small_button("use as main").clicked() {
+                            self.model_main = m.id.clone();
+                        }
+                        if ui.small_button("use as subagent").clicked() {
+                            self.model_sub = m.id.clone();
+                        }
+                    });
+                }
+            });
+        }
+
+        if !self.model_errors.is_empty() {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Providers that could not be listed")
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(180, 120, 0)),
+            );
+            for e in &self.model_errors {
+                ui.label(egui::RichText::new(e).small().weak());
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new(
+                "Switching rebuilds the agent (sessions and memory are kept — they live on disk) \
+                 and persists to ~/.metis/config.json, so the CLI and gateway pick it up too. \
+                 Cloud models need their API key configured via `metis onboard`.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     fn draw_cron(&mut self, ui: &mut egui::Ui) {
@@ -522,6 +1136,19 @@ fn session_label(key: &str) -> String {
     key.split_once(':')
         .map(|(_, id)| id.to_string())
         .unwrap_or_else(|| key.to_string())
+}
+
+/// Split the agent's token-usage footer ("\n\n📊 …") off a wire reply.
+/// Session history stores replies without the footer, so it must not go
+/// into `chat_lines`; the caller surfaces it in the status line.
+fn split_usage_footer(reply: &str) -> (String, Option<String>) {
+    match reply.rfind("\n\n📊 ") {
+        Some(pos) => (
+            reply[..pos].to_string(),
+            Some(reply[pos..].trim().to_string()),
+        ),
+        None => (reply.to_string(), None),
+    }
 }
 
 fn split_session_key(key: &str) -> (String, String) {

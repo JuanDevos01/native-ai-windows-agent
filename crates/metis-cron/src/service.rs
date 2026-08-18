@@ -21,7 +21,7 @@ use metis_core::bus::queue::MessageBus;
 use metis_core::bus::types::OutboundMessage;
 
 use crate::types::{
-    compute_next_run_from, CronJob, CronStore, JobStatus, ScheduleKind,
+    compute_next_run_from, CronJob, CronSchedule, CronStore, JobStatus, ScheduleKind,
 };
 
 // ─────────────────────────────────────────────
@@ -259,7 +259,39 @@ impl CronService {
             .min()
     }
 
+    /// Next run time after a completed execution.
+    ///
+    /// For interval (`every`) schedules this anchors to the time the run was
+    /// DUE rather than the time it finished. Anchoring to completion made
+    /// every run drift later by however long the previous one took — an
+    /// hourly job that takes 3 minutes slips 3 minutes further each hour.
+    /// If the job overran one or more whole intervals, skip ahead so it does
+    /// not immediately re-fire for each missed slot.
+    fn next_run_after_execution(
+        schedule: &CronSchedule,
+        scheduled_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Option<i64> {
+        if schedule.kind != ScheduleKind::Every {
+            // Cron/At schedules are absolute — the next occurrence after now
+            // is already correct and cannot drift.
+            return compute_next_run_from(schedule, now_ms);
+        }
+        let interval = schedule.every_ms.unwrap_or(60_000).max(1);
+        let anchor = scheduled_ms.unwrap_or(now_ms);
+        let mut next = anchor.saturating_add(interval);
+        if next <= now_ms {
+            let missed = (now_ms - next) / interval + 1;
+            next = next.saturating_add(missed.saturating_mul(interval));
+        }
+        Some(next)
+    }
+
     /// Execute all due jobs.
+    ///
+    /// Runs them concurrently: they are independent, and executing them in a
+    /// blocking sequence meant a long job (browser + LLM) delayed every other
+    /// job that was due at the same moment.
     async fn execute_due_jobs(&self) {
         // Collect due job IDs (avoid holding lock during execution)
         let due_ids: Vec<String> = {
@@ -277,9 +309,7 @@ impl CronService {
 
         debug!(count = due_ids.len(), "executing due cron jobs");
 
-        for id in &due_ids {
-            self.execute_job(id, None).await;
-        }
+        futures::future::join_all(due_ids.iter().map(|id| self.execute_job(id, None))).await;
     }
 
     /// Execute a single job by ID.
@@ -301,14 +331,24 @@ impl CronService {
             }
         };
 
+        // The time this run was DUE, captured before anything can overwrite
+        // it — used to schedule the next run without drift.
+        let scheduled_ms = job.state.next_run_at_ms;
+        let started_ms = Utc::now().timestamp_millis();
+
         info!(id = %job.id, name = %job.name, "executing cron job");
 
         // Invoke callback unless this is a manual CLI run with a precomputed result.
         let result = match manual_result {
             Some(r) => Some(r),
             None => {
-                let on_job = self.on_job.lock().await;
-                if let Some(ref callback) = *on_job {
+                // Clone the callback and RELEASE the lock before awaiting it.
+                // Holding this mutex across the await serialized every cron
+                // job in the process: a slow job (browser + LLM) blocked
+                // unrelated jobs that were already due, so a task scheduled
+                // for 06:00 could be delivered an hour late.
+                let callback = { self.on_job.lock().await.clone() };
+                if let Some(callback) = callback {
                     Some(callback(job.clone()).await)
                 } else {
                     warn!(id = %id, "no on_job callback set, skipping execution");
@@ -319,6 +359,17 @@ impl CronService {
 
         // Update job state
         let now_ms = Utc::now().timestamp_millis();
+        let duration_ms = now_ms - started_ms;
+        // Lateness and duration were previously invisible: `last_run_at_ms`
+        // recorded COMPLETION, so a job that started on time but ran for an
+        // hour looked identical to one that started an hour late.
+        info!(
+            id = %job.id,
+            name = %job.name,
+            duration_ms,
+            late_by_ms = scheduled_ms.map(|s| started_ms - s).unwrap_or(0),
+            "cron job finished"
+        );
         let mut should_delete = false;
 
         {
@@ -381,7 +432,8 @@ impl CronService {
                     j.enabled = false;
                     j.state.next_run_at_ms = None;
                 } else {
-                    j.state.next_run_at_ms = compute_next_run_from(&j.schedule, now_ms);
+                    j.state.next_run_at_ms =
+                        Self::next_run_after_execution(&j.schedule, scheduled_ms, now_ms);
                 }
 
                 j.updated_at_ms = now_ms;
@@ -716,5 +768,47 @@ mod tests {
         let svc = make_service(&dir);
         // stop should not error even without start
         svc.stop().await;
+    }
+
+    #[test]
+    fn test_every_schedule_does_not_drift_with_slow_jobs() {
+        // Job due at t=1000, interval 1h, but the run took 5 minutes.
+        let hour = 3_600_000i64;
+        let schedule = CronSchedule::every(hour);
+        let scheduled = 1_000_000i64;
+        let finished = scheduled + 300_000; // +5 min
+
+        let next = CronService::next_run_after_execution(&schedule, Some(scheduled), finished)
+            .expect("interval schedule always has a next run");
+        // Anchored to when it was DUE, not when it finished: exactly one
+        // interval after the scheduled slot, so the job keeps its slot
+        // instead of sliding 5 minutes later every hour.
+        assert_eq!(next, scheduled + hour);
+    }
+
+    #[test]
+    fn test_every_schedule_skips_missed_slots() {
+        // A run that overran more than two whole intervals must not queue up
+        // a burst of immediate catch-up executions.
+        let hour = 3_600_000i64;
+        let schedule = CronSchedule::every(hour);
+        let scheduled = 1_000_000i64;
+        let finished = scheduled + (hour * 2) + 60_000;
+
+        let next = CronService::next_run_after_execution(&schedule, Some(scheduled), finished)
+            .expect("interval schedule always has a next run");
+        assert!(next > finished, "next run must be in the future");
+        assert_eq!((next - scheduled) % hour, 0, "stays on the original cadence");
+    }
+
+    #[test]
+    fn test_cron_schedule_next_is_absolute() {
+        // Cron expressions are absolute wall-clock times and must not be
+        // affected by how long the previous run took.
+        let schedule = CronSchedule::cron("0 0 11 * * *");
+        let now = chrono::Utc::now().timestamp_millis();
+        let a = CronService::next_run_after_execution(&schedule, Some(now - 60_000), now);
+        let b = compute_next_run_from(&schedule, now);
+        assert_eq!(a, b);
     }
 }

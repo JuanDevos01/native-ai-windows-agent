@@ -12,7 +12,8 @@ telegram = ["dep:teloxide", "dep:futures-util"]
 discord = ["dep:tokio-tungstenite", "dep:reqwest", "dep:url", "dep:serde", "dep:serde_json", "dep:futures-util"]
 whatsapp = ["dep:tokio-tungstenite", "dep:serde_json", "dep:futures-util"]
 slack = ["dep:tokio-tungstenite", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
-email = ["dep:lettre", "dep:mailparse", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+# Graph backend (Office 365) needs an HTTP+JSON stack as well as the IMAP/SMTP one.
+email = ["dep:lettre", "dep:mailparse", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:reqwest", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 metis-core = { workspace = true }

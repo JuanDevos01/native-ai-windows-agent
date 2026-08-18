@@ -499,6 +499,29 @@ pub struct EmailConfig {
     #[serde(default = "default_true")]
     pub imap_use_ssl: bool,
 
+    // ── Microsoft Graph settings (Office 365) ──
+    /// Backend used for mail: "imap" (default) or "graph".
+    ///
+    /// Office 365 requires "graph": Microsoft disabled Basic authentication
+    /// for IMAP/POP/SMTP in Exchange Online on 2022-10-01, so the IMAP
+    /// backend cannot authenticate against it at all (the server answers
+    /// `NO AUTHENTICATE failed`). App passwords do not help — they are
+    /// themselves Basic auth. Other providers still work fine over IMAP.
+    #[serde(default = "default_email_provider")]
+    pub provider: String,
+    /// Azure AD directory (tenant) ID.
+    #[serde(default)]
+    pub graph_tenant_id: String,
+    /// Azure AD application (client) ID.
+    #[serde(default)]
+    pub graph_client_id: String,
+    /// Azure AD client secret value.
+    #[serde(default)]
+    pub graph_client_secret: String,
+    /// Mailbox to read, as UPN or object id (e.g. "info@contoso.com").
+    #[serde(default)]
+    pub graph_user_id: String,
+
     // ── SMTP settings ──
     /// SMTP server hostname.
     #[serde(default)]
@@ -540,6 +563,10 @@ pub struct EmailConfig {
     pub allowed_users: Vec<String>,
 }
 
+fn default_email_provider() -> String {
+    "imap".to_string()
+}
+
 fn default_imap_port() -> u16 { 993 }
 fn default_smtp_port() -> u16 { 587 }
 fn default_imap_mailbox() -> String { "INBOX".to_string() }
@@ -556,6 +583,11 @@ impl Default for EmailConfig {
             imap_password: String::new(),
             imap_mailbox: "INBOX".to_string(),
             imap_use_ssl: true,
+            provider: default_email_provider(),
+            graph_tenant_id: String::new(),
+            graph_client_id: String::new(),
+            graph_client_secret: String::new(),
+            graph_user_id: String::new(),
             smtp_host: String::new(),
             smtp_port: 587,
             smtp_username: String::new(),

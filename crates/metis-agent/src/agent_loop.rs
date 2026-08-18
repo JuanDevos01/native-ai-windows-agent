@@ -2101,6 +2101,10 @@ impl AgentLoop {
         tools.register(Arc::new(crate::tools::vision::VisionTool::new(
             workspace.clone(),
         )));
+        // Exact text from PDFs (invoice amounts/dates) — see tools/pdf.rs.
+        tools.register(Arc::new(crate::tools::pdf::ReadPdfTool::new(
+            workspace.clone(),
+        )));
         // Gives the "write down what worked" instruction an actual mechanism.
         tools.register(Arc::new(crate::tools::skill_writer::SaveSkillTool::new(
             workspace.clone(),
@@ -2633,11 +2637,19 @@ impl AgentLoop {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
                 let content = self.tools.execute("read_file", params).await;
-                self.sessions
-                    .add_message(&session_key, Message::user(&msg.content));
-                self.sessions
-                    .add_message(&session_key, Message::assistant(&content));
-                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+                // Only short-circuit on success. This path bypasses the model
+                // entirely, so returning a failure here strands the request:
+                // asking to "read" a PDF hit read_file, which correctly
+                // refused and named `read_pdf`, but the user just got the
+                // error because the model never got a turn to act on it.
+                // Falling through lets it pick the right tool.
+                if !content.starts_with("Error") {
+                    self.sessions
+                        .add_message(&session_key, Message::user(&msg.content));
+                    self.sessions
+                        .add_message(&session_key, Message::assistant(&content));
+                    return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+                }
             }
         }
 
@@ -4703,10 +4715,11 @@ Write-Output "hello"
         assert!(names.contains(&"web_fetch".into()));
         assert!(names.contains(&"browser".into()));
         assert!(names.contains(&"analyze_image".into()));
+        assert!(names.contains(&"read_pdf".into()));
         assert!(names.contains(&"save_skill".into()));
         assert!(names.contains(&"message".into()));
         assert!(names.contains(&"spawn".into()));
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

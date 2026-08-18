@@ -466,7 +466,45 @@ fn configure_channels(config: &mut Config) -> Result<bool> {
         }
     }
 
-    if prompt_yn("  Configure Email (IMAP + SMTP)?", false)? {
+    if prompt_yn("  Configure Email?", false)? {
+        // Ask the backend first: Office 365 cannot use IMAP at all (Microsoft
+        // disabled Basic auth for it in Exchange Online on 2022-10-01), so
+        // sending someone down the IMAP path with an O365 mailbox guarantees
+        // "NO AUTHENTICATE failed" later.
+        println!("  Which backend?");
+        println!("    1) IMAP + SMTP  — Gmail, Fastmail, self-hosted, most providers");
+        println!("    2) Microsoft Graph — Office 365 / Outlook business (IMAP does not work there)");
+        let choice = read_line("  Choose [1]: ")?;
+        let use_graph = choice.trim() == "2";
+
+        if use_graph {
+            config.channels.email.provider = "graph".to_string();
+            println!(
+                "  {} Needs an Azure AD app registration with the APPLICATION permission",
+                "→".cyan()
+            );
+            println!("     Mail.ReadWrite (and Mail.Send to reply), with admin consent granted.");
+            config.channels.email.graph_tenant_id =
+                read_line("  Directory (tenant) ID: ")?;
+            config.channels.email.graph_client_id =
+                read_line("  Application (client) ID: ")?;
+            config.channels.email.graph_client_secret =
+                read_line("  Client secret value: ")?;
+            config.channels.email.graph_user_id =
+                read_line("  Mailbox to read (e.g. info@yourdomain.com): ")?;
+            let folder = read_line("  Folder [Inbox]: ")?;
+            if !folder.is_empty() {
+                config.channels.email.imap_mailbox = folder;
+            }
+            let allow = read_line("  Allowed sender emails (comma-separated, Enter = any): ")?;
+            if !allow.is_empty() {
+                config.channels.email.allowed_users =
+                    allow.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            println!("  {} Email channel saved (Microsoft Graph)", "✓".green());
+            return Ok(true);
+        }
+
         let imap_host = read_line("  IMAP host (e.g. imap.gmail.com): ")?;
         if !imap_host.is_empty() {
             config.channels.email.imap_host = imap_host.clone();

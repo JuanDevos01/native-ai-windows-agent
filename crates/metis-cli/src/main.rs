@@ -140,7 +140,25 @@ enum Commands {
 // Entrypoint
 // ─────────────────────────────────────────────
 
+/// Select the TLS backend explicitly, before any network code runs.
+///
+/// rustls 0.23 refuses to pick a `CryptoProvider` on its own unless exactly
+/// one provider feature is compiled in, and *panics on the first TLS
+/// handshake* otherwise — killing a worker thread mid-request rather than
+/// failing at startup. Which providers end up compiled in depends on the
+/// feature combination: enabling the `email` channel pulls `aws-lc-rs` into
+/// the graph, while other builds get `ring`, and reqwest can select its
+/// `-no-provider` variants and leave none registered at all. Installing one
+/// here makes every build behave the same regardless of channel features.
+///
+/// Ignores the error: a provider may already be installed, which is fine.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn main() -> Result<()> {
+    install_crypto_provider();
+
     let cli = Cli::parse();
 
     // Desktop runs its own tokio runtime for background agent calls and blocks on

@@ -133,8 +133,54 @@ impl Tool for ReadFileTool {
         // agent still inspect the file instead of falling back to shell commands.
         let bytes = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+
+        // Refuse binary formats instead of emitting a screenful of mojibake.
+        // A PDF or JPEG decoded lossily looks like text to the model, which
+        // then tries to answer from the garbage — the reason "it cannot read
+        // the invoice" looked like a model failure when it was really the
+        // wrong tool being used. Point at the right one.
+        if let Some(hint) = binary_format_hint(&path, &bytes) {
+            anyhow::bail!("{hint}");
+        }
+
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+/// Identify binary files that must not be dumped as lossy text, returning a
+/// message naming the tool that CAN read them. Detection is by magic bytes
+/// first (extension can lie), then by NUL bytes, which never appear in real
+/// text files but are everywhere in binary formats.
+fn binary_format_hint(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
+    let name = path.display().to_string();
+    let starts = |sig: &[u8]| bytes.len() >= sig.len() && &bytes[..sig.len()] == sig;
+
+    if starts(b"%PDF") {
+        return Some(format!(
+            "{name} is a PDF. read_file returns binary garbage for it. Use the `read_pdf` tool              instead - it extracts the real text, which is what you need for exact amounts and dates."
+        ));
+    }
+    // JPEG / PNG / GIF / BMP magic numbers - an extension can lie, these do not.
+    let png = [0x89u8, b'P', b'N', b'G'];
+    if starts(&[0xFFu8, 0xD8, 0xFF]) || starts(&png) || starts(b"GIF8") || starts(b"BM") {
+        return Some(format!(
+            "{name} is an image. Use the `analyze_image` tool instead - read_file cannot see pictures."
+        ));
+    }
+    if starts(&[0x50u8, 0x4B, 0x03, 0x04]) {
+        return Some(format!(
+            "{name} is a zip-based file (zip/docx/xlsx/pptx). read_file cannot decode it; unzip it              with the exec tool first, or ask the user for a text export."
+        ));
+    }
+    // Generic binary: a NUL byte in the first 8KB. Real text files do not
+    // contain NUL; virtually every binary format does.
+    let window = &bytes[..bytes.len().min(8192)];
+    if window.contains(&0) {
+        return Some(format!(
+            "{name} appears to be a binary file (contains NUL bytes), so it cannot be read as text.              Do not try to interpret it - tell the user what kind of file it is, or use a tool that              understands the format."
+        ));
+    }
+    None
 }
 
 // ─────────────────────────────────────────────
@@ -597,5 +643,37 @@ mod tests {
             assert_eq!(def.tool_type, "function");
             assert!(!def.function.description.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_binary_and_names_the_right_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadFileTool::new(None);
+
+        // A PDF must point at read_pdf, not dump mojibake. This is the exact
+        // failure behind "the agent cannot read my invoice".
+        let pdf = dir.path().join("invoice.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7
+1 0 obj
+<</Type/Catalog>>").unwrap();
+        let mut p = HashMap::new();
+        p.insert("path".into(), Value::String(pdf.display().to_string()));
+        let err = tool.execute(p).await.unwrap_err().to_string();
+        assert!(err.contains("read_pdf"), "got: {err}");
+
+        // An image must point at analyze_image.
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A]).unwrap();
+        let mut p = HashMap::new();
+        p.insert("path".into(), Value::String(png.display().to_string()));
+        let err = tool.execute(p).await.unwrap_err().to_string();
+        assert!(err.contains("analyze_image"), "got: {err}");
+
+        // Plain text still reads normally.
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "hello world").unwrap();
+        let mut p = HashMap::new();
+        p.insert("path".into(), Value::String(txt.display().to_string()));
+        assert_eq!(tool.execute(p).await.unwrap(), "hello world");
     }
 }

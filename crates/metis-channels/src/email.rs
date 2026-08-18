@@ -300,6 +300,14 @@ impl ImapClient {
 // ─────────────────────────────────────────────
 
 /// Email channel — IMAP polling for inbound, SMTP for outbound.
+
+/// True when the email channel should talk to Microsoft Graph rather than
+/// IMAP/SMTP. Office 365 has no working IMAP path (Basic auth was disabled
+/// in Exchange Online on 2022-10-01), so Graph is the only option there.
+fn config_uses_graph(cfg: &EmailConfig) -> bool {
+    cfg.provider.trim().eq_ignore_ascii_case("graph")
+}
+
 pub struct EmailChannel {
     /// Full config.
     config: EmailConfig,
@@ -313,11 +321,16 @@ pub struct EmailChannel {
     last_subject: Arc<RwLock<HashMap<String, String>>>,
     /// Last inbound Message-ID per sender (for In-Reply-To).
     last_message_id: Arc<RwLock<HashMap<String, String>>>,
+    /// Graph client, used instead of IMAP/SMTP when provider = "graph".
+    graph: Option<crate::graph_mail::GraphMailClient>,
+    /// Graph message id per sender, so a reply stays on the same thread.
+    last_graph_id: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl EmailChannel {
     /// Create a new email channel.
     pub fn new(config: EmailConfig, bus: Arc<MessageBus>) -> Self {
+        let cfg_for_graph = config.clone();
         Self {
             config,
             bus,
@@ -325,6 +338,17 @@ impl EmailChannel {
             processed_uids: Arc::new(Mutex::new(HashSet::new())),
             last_subject: Arc::new(RwLock::new(HashMap::new())),
             last_message_id: Arc::new(RwLock::new(HashMap::new())),
+            graph: if config_uses_graph(&cfg_for_graph) {
+                Some(crate::graph_mail::GraphMailClient::new(
+                    cfg_for_graph.graph_tenant_id.clone(),
+                    cfg_for_graph.graph_client_id.clone(),
+                    cfg_for_graph.graph_client_secret.clone(),
+                    cfg_for_graph.graph_user_id.clone(),
+                ))
+            } else {
+                None
+            },
+            last_graph_id: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -665,6 +689,113 @@ impl EmailChannel {
     }
 
     // ─────────────────────────────────────────
+    // Microsoft Graph polling / sending (Office 365)
+    // ─────────────────────────────────────────
+
+    /// Poll Graph once: list unread → publish → mark read.
+    ///
+    /// Mirrors `poll_once` but over REST. Marking read is what stops a
+    /// message being reprocessed, so it is only done after the message has
+    /// been handed to the bus.
+    async fn poll_once_graph(&self) -> anyhow::Result<()> {
+        let Some(graph) = self.graph.as_ref() else {
+            return Ok(());
+        };
+        let messages = graph.fetch_unread(&self.config.imap_mailbox, 20).await?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        debug!(count = messages.len(), "graph: unread messages");
+
+        for m in messages {
+            let sender = Self::extract_sender_email(&m.from);
+            if !self.is_allowed(&sender) {
+                warn!(sender = %sender, "email sender not in allow-list");
+                // Still mark read, or it is re-fetched every poll forever.
+                if self.config.mark_seen {
+                    let _ = graph.mark_read(&m.id).await;
+                }
+                continue;
+            }
+
+            let body = if m.body.trim_start().starts_with("<html>") {
+                Self::html_to_text(&m.body)
+            } else {
+                m.body.clone()
+            };
+            let body = Self::truncate(&body, self.config.max_body_chars as usize);
+
+            {
+                let mut subjects = self.last_subject.write().await;
+                subjects.insert(sender.clone(), m.subject.clone());
+            }
+            {
+                let mut ids = self.last_graph_id.write().await;
+                ids.insert(sender.clone(), m.id.clone());
+            }
+
+            let content = format!(
+                "Email received.
+From: {}
+Subject: {}
+
+{}",
+                sender, m.subject, body
+            );
+            let mut metadata = HashMap::new();
+            metadata.insert("subject".to_string(), m.subject.clone());
+            metadata.insert("sender_email".to_string(), sender.clone());
+            metadata.insert("graph_message_id".to_string(), m.id.clone());
+
+            let inbound = InboundMessage {
+                sender_id: sender.clone(),
+                chat_id: sender.clone(),
+                channel: "email".to_string(),
+                content,
+                timestamp: chrono::Utc::now(),
+                media: Vec::new(),
+                metadata,
+            };
+            if let Err(e) = self.bus.publish_inbound(inbound).await {
+                error!(error = %e, "failed to publish email inbound");
+                continue; // leave unread so it is retried
+            }
+
+            if self.config.mark_seen {
+                if let Err(e) = graph.mark_read(&m.id).await {
+                    warn!(error = %e, "failed to mark graph message read");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Send via Graph — replying in-thread when the recipient's last message
+    /// id is known, otherwise sending a fresh mail.
+    async fn send_email_graph(&self, msg: &OutboundMessage) -> anyhow::Result<()> {
+        let Some(graph) = self.graph.as_ref() else {
+            anyhow::bail!("graph client not configured");
+        };
+        let reply_to_id = {
+            let ids = self.last_graph_id.read().await;
+            ids.get(&msg.chat_id).cloned()
+        };
+        match reply_to_id {
+            Some(id) => graph.reply(&id, &msg.content).await,
+            None => {
+                let subject = {
+                    let subjects = self.last_subject.read().await;
+                    subjects
+                        .get(&msg.chat_id)
+                        .map(|s| Self::build_reply_subject(s, &self.config.subject_prefix))
+                        .unwrap_or_else(|| "Message from Metis".to_string())
+                };
+                graph.send_mail(&msg.chat_id, &subject, &msg.content).await
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────
     // SMTP sending
     // ─────────────────────────────────────────
 
@@ -770,7 +901,24 @@ impl Channel for EmailChannel {
     }
 
     async fn start(&self) -> anyhow::Result<()> {
-        if !self.validate_imap_config() {
+        let use_graph = config_uses_graph(&self.config);
+        if use_graph {
+            match self.graph.as_ref() {
+                Some(g) if g.is_configured() => {}
+                _ => {
+                    warn!(
+                        "email channel not starting: provider=graph but graph_tenant_id /                          graph_client_id / graph_client_secret / graph_user_id are incomplete"
+                    );
+                    return Ok(());
+                }
+            }
+            info!(
+                mailbox = %self.config.imap_mailbox,
+                user = %self.config.graph_user_id,
+                poll_secs = self.poll_interval().as_secs(),
+                "starting email channel (Microsoft Graph)"
+            );
+        } else if !self.validate_imap_config() {
             warn!("email channel not starting: missing IMAP config");
             return Ok(());
         }
@@ -787,7 +935,12 @@ impl Channel for EmailChannel {
 
         loop {
             // Poll for new emails
-            if let Err(e) = self.poll_once().await {
+            let polled = if use_graph {
+                self.poll_once_graph().await
+            } else {
+                self.poll_once().await
+            };
+            if let Err(e) = polled {
                 warn!(error = %e, "email poll error (will retry)");
             }
 
@@ -809,7 +962,11 @@ impl Channel for EmailChannel {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> anyhow::Result<()> {
-        self.send_email(msg).await
+        if config_uses_graph(&self.config) {
+            self.send_email_graph(msg).await
+        } else {
+            self.send_email(msg).await
+        }
     }
 }
 
@@ -833,6 +990,11 @@ mod tests {
             smtp_port: 587,
             smtp_username: "user@example.com".into(),
             smtp_password: "password".into(),
+            provider: "imap".to_string(),
+            graph_tenant_id: String::new(),
+            graph_client_id: String::new(),
+            graph_client_secret: String::new(),
+            graph_user_id: String::new(),
             smtp_use_tls: true,
             smtp_use_ssl: false,
             from_address: "bot@example.com".into(),
