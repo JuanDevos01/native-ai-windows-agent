@@ -27,6 +27,8 @@ pub enum SettingsAction {
     None,
     Save,
     Reload,
+    /// Launch the Azure app-registration script for the Graph backend.
+    RunGraphSetup,
 }
 
 /// Editable mirror of the parts of `MetisConfig` worth exposing in a GUI.
@@ -502,10 +504,37 @@ pub fn draw(
                             .small()
                             .color(WARN),
                     );
+                    text_field(ui, "Mailbox", &mut form.email_graph_user_id, 320.0, "info@yourdomain.com");
+                    // The three values below all come from an Azure app
+                    // registration, so offer to create one rather than
+                    // leaving the user to find the script themselves. The
+                    // script needs the mailbox as an argument, so it is only
+                    // offered once that field is filled in.
+                    let have_mailbox = !form.email_graph_user_id.trim().is_empty();
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(have_mailbox, |ui| {
+                            if ui
+                                .button("➕  Create Azure app…")
+                                .on_hover_text(
+                                    "Opens a PowerShell window that registers the Azure AD app,                                      grants the mail permissions, scopes them to this mailbox, and                                      writes the values into config.json. You sign in there.",
+                                )
+                                .clicked()
+                            {
+                                action = SettingsAction::RunGraphSetup;
+                            }
+                        });
+                        if !have_mailbox {
+                            ui.label(
+                                egui::RichText::new("enter the mailbox first")
+                                    .small()
+                                    .color(WARN),
+                            );
+                        }
+                    });
+                    ui.add_space(4.0);
                     text_field(ui, "Tenant id", &mut form.email_graph_tenant_id, 320.0, "");
                     text_field(ui, "Client id", &mut form.email_graph_client_id, 320.0, "");
                     secret_field(ui, "gr_secret", "Client secret", &mut form.email_graph_client_secret, reveal);
-                    text_field(ui, "Mailbox", &mut form.email_graph_user_id, 320.0, "info@yourdomain.com");
                     text_field(ui, "Folder", &mut form.email_imap_mailbox, 200.0, "Inbox");
                 } else {
                     text_field(ui, "IMAP host", &mut form.email_imap_host, 260.0, "imap.gmail.com");

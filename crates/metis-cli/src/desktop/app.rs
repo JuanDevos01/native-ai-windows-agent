@@ -875,6 +875,84 @@ impl MetisDesktopApp {
         std::fs::copy(&path, &backup).ok().map(|_| backup)
     }
 
+    /// Locate `setup-o365-graph.ps1`. The binary can be run from a dev
+    /// checkout (`target/debug/metis.exe`) or copied somewhere with the
+    /// scripts alongside it, so check the plausible layouts rather than
+    /// assuming a fixed path.
+    fn find_setup_script() -> Option<std::path::PathBuf> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut dir = exe.parent().map(|p| p.to_path_buf());
+            // exe dir, then up a few levels for target/debug|release layouts.
+            for _ in 0..4 {
+                match dir {
+                    Some(d) => {
+                        roots.push(d.clone());
+                        dir = d.parent().map(|p| p.to_path_buf());
+                    }
+                    None => break,
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+        for r in roots {
+            for candidate in [
+                r.join("scripts").join("setup-o365-graph.ps1"),
+                r.join("setup-o365-graph.ps1"),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// Launch the Azure setup script in its own console window.
+    ///
+    /// Deliberately a separate visible window rather than a captured child
+    /// process: the script requires an interactive Microsoft sign-in (with
+    /// MFA) and prints a client secret exactly once, both of which the user
+    /// has to see and act on. `-NoExit` keeps the window open afterwards so
+    /// the output survives long enough to read.
+    fn run_graph_setup(&mut self) {
+        let mailbox = self.settings.email_graph_user_id.trim().to_string();
+        if mailbox.is_empty() {
+            self.settings_status = "Enter the mailbox first.".to_string();
+            return;
+        }
+        let Some(script) = Self::find_setup_script() else {
+            self.settings_status =
+                "Could not find scripts/setup-o365-graph.ps1 next to the Metis binary.                  Run it manually from the repo."
+                    .to_string();
+            return;
+        };
+
+        let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
+        let result = std::process::Command::new(shell)
+            .args([
+                "-NoExit",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Mailbox")
+            .arg(&mailbox)
+            .arg("-WriteConfig")
+            .spawn();
+
+        self.settings_status = match result {
+            Ok(_) => format!(
+                "Setup running in a new PowerShell window for {mailbox}. Sign in there, then click                  “Reload from disk” to pull in the tenant/client/secret it saves."
+            ),
+            Err(e) => format!("Could not start {shell}: {e}"),
+        };
+    }
+
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         if self.show_first_run {
             egui::Frame::none()
@@ -930,6 +1008,7 @@ impl MetisDesktopApp {
                 self.settings_reveal.clear();
                 self.settings_status = "Reloaded from config.json.".to_string();
             }
+            super::settings::SettingsAction::RunGraphSetup => self.run_graph_setup(),
             super::settings::SettingsAction::None => {}
         }
     }
@@ -1255,4 +1334,24 @@ pub fn run(logs: bool) -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("desktop GUI error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_script_is_locatable_from_the_binary() {
+        // The button is useless if the script cannot be found from wherever
+        // the binary sits. The test binary lives deeper (target/debug/deps),
+        // so finding it from there also covers the normal exe location.
+        let found = MetisDesktopApp::find_setup_script();
+        assert!(
+            found.is_some(),
+            "setup-o365-graph.ps1 not found by walking up from the test binary"
+        );
+        let p = found.unwrap();
+        assert!(p.ends_with("setup-o365-graph.ps1"));
+        assert!(p.is_file());
+    }
 }
