@@ -89,12 +89,33 @@ $GraphAppId = "00000003-0000-0000-c000-000000000000"
 $WantedRoles = @("Mail.ReadWrite", "Mail.Send")
 
 # ── 1. Modules ────────────────────────────────────────────────────────────
+# Install-Module normally stops to ask two questions the first time it is
+# used on a machine: whether to install the NuGet provider, and whether to
+# trust PSGallery. Both are answered here so the script can run start to
+# finish without babysitting - the only prompt left is the sign-in itself.
 Write-Step "Checking PowerShell modules"
+
+# Older PowerShell defaults to TLS 1.0, which the gallery refuses.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+
+if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+    Write-Warn "Installing the NuGet package provider (needed to fetch modules)"
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+}
+$gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+if ($gallery -and $gallery.InstallationPolicy -ne 'Trusted') {
+    Write-Warn "Trusting PSGallery for this user so module installs do not prompt"
+    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+}
+
 $needed = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Applications")
 foreach ($m in $needed) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
         Write-Warn "$m not found - installing for the current user (no admin rights needed)"
-        Install-Module $m -Scope CurrentUser -Force -AllowClobber
+        Install-Module $m -Scope CurrentUser -Force -AllowClobber -Confirm:$false
     }
     Import-Module $m -ErrorAction Stop
     Write-Ok $m
@@ -191,7 +212,7 @@ if ($SkipMailboxRestriction) {
     Write-Step "Restricting the app to $Mailbox only"
     if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
         Write-Warn "ExchangeOnlineManagement not found - installing for the current user"
-        Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber
+        Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -Confirm:$false
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
     Connect-ExchangeOnline -ShowBanner:$false

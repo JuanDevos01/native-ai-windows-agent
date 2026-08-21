@@ -875,7 +875,29 @@ impl MetisDesktopApp {
         std::fs::copy(&path, &backup).ok().map(|_| backup)
     }
 
-    /// Locate `setup-o365-graph.ps1`. The binary can be run from a dev
+    /// The setup script, compiled into the binary.
+    ///
+    /// Deployments are frequently just `metis.exe` copied to another machine
+    /// with no repo alongside it, which left the button dead with "could not
+    /// find the script". Embedding it means the feature travels with the
+    /// binary; an on-disk copy still wins so local edits are respected.
+    const SETUP_SCRIPT: &'static str =
+        include_str!("../../../../scripts/setup-o365-graph.ps1");
+
+    /// Path to the script to run: a real file next to the binary if there is
+    /// one, otherwise the embedded copy written to a temp file.
+    fn resolve_setup_script() -> std::io::Result<std::path::PathBuf> {
+        if let Some(found) = Self::find_setup_script() {
+            return Ok(found);
+        }
+        let dir = std::env::temp_dir().join("metis-setup");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("setup-o365-graph.ps1");
+        std::fs::write(&path, Self::SETUP_SCRIPT)?;
+        Ok(path)
+    }
+
+    /// Locate `setup-o365-graph.ps1` on disk. The binary can be run from a dev
     /// checkout (`target/debug/metis.exe`) or copied somewhere with the
     /// scripts alongside it, so check the plausible layouts rather than
     /// assuming a fixed path.
@@ -923,27 +945,41 @@ impl MetisDesktopApp {
             self.settings_status = "Enter the mailbox first.".to_string();
             return;
         }
-        let Some(script) = Self::find_setup_script() else {
-            self.settings_status =
-                "Could not find scripts/setup-o365-graph.ps1 next to the Metis binary.                  Run it manually from the repo."
-                    .to_string();
-            return;
+        let script = match Self::resolve_setup_script() {
+            Ok(p) => p,
+            Err(e) => {
+                self.settings_status = format!("Could not prepare the setup script: {e}");
+                return;
+            }
         };
 
         let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
-        let result = std::process::Command::new(shell)
-            .args([
-                "-NoExit",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&script)
-            .arg("-Mailbox")
-            .arg(&mailbox)
-            .arg("-WriteConfig")
-            .spawn();
+        let mut cmd = std::process::Command::new(shell);
+        cmd.args([
+            "-NoExit",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .arg("-Mailbox")
+        .arg(&mailbox)
+        .arg("-WriteConfig");
+
+        // Without CREATE_NEW_CONSOLE the child inherits this process's
+        // console, so when Metis was itself started from a terminal the
+        // script's prompts and output land in that same window mixed with
+        // Metis' logs. The script is interactive (sign-in, one-time secret),
+        // so it needs a window of its own.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            cmd.creation_flags(CREATE_NEW_CONSOLE);
+        }
+
+        let result = cmd.spawn();
 
         self.settings_status = match result {
             Ok(_) => format!(
@@ -1353,5 +1389,25 @@ mod tests {
         let p = found.unwrap();
         assert!(p.ends_with("setup-o365-graph.ps1"));
         assert!(p.is_file());
+    }
+
+    #[test]
+    fn embedded_script_is_the_real_script() {
+        // The button must work on a machine that has only metis.exe, so the
+        // script is compiled in. Guard against it being empty or truncated.
+        let s = MetisDesktopApp::SETUP_SCRIPT;
+        assert!(s.len() > 2000, "embedded script looks truncated: {} bytes", s.len());
+        assert!(s.contains("param("), "missing param block");
+        assert!(s.contains("-Mailbox") || s.contains("$Mailbox"), "missing Mailbox param");
+        assert!(s.contains("Connect-MgGraph"), "missing the sign-in step");
+        assert!(s.contains("Install-PackageProvider"), "missing the NuGet bootstrap");
+    }
+
+    #[test]
+    fn resolve_setup_script_always_yields_a_runnable_file() {
+        let p = MetisDesktopApp::resolve_setup_script().expect("must resolve");
+        assert!(p.is_file());
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("Connect-MgGraph"));
     }
 }
