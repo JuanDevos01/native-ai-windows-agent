@@ -73,7 +73,11 @@ param(
 
     [switch]$WriteConfig,
     [switch]$SkipConsent,
-    [switch]$SkipMailboxRestriction
+    [switch]$SkipMailboxRestriction,
+
+    # Set automatically when the script relaunches itself after upgrading
+    # PowerShellGet. Not meant to be passed by hand.
+    [switch]$Bootstrapped
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,10 +93,11 @@ $GraphAppId = "00000003-0000-0000-c000-000000000000"
 $WantedRoles = @("Mail.ReadWrite", "Mail.Send")
 
 # ── 1. Modules ────────────────────────────────────────────────────────────
-# Install-Module normally stops to ask two questions the first time it is
-# used on a machine: whether to install the NuGet provider, and whether to
-# trust PSGallery. Both are answered here so the script can run start to
-# finish without babysitting - the only prompt left is the sign-in itself.
+# Windows ships PowerShell 5.1 with PowerShellGet 1.0.0.1 (2016). That version
+# cannot install the Microsoft.Graph modules: Install-Module returns without
+# error and installs nothing, so the next Import-Module fails with "no valid
+# module file was found". It has to be upgraded first, and a module upgrade
+# only takes effect in a NEW session - hence the one-time relaunch below.
 Write-Step "Checking PowerShell modules"
 
 # Older PowerShell defaults to TLS 1.0, which the gallery refuses.
@@ -101,14 +106,49 @@ try {
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch {}
 
+# -ForceBootstrap answers the "Would you like PackageManagement to install
+# 'nuget' now?" prompt; -Force alone does not suppress it.
 if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-    Write-Warn "Installing the NuGet package provider (needed to fetch modules)"
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+    Write-Warn "Installing the NuGet package provider"
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 `
+        -Scope CurrentUser -Force -ForceBootstrap | Out-Null
+    # Load it into THIS session; a provider installed mid-session is not
+    # picked up automatically, which makes the next Install-Module a no-op.
+    Import-PackageProvider -Name NuGet -Force | Out-Null
 }
+
 $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
 if ($gallery -and $gallery.InstallationPolicy -ne 'Trusted') {
     Write-Warn "Trusting PSGallery for this user so module installs do not prompt"
     Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+}
+
+$pgVersion = (Get-Module PowerShellGet -ListAvailable |
+              Sort-Object Version -Descending | Select-Object -First 1).Version
+Write-Ok "PowerShell $($PSVersionTable.PSVersion), PowerShellGet $pgVersion"
+
+if ($pgVersion -lt [version]'2.0.0') {
+    if ($Bootstrapped) {
+        throw ("PowerShellGet is still $pgVersion after an upgrade attempt. " +
+               "Install it manually with: Install-Module PowerShellGet -Force -AllowClobber " +
+               "-Scope CurrentUser -SkipPublisherCheck, then reopen PowerShell and re-run this script.")
+    }
+    Write-Warn "PowerShellGet $pgVersion is too old to install the Microsoft.Graph modules - upgrading"
+    Install-Module PowerShellGet -MinimumVersion 2.2.5 -Scope CurrentUser `
+        -Force -AllowClobber -SkipPublisherCheck -Confirm:$false
+    Write-Ok "PowerShellGet upgraded"
+
+    # The upgrade is only visible to a fresh session, so start one and hand
+    # over. Forwarding the original arguments keeps this invisible to the user.
+    Write-Step "Reopening PowerShell to finish setup (the old session cannot see the upgrade)"
+    $fwd = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+             '-Mailbox', $Mailbox, '-AppName', $AppName, '-SecretYears', $SecretYears, '-Bootstrapped')
+    if ($WriteConfig)            { $fwd += '-WriteConfig' }
+    if ($SkipConsent)            { $fwd += '-SkipConsent' }
+    if ($SkipMailboxRestriction) { $fwd += '-SkipMailboxRestriction' }
+    Start-Process powershell -ArgumentList $fwd
+    Write-Ok "Continue in the new window - this one is done."
+    return
 }
 
 $needed = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Applications")
@@ -116,6 +156,13 @@ foreach ($m in $needed) {
     if (-not (Get-Module -ListAvailable -Name $m)) {
         Write-Warn "$m not found - installing for the current user (no admin rights needed)"
         Install-Module $m -Scope CurrentUser -Force -AllowClobber -Confirm:$false
+    }
+    # Verify rather than trust: a silent no-op here is exactly the failure
+    # this section exists to prevent.
+    if (-not (Get-Module -ListAvailable -Name $m)) {
+        throw ("$m did not install. PowerShell $($PSVersionTable.PSVersion), " +
+               "PowerShellGet $pgVersion, module path '$($env:PSModulePath -split ';' | Select-Object -First 1)'. " +
+               "Try: Install-Module $m -Scope CurrentUser -Force -AllowClobber -Verbose")
     }
     Import-Module $m -ErrorAction Stop
     Write-Ok $m

@@ -92,6 +92,15 @@ pub struct MetisDesktopApp {
     show_first_run: bool,
 }
 
+
+/// True when `pwsh` (PowerShell 7+) is on PATH.
+fn which_pwsh() -> bool {
+    let exe = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+    std::env::var("PATH")
+        .map(|path| std::env::split_paths(&path).any(|d| d.join(exe).is_file()))
+        .unwrap_or(false)
+}
+
 impl MetisDesktopApp {
     fn new(
         config: DesktopConfig,
@@ -953,7 +962,17 @@ impl MetisDesktopApp {
             }
         };
 
-        let shell = if cfg!(windows) { "powershell" } else { "pwsh" };
+        // Prefer PowerShell 7 when it is installed: Windows PowerShell 5.1
+        // ships PowerShellGet 1.0.0.1, which cannot install the
+        // Microsoft.Graph modules and fails silently, so the script has to
+        // upgrade it and relaunch. pwsh skips that whole detour.
+        let shell = if which_pwsh() {
+            "pwsh"
+        } else if cfg!(windows) {
+            "powershell"
+        } else {
+            "pwsh"
+        };
         let mut cmd = std::process::Command::new(shell);
         cmd.args([
             "-NoExit",
