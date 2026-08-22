@@ -92,6 +92,61 @@ $GraphAppId = "00000003-0000-0000-c000-000000000000"
 # time so a mistyped/stale GUID cannot silently grant the wrong permission.
 $WantedRoles = @("Mail.ReadWrite", "Mail.Send")
 
+# Rebuild this script's own arguments, for the two places that hand over to a
+# fresh PowerShell session.
+function Get-ForwardArgs {
+    param([switch]$MarkBootstrapped)
+    $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+           '-Mailbox', $Mailbox, '-AppName', $AppName, '-SecretYears', $SecretYears)
+    if ($WriteConfig)            { $a += '-WriteConfig' }
+    if ($SkipConsent)            { $a += '-SkipConsent' }
+    if ($SkipMailboxRestriction) { $a += '-SkipMailboxRestriction' }
+    if ($MarkBootstrapped)       { $a += '-Bootstrapped' }
+    return $a
+}
+
+# ── 0. PowerShell edition ─────────────────────────────────────────────────
+# Everything downstream depends on this. Windows PowerShell 5.1 ships
+# PowerShellGet 1.0.0.1, which cannot install the Microsoft.Graph modules and
+# fails *silently* while doing it. PowerShell 7 ships a current one, so check
+# for it before anything else and either use it or say plainly what to install.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($pwshCmd) {
+        Write-Step "PowerShell 7 found - continuing there (5.1 cannot install the Graph modules)"
+        Start-Process pwsh -ArgumentList (Get-ForwardArgs)
+        Write-Ok "Continue in the new PowerShell 7 window - this one is done."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  ------------------------------------------------------------------" -ForegroundColor Yellow
+    Write-Host "   PowerShell 7 is not installed." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "   You are on Windows PowerShell $($PSVersionTable.PSVersion), which ships"
+    Write-Host "   PowerShellGet 1.0.0.1 - too old to install the Microsoft.Graph"
+    Write-Host "   modules this script needs."
+    Write-Host ""
+    Write-Host "   RECOMMENDED - install PowerShell 7, then re-run this script:" -ForegroundColor Cyan
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Host "       winget install --id Microsoft.PowerShell --source winget" -ForegroundColor Cyan
+    } else {
+        Write-Host "       https://aka.ms/powershell-release?tag=stable" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Host "   Otherwise this script will upgrade PowerShellGet here and reopen"
+    Write-Host "   a second window to finish. That works, but takes longer and"
+    Write-Host "   changes your PowerShell module setup."
+    Write-Host "  ------------------------------------------------------------------" -ForegroundColor Yellow
+    Write-Host ""
+    $ans = Read-Host "  Continue without PowerShell 7? [y/N]"
+    if ($ans -notmatch '^(y|yes)$') {
+        Write-Host ""
+        Write-Ok "Stopped. Install PowerShell 7 with the command above, then run this script again."
+        return
+    }
+}
+
 # ── 1. Modules ────────────────────────────────────────────────────────────
 # Windows ships PowerShell 5.1 with PowerShellGet 1.0.0.1 (2016). That version
 # cannot install the Microsoft.Graph modules: Install-Module returns without
@@ -141,12 +196,7 @@ if ($pgVersion -lt [version]'2.0.0') {
     # The upgrade is only visible to a fresh session, so start one and hand
     # over. Forwarding the original arguments keeps this invisible to the user.
     Write-Step "Reopening PowerShell to finish setup (the old session cannot see the upgrade)"
-    $fwd = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-             '-Mailbox', $Mailbox, '-AppName', $AppName, '-SecretYears', $SecretYears, '-Bootstrapped')
-    if ($WriteConfig)            { $fwd += '-WriteConfig' }
-    if ($SkipConsent)            { $fwd += '-SkipConsent' }
-    if ($SkipMailboxRestriction) { $fwd += '-SkipMailboxRestriction' }
-    Start-Process powershell -ArgumentList $fwd
+    Start-Process powershell -ArgumentList (Get-ForwardArgs -MarkBootstrapped)
     Write-Ok "Continue in the new window - this one is done."
     return
 }
