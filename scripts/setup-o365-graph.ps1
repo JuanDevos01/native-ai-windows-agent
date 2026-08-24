@@ -94,10 +94,23 @@ $WantedRoles = @("Mail.ReadWrite", "Mail.Send")
 
 # Rebuild this script's own arguments, for the two places that hand over to a
 # fresh PowerShell session.
+function Format-Arg {
+    # Start-Process joins -ArgumentList with spaces and does no quoting, so a
+    # value containing one arrives as two tokens: the default app name
+    # "Metis Mail" bound "Metis" to -AppName and left "Mail" as a stray
+    # positional ("A positional parameter cannot be found..."). Paths under
+    # "Program Files" break the same way.
+    param([string]$Value)
+    if ($Value -match '\s') { '"' + $Value + '"' } else { $Value }
+}
+
 function Get-ForwardArgs {
     param([switch]$MarkBootstrapped)
-    $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-           '-Mailbox', $Mailbox, '-AppName', $AppName, '-SecretYears', $SecretYears)
+    $a = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+           '-File',        (Format-Arg $PSCommandPath),
+           '-Mailbox',     (Format-Arg $Mailbox),
+           '-AppName',     (Format-Arg $AppName),
+           '-SecretYears', $SecretYears)
     if ($WriteConfig)            { $a += '-WriteConfig' }
     if ($SkipConsent)            { $a += '-SkipConsent' }
     if ($SkipMailboxRestriction) { $a += '-SkipMailboxRestriction' }
