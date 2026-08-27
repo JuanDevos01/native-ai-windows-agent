@@ -35,6 +35,10 @@ pub enum SettingsAction {
     SendTestEmail,
     /// Write a troubleshooting report to disk.
     WriteDiagnostics,
+    /// Re-apply permissions + mailbox scoping to the existing Azure app.
+    RepairGraphAccess,
+    /// Open the admin-consent page for the configured app.
+    OpenAdminConsent,
 }
 
 /// Editable mirror of the parts of `MetisConfig` worth exposing in a GUI.
@@ -624,6 +628,36 @@ pub fn draw(
                         action = SettingsAction::WriteDiagnostics;
                     }
                 });
+                if form.email_provider == "graph" {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("🔐  Grant admin consent")
+                            .on_hover_text(
+                                "Opens the Microsoft consent page for this app. Fixes \"the token \
+                                 carries no permissions\". Requires a tenant administrator.",
+                            )
+                            .clicked()
+                        {
+                            action = SettingsAction::OpenAdminConsent;
+                        }
+                        if ui
+                            .button("🔧  Repair access")
+                            .on_hover_text(
+                                "Re-applies the mail permissions, admin consent and mailbox \
+                                 scoping to the SAME Azure app. Keeps your existing secret — \
+                                 nothing in config.json changes.",
+                            )
+                            .clicked()
+                        {
+                            action = SettingsAction::RepairGraphAccess;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Access denied? Run Check connection first — it says which of these to use.")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.label("Send test to");
                     ui.add(

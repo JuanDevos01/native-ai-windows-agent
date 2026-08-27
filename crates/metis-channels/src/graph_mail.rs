@@ -165,10 +165,31 @@ impl GraphMailClient {
         format!("https://graph.microsoft.com/v1.0/users/{}", self.user_id)
     }
 
+    /// Map an IMAP-style folder name onto Graph's well-known name.
+    ///
+    /// The config field is shared with the IMAP backend, whose default is
+    /// "INBOX"; Graph expects "inbox". Anything unrecognised is passed
+    /// through so custom folders still work.
+    fn graph_folder(folder: &str) -> String {
+        let f = folder.trim();
+        if f.is_empty() {
+            return "inbox".to_string();
+        }
+        match f.to_ascii_lowercase().as_str() {
+            "inbox" => "inbox".to_string(),
+            "sent" | "sent items" | "sentitems" => "sentitems".to_string(),
+            "drafts" => "drafts".to_string(),
+            "archive" => "archive".to_string(),
+            "junk" | "junk email" | "spam" => "junkemail".to_string(),
+            "deleted" | "deleted items" | "trash" => "deleteditems".to_string(),
+            _ => f.to_string(),
+        }
+    }
+
     /// Fetch unread messages from the given folder (default Inbox).
     pub async fn fetch_unread(&self, folder: &str, limit: u32) -> anyhow::Result<Vec<GraphMessage>> {
         let token = self.token().await?;
-        let folder = if folder.trim().is_empty() { "Inbox" } else { folder.trim() };
+        let folder = Self::graph_folder(folder);
         let url = format!(
             "{}/mailFolders/{}/messages?$filter=isRead%20eq%20false&$top={}&$select=id,subject,from,body,bodyPreview&$orderby=receivedDateTime%20asc",
             self.base(),
@@ -471,8 +492,8 @@ impl GraphMailClient {
         report.push_str(&format!("✓ Mailbox '{}' is visible to the app.\n", self.user_id));
 
         // 4. The actual thing the channel does every poll.
-        let folder = if folder.trim().is_empty() { "Inbox" } else { folder.trim() };
-        match self.fetch_unread(folder, 1).await {
+        let folder = Self::graph_folder(folder);
+        match self.fetch_unread(&folder, 1).await {
             Ok(msgs) => {
                 report.push_str(&format!(
                     "✓ Folder '{folder}' readable — {} unread message(s) waiting.\n\nEverything works.",
@@ -491,6 +512,18 @@ impl GraphMailClient {
 #[cfg(test)]
 mod diag_tests {
     use super::*;
+
+    #[test]
+    fn imap_folder_names_map_to_graph_well_known_names() {
+        // The config field is shared with IMAP, whose default is "INBOX".
+        assert_eq!(GraphMailClient::graph_folder("INBOX"), "inbox");
+        assert_eq!(GraphMailClient::graph_folder("Inbox"), "inbox");
+        assert_eq!(GraphMailClient::graph_folder(""), "inbox");
+        assert_eq!(GraphMailClient::graph_folder("Sent Items"), "sentitems");
+        assert_eq!(GraphMailClient::graph_folder("Junk"), "junkemail");
+        // Custom folders pass through untouched.
+        assert_eq!(GraphMailClient::graph_folder("Invoices"), "Invoices");
+    }
 
     #[test]
     fn base64_decode_matches_known_vectors() {

@@ -1320,6 +1320,76 @@ impl MetisDesktopApp {
         }
     }
 
+    /// Open Microsoft's admin-consent page for the configured app.
+    ///
+    /// This is the one-click fix for "the token carries no application
+    /// permissions": the permissions are requested on the app but nobody with
+    /// authority has approved them yet.
+    fn open_admin_consent(&mut self) {
+        let cfg = load_config(None).channels.email;
+        if cfg.graph_tenant_id.trim().is_empty() || cfg.graph_client_id.trim().is_empty() {
+            self.settings_status =
+                "Save the tenant id and client id first.".to_string();
+            return;
+        }
+        let url = format!(
+            "https://login.microsoftonline.com/{}/adminconsent?client_id={}",
+            cfg.graph_tenant_id.trim(),
+            cfg.graph_client_id.trim()
+        );
+        let opened = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn().is_ok()
+        } else {
+            std::process::Command::new("xdg-open").arg(&url).spawn().is_ok()
+        };
+        self.settings_status = if opened {
+            "Opened the consent page — sign in as an administrator and approve, then use Check connection.".to_string()
+        } else {
+            format!("Could not open a browser. Visit: {url}")
+        };
+    }
+
+    /// Re-apply permissions, consent and mailbox scoping to the EXISTING app.
+    ///
+    /// Deliberately does not mint a new secret or touch config.json: the
+    /// usual cause of a 403 is scoping or consent, not credentials, and
+    /// re-registering would invalidate a working setup for no reason.
+    fn run_graph_setup_repair(&mut self) {
+        let cfg = load_config(None).channels.email;
+        let mailbox = cfg.graph_user_id.trim().to_string();
+        if mailbox.is_empty() {
+            self.settings_status = "Save the mailbox address first.".to_string();
+            return;
+        }
+        let script = match Self::resolve_setup_script() {
+            Ok(p) => p,
+            Err(e) => {
+                self.settings_status = format!("Could not prepare the setup script: {e}");
+                return;
+            }
+        };
+        let shell = if which_pwsh() { "pwsh" } else if cfg!(windows) { "powershell" } else { "pwsh" };
+        let mut cmd = std::process::Command::new(shell);
+        cmd.args(["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .arg("-Mailbox")
+            .arg(&mailbox)
+            .arg("-RepairAccess");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            cmd.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        self.settings_status = match cmd.spawn() {
+            Ok(_) => format!(
+                "Repairing access for {mailbox} in a new window. Your secret and config.json are \
+                 left unchanged. Scoping can take ~30 min to apply — then use Check connection."
+            ),
+            Err(e) => format!("Could not start {shell}: {e}"),
+        };
+    }
+
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         if self.show_first_run {
             egui::Frame::none()
@@ -1379,6 +1449,8 @@ impl MetisDesktopApp {
             super::settings::SettingsAction::TestEmailConnection => self.start_email_diag(false),
             super::settings::SettingsAction::SendTestEmail => self.start_email_diag(true),
             super::settings::SettingsAction::WriteDiagnostics => self.write_diagnostics(),
+            super::settings::SettingsAction::RepairGraphAccess => self.run_graph_setup_repair(),
+            super::settings::SettingsAction::OpenAdminConsent => self.open_admin_consent(),
             super::settings::SettingsAction::None => {}
         }
     }

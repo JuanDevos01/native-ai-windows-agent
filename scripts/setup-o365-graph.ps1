@@ -75,6 +75,11 @@ param(
     [switch]$SkipConsent,
     [switch]$SkipMailboxRestriction,
 
+    # Re-apply permissions, consent and mailbox scoping to the EXISTING app
+    # without creating another client secret. Use when access is denied but
+    # the app and the secret in config.json are already good.
+    [switch]$RepairAccess,
+
     # Set automatically when the script relaunches itself after upgrading
     # PowerShellGet. Not meant to be passed by hand.
     [switch]$Bootstrapped
@@ -304,6 +309,11 @@ if ($SkipConsent) {
 }
 
 # ── 6. Client secret ──────────────────────────────────────────────────────
+if ($RepairAccess) {
+    Write-Step "Repair mode - keeping the existing client secret"
+    Write-Ok "config.json is left alone; only permissions and scoping are re-applied."
+    $Secret = $null
+} else {
 Write-Step "Creating a client secret (valid $SecretYears year(s))"
 $cred = Add-MgApplicationPassword -ApplicationId $app.Id -PasswordCredential @{
     DisplayName = "Metis $(Get-Date -Format yyyy-MM-dd)"
@@ -311,6 +321,7 @@ $cred = Add-MgApplicationPassword -ApplicationId $app.Id -PasswordCredential @{
 }
 $Secret = $cred.SecretText
 Write-Ok "Secret created - it is shown only once, below"
+}
 
 # ── 7. Restrict to one mailbox ────────────────────────────────────────────
 # Two mechanisms exist. RBAC for Applications is the current one; Application
@@ -382,12 +393,14 @@ Write-Host ""
 Write-Host "  provider            graph"
 Write-Host "  graphTenantId       $TenantId"
 Write-Host "  graphClientId       $($app.AppId)"
-Write-Host "  graphClientSecret   $Secret"
+if ($Secret) { Write-Host "  graphClientSecret   $Secret" } else { Write-Host "  graphClientSecret   (unchanged)" }
 Write-Host "  graphUserId         $Mailbox"
 Write-Host ""
 Write-Warn "The secret cannot be retrieved again - store it now."
 
-if ($WriteConfig) {
+if ($WriteConfig -and -not $Secret) {
+    Write-Warn "Repair mode: not touching config.json (there is no new secret to write)."
+} elseif ($WriteConfig) {
     $cfgPath = Join-Path $HOME ".metis\config.json"
     if (-not (Test-Path $cfgPath)) {
         Write-Warn "No config at $cfgPath - skipping write."
