@@ -75,6 +75,7 @@ pub struct SettingsForm {
     pub email_graph_client_secret: String,
     pub email_graph_user_id: String,
     pub email_allowed: String,
+    pub email_reply_policy: String,
 
     // ── Tools ──
     pub exec_timeout: String,
@@ -165,6 +166,11 @@ impl SettingsForm {
             email_graph_client_secret: e.graph_client_secret.clone(),
             email_graph_user_id: e.graph_user_id.clone(),
             email_allowed: join(&e.allowed_users),
+            email_reply_policy: if e.reply_policy.trim().is_empty() {
+                "allowlist_only".into()
+            } else {
+                e.reply_policy.clone()
+            },
 
             exec_timeout: c.tools.exec.timeout.to_string(),
             exec_shell: c.tools.exec.shell.clone(),
@@ -250,6 +256,7 @@ impl SettingsForm {
         e.graph_client_secret = self.email_graph_client_secret.trim().to_string();
         e.graph_user_id = self.email_graph_user_id.trim().to_string();
         e.allowed_users = split(&self.email_allowed);
+        e.reply_policy = self.email_reply_policy.trim().to_string();
 
         c.tools.exec.timeout = self.exec_timeout.trim().parse().unwrap_or(c.tools.exec.timeout);
         c.tools.exec.shell = self.exec_shell.trim().to_string();
@@ -555,7 +562,36 @@ pub fn draw(
                     secret_field(ui, "sm_pass", "SMTP password", &mut form.email_smtp_password, reveal);
                     text_field(ui, "From address", &mut form.email_from_address, 260.0, "");
                 }
-                text_field(ui, "Allowed senders", &mut form.email_allowed, 320.0, "comma-separated, empty = anyone");
+                text_field(ui, "Allowed senders", &mut form.email_allowed, 320.0, "alice@x.com, @yourdomain.com, partner.com");
+                ui.label(
+                    egui::RichText::new("Comma-separated. Accepts full addresses and whole domains (@yourdomain.com).")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(4.0);
+                ui.label("Mail from anyone else:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut form.email_reply_policy, "allowlist_only".to_string(), "Ignore");
+                    ui.selectable_value(&mut form.email_reply_policy, "approval".to_string(), "Draft + ask me");
+                    ui.selectable_value(&mut form.email_reply_policy, "all".to_string(), "Reply automatically");
+                });
+                match form.email_reply_policy.as_str() {
+                    "approval" => ui.label(
+                        egui::RichText::new("Replies to unlisted senders wait in the Approvals tab. Nothing is sent until you approve it.")
+                            .small()
+                            .color(ACCENT),
+                    ),
+                    "all" => ui.label(
+                        egui::RichText::new("Metis will answer ANY mail, including newsletters and spam. Not advised on a real mailbox.")
+                            .small()
+                            .color(WARN),
+                    ),
+                    _ => ui.label(
+                        egui::RichText::new("Unlisted senders are ignored entirely. If the list is empty, everyone is allowed.")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    ),
+                };
             });
 
         // ── Tools ──

@@ -27,6 +27,7 @@ const MAIN_BG: egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
 enum NavPanel {
     Chat,
     Settings,
+    Approvals,
     Models,
     SkillsTools,
     Messaging,
@@ -90,6 +91,13 @@ pub struct MetisDesktopApp {
     settings_status: String,
     /// Shown once when the install has never been configured.
     show_first_run: bool,
+    // ── Approvals panel ──
+    /// Replies held for approval, refreshed from disk.
+    approvals: Vec<metis_core::approvals::PendingReply>,
+    /// Draft being edited, keyed by entry id.
+    approval_edits: std::collections::HashMap<String, String>,
+    approval_status: String,
+    approvals_last_load: f64,
 }
 
 
@@ -119,6 +127,10 @@ impl MetisDesktopApp {
             settings_reveal: std::collections::HashSet::new(),
             settings_status: String::new(),
             show_first_run: first_run,
+            approvals: Vec::new(),
+            approval_edits: std::collections::HashMap::new(),
+            approval_status: String::new(),
+            approvals_last_load: 0.0,
             config,
             agent,
             sessions,
@@ -581,6 +593,8 @@ impl eframe::App for MetisDesktopApp {
             self.refresh_sessions();
             self.cron_jobs = load_cron_jobs();
             self.last_refresh = now;
+            // The gateway may have queued a reply since the last tick.
+            self.refresh_approvals();
         }
 
         egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
@@ -676,6 +690,13 @@ impl eframe::App for MetisDesktopApp {
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Messaging, "📨  Messaging");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Artifacts, "📁  Artifacts");
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::CronJobs, "⏱  Cron jobs");
+                let waiting = self.approvals.len();
+                let label = if waiting > 0 {
+                    format!("✉  Approvals ({waiting})")
+                } else {
+                    "✉  Approvals".to_string()
+                };
+                sidebar_nav_button(ui, &mut self.nav, NavPanel::Approvals, &label);
                 sidebar_nav_button(ui, &mut self.nav, NavPanel::Settings, "⚙  Settings");
 
                 ui.add_space(12.0);
@@ -799,6 +820,7 @@ impl eframe::App for MetisDesktopApp {
                 NavPanel::Models => self.draw_models(ui),
                 NavPanel::CronJobs => self.draw_cron(ui),
                 NavPanel::Settings => self.draw_settings(ui),
+                NavPanel::Approvals => self.draw_approvals(ui),
                 NavPanel::SkillsTools => draw_placeholder(
                     ui,
                     "Skills & Tools",
@@ -1006,6 +1028,139 @@ impl MetisDesktopApp {
             ),
             Err(e) => format!("Could not start {shell}: {e}"),
         };
+    }
+
+    // ── Approvals panel ──
+
+    /// Reload the queue from disk. The gateway is a different process, so
+    /// the file is the only shared state; poll it rather than caching.
+    fn refresh_approvals(&mut self) {
+        let path = metis_core::approvals::default_path();
+        match metis_core::approvals::load(&path) {
+            Ok(store) => {
+                self.approvals = metis_core::approvals::with_status(
+                    &store,
+                    metis_core::approvals::ApprovalStatus::Pending,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+            }
+            Err(e) => {
+                self.approval_status = format!("Could not read the approval queue: {e}");
+            }
+        }
+    }
+
+    fn draw_approvals(&mut self, ui: &mut egui::Ui) {
+        use metis_core::approvals::{self, ApprovalStatus};
+
+        ui.horizontal(|ui| {
+            ui.heading("Approvals");
+            ui.add_space(10.0);
+            if ui.button("↻  Refresh").clicked() {
+                self.refresh_approvals();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Replies to senders outside your allow-list wait here. Nothing is sent until you approve it.                  Enable with channels.email.replyPolicy = \"approval\".",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
+        if !self.approval_status.is_empty() {
+            ui.label(egui::RichText::new(&self.approval_status).color(ACCENT).strong());
+        }
+        ui.separator();
+
+        if self.approvals.is_empty() {
+            ui.add_space(20.0);
+            ui.label(
+                egui::RichText::new("Nothing waiting for approval.")
+                    .color(egui::Color32::GRAY),
+            );
+            return;
+        }
+
+        let path = approvals::default_path();
+        let mut action: Option<(String, ApprovalStatus)> = None;
+        let entries = self.approvals.clone();
+
+        egui::ScrollArea::vertical().id_salt("approvals_scroll").show(ui, |ui| {
+            for e in &entries {
+                ui.push_id(&e.id, |ui| {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(250, 250, 252))
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&e.to).strong().color(ACCENT));
+                                ui.label(egui::RichText::new(format!("· {}", e.subject)).small());
+                            });
+                            if !e.incoming_excerpt.trim().is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("They wrote:").small().strong());
+                                ui.label(
+                                    egui::RichText::new(&e.incoming_excerpt)
+                                        .small()
+                                        .color(egui::Color32::DARK_GRAY),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Proposed reply (editable):").small().strong());
+                            let draft = self
+                                .approval_edits
+                                .entry(e.id.clone())
+                                .or_insert_with(|| e.body.clone());
+                            ui.add(
+                                egui::TextEdit::multiline(draft)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(6),
+                            );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("✔  Approve & send").clicked() {
+                                    action = Some((e.id.clone(), ApprovalStatus::Approved));
+                                }
+                                if ui.button("✖  Reject").clicked() {
+                                    action = Some((e.id.clone(), ApprovalStatus::Rejected));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("id {}", e.id))
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                        });
+                });
+                ui.add_space(8.0);
+            }
+        });
+
+        if let Some((id, status)) = action {
+            // Persist any edit before approving, so the gateway sends the
+            // text actually shown here rather than the original draft.
+            if status == ApprovalStatus::Approved {
+                if let Some(body) = self.approval_edits.get(&id) {
+                    let _ = approvals::set_body(&path, &id, body);
+                }
+            }
+            match approvals::set_status(&path, &id, status, None) {
+                Ok(Some(_)) => {
+                    self.approval_status = match status {
+                        ApprovalStatus::Approved => {
+                            format!("Approved {id} — the gateway will send it shortly.")
+                        }
+                        _ => format!("Rejected {id} — it will not be sent."),
+                    };
+                    self.approval_edits.remove(&id);
+                    self.refresh_approvals();
+                }
+                Ok(None) => self.approval_status = format!("{id} is no longer in the queue."),
+                Err(e) => self.approval_status = format!("Could not update {id}: {e}"),
+            }
+        }
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {

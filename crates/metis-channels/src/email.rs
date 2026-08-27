@@ -325,6 +325,9 @@ pub struct EmailChannel {
     graph: Option<crate::graph_mail::GraphMailClient>,
     /// Graph message id per sender, so a reply stays on the same thread.
     last_graph_id: Arc<RwLock<HashMap<String, String>>>,
+    /// Last inbound body per sender, shown alongside a held reply so the
+    /// approver can see what is being answered.
+    last_incoming: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl EmailChannel {
@@ -349,6 +352,7 @@ impl EmailChannel {
                 None
             },
             last_graph_id: Arc::new(RwLock::new(HashMap::new())),
+            last_incoming: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -389,6 +393,26 @@ impl EmailChannel {
                 None => sender_domain == e,
             }
         })
+    }
+
+    /// True when unlisted senders should still be read and answered, with
+    /// the reply held for approval rather than sent.
+    fn approval_mode(&self) -> bool {
+        self.config.reply_policy.trim().eq_ignore_ascii_case("approval")
+    }
+
+    /// True when replies go out to anyone, allow-list or not.
+    fn reply_to_everyone(&self) -> bool {
+        self.config.reply_policy.trim().eq_ignore_ascii_case("all")
+    }
+
+    /// Whether an inbound message should be processed at all.
+    ///
+    /// In approval mode unlisted mail IS processed — that is the point: the
+    /// agent drafts a reply a human can approve. The gate moves to the
+    /// outbound side (`send`), so nothing reaches the recipient unseen.
+    fn should_process(&self, sender: &str) -> bool {
+        self.approval_mode() || self.reply_to_everyone() || self.is_allowed(sender)
     }
 
     /// Effective poll interval (minimum 5 seconds).
@@ -651,7 +675,7 @@ impl EmailChannel {
             };
 
             // Allow-list check
-            if !self.is_allowed(&email.sender) {
+            if !self.should_process(&email.sender) {
                 warn!(sender = %email.sender, "email sender not in allow-list");
                 continue;
             }
@@ -660,6 +684,10 @@ impl EmailChannel {
             {
                 let mut subjects = self.last_subject.write().await;
                 subjects.insert(email.sender.clone(), email.subject.clone());
+            }
+            {
+                let mut bodies = self.last_incoming.write().await;
+                bodies.insert(email.sender.clone(), Self::truncate(&email.body, 600));
             }
             if !email.message_id.is_empty() {
                 let mut msg_ids = self.last_message_id.write().await;
@@ -732,7 +760,7 @@ impl EmailChannel {
 
         for m in messages {
             let sender = Self::extract_sender_email(&m.from);
-            if !self.is_allowed(&sender) {
+            if !self.should_process(&sender) {
                 warn!(sender = %sender, "email sender not in allow-list");
                 // Still mark read, or it is re-fetched every poll forever.
                 if self.config.mark_seen {
@@ -751,6 +779,10 @@ impl EmailChannel {
             {
                 let mut subjects = self.last_subject.write().await;
                 subjects.insert(sender.clone(), m.subject.clone());
+            }
+            {
+                let mut bodies = self.last_incoming.write().await;
+                bodies.insert(sender.clone(), Self::truncate(&body, 600));
             }
             {
                 let mut ids = self.last_graph_id.write().await;
@@ -985,6 +1017,46 @@ impl Channel for EmailChannel {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> anyhow::Result<()> {
+        // Hold replies to senders outside the allow-list. The agent has
+        // already written the reply; a human decides whether it goes out.
+        if self.approval_mode() && !self.is_allowed(&msg.chat_id) {
+            let subject = {
+                let subjects = self.last_subject.read().await;
+                subjects.get(&msg.chat_id).cloned().unwrap_or_default()
+            };
+            let excerpt = {
+                let bodies = self.last_incoming.read().await;
+                bodies.get(&msg.chat_id).cloned().unwrap_or_default()
+            };
+            let entry = metis_core::approvals::PendingReply::new(
+                "email",
+                &msg.chat_id,
+                subject,
+                excerpt,
+                &msg.content,
+            );
+            let id = entry.id.clone();
+            let path = metis_core::approvals::default_path();
+            match metis_core::approvals::push(&path, entry) {
+                Ok(()) => {
+                    info!(
+                        id = %id,
+                        to = %msg.chat_id,
+                        "reply held for approval (sender not in allowedUsers)"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Refuse rather than fall through to sending: the whole
+                    // point of approval mode is that nothing goes out unseen.
+                    anyhow::bail!(
+                        "could not queue reply to {} for approval ({e}); not sending",
+                        msg.chat_id
+                    );
+                }
+            }
+        }
+
         if config_uses_graph(&self.config) {
             self.send_email_graph(msg).await
         } else {
@@ -999,6 +1071,34 @@ impl Channel for EmailChannel {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reply_policy_controls_inbound_processing() {
+        let bus = || std::sync::Arc::new(MessageBus::new(8));
+
+        // Default: only allow-listed senders are processed at all.
+        let mut cfg = make_config();
+        cfg.allowed_users = vec!["@known.com".into()];
+        let ch = EmailChannel::new(cfg.clone(), bus());
+        assert!(ch.should_process("a@known.com"));
+        assert!(!ch.should_process("stranger@other.com"));
+
+        // Approval: strangers ARE processed, so a draft can be produced.
+        cfg.reply_policy = "approval".into();
+        let ch = EmailChannel::new(cfg.clone(), bus());
+        assert!(ch.should_process("stranger@other.com"));
+        assert!(ch.approval_mode());
+        // ...but they are still not "allowed", which is what holds the reply.
+        assert!(!ch.is_allowed("stranger@other.com"));
+        assert!(ch.is_allowed("a@known.com"));
+
+        // All: everyone processed, nothing held.
+        cfg.reply_policy = "all".into();
+        let ch = EmailChannel::new(cfg, bus());
+        assert!(ch.should_process("stranger@other.com"));
+        assert!(!ch.approval_mode());
+    }
+
 
     #[test]
     fn allow_list_supports_domains_and_addresses() {
@@ -1041,6 +1141,7 @@ mod tests {
             smtp_username: "user@example.com".into(),
             smtp_password: "password".into(),
             provider: "imap".to_string(),
+            reply_policy: "allowlist_only".to_string(),
             graph_tenant_id: String::new(),
             graph_client_id: String::new(),
             graph_client_secret: String::new(),

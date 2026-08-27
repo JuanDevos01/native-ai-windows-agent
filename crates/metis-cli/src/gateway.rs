@@ -124,6 +124,56 @@ pub async fn restart() -> Result<()> {
     run().await
 }
 
+/// Send replies a human approved in the desktop app.
+///
+/// The desktop and the gateway are separate processes, so the approval queue
+/// file is the only channel between them: the desktop flips an entry to
+/// Approved, and this loop notices and puts it on the bus. Polling (rather
+/// than watching) keeps it simple and survives either side restarting.
+async fn run_approval_sender(bus: Arc<MessageBus>) {
+    use metis_core::approvals::{self, ApprovalStatus};
+    use metis_core::bus::types::OutboundMessage;
+
+    let path = approvals::default_path();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let store = match approvals::load(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read approval queue");
+                continue;
+            }
+        };
+        let approved: Vec<_> = approvals::with_status(&store, ApprovalStatus::Approved)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        for entry in approved {
+            // Mark Sent BEFORE publishing. If the process dies mid-send the
+            // reply is lost, which is recoverable; marking after could resend
+            // the same mail on every restart, which is not.
+            if let Err(e) = approvals::set_status(&path, &entry.id, ApprovalStatus::Sent, None) {
+                tracing::warn!(id = %entry.id, error = %e, "could not update approval status");
+                continue;
+            }
+            let msg = OutboundMessage::new(entry.channel.clone(), entry.to.clone(), entry.body.clone());
+            if let Err(e) = bus.publish_outbound(msg).await {
+                tracing::error!(id = %entry.id, error = %e, "failed to send approved reply");
+                let _ = approvals::set_status(
+                    &path,
+                    &entry.id,
+                    ApprovalStatus::Failed,
+                    Some(e.to_string()),
+                );
+            } else {
+                info!(id = %entry.id, to = %entry.to, "sent approved reply");
+            }
+        }
+    }
+}
+
 /// Run the gateway — starts the agent loop + channel manager.
 pub async fn run() -> Result<()> {
     println!();
@@ -548,6 +598,9 @@ pub async fn run() -> Result<()> {
             if let Err(e) = result {
                 tracing::error!(error = %e, "heartbeat service error");
             }
+        }
+        _ = run_approval_sender(bus.clone()) => {
+            info!("approval sender exited");
         }
         _ = tokio::signal::ctrl_c() => {
             println!();

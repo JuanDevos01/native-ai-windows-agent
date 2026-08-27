@@ -1,6 +1,7 @@
 pub mod build;
 pub mod types;
 pub mod bus;
+pub mod approvals;
 pub mod config;
 pub mod heartbeat;
 pub mod memory_db;

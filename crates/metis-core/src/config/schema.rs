@@ -499,6 +499,19 @@ pub struct EmailConfig {
     #[serde(default = "default_true")]
     pub imap_use_ssl: bool,
 
+    /// What to do with mail from senders NOT in `allowed_users`:
+    ///
+    /// - `"allowlist_only"` (default) — ignore them entirely.
+    /// - `"approval"` — the agent answers, but the reply is held in
+    ///   `~/.metis/pending_replies.json` until a human approves it in the
+    ///   desktop app. Nothing is sent unseen.
+    /// - `"all"` — reply to anyone. Not advisable on a real mailbox: it
+    ///   answers newsletters and spam too.
+    ///
+    /// Allow-listed senders are always answered automatically.
+    #[serde(default = "default_reply_policy")]
+    pub reply_policy: String,
+
     // ── Microsoft Graph settings (Office 365) ──
     /// Backend used for mail: "imap" (default) or "graph".
     ///
@@ -563,6 +576,10 @@ pub struct EmailConfig {
     pub allowed_users: Vec<String>,
 }
 
+fn default_reply_policy() -> String {
+    "allowlist_only".to_string()
+}
+
 fn default_email_provider() -> String {
     "imap".to_string()
 }
@@ -584,6 +601,7 @@ impl Default for EmailConfig {
             imap_mailbox: "INBOX".to_string(),
             imap_use_ssl: true,
             provider: default_email_provider(),
+            reply_policy: default_reply_policy(),
             graph_tenant_id: String::new(),
             graph_client_id: String::new(),
             graph_client_secret: String::new(),
