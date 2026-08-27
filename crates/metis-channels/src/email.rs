@@ -357,15 +357,38 @@ impl EmailChannel {
     // ─────────────────────────────────────────
 
     /// Check if a sender email is in the allow-list.
+    /// Whether a sender is on the allow-list.
+    ///
+    /// Entries may be a full address (`alice@example.com`) or a whole domain
+    /// (`example.com` or `@example.com`) so a company's mail can be allowed
+    /// without listing every colleague. Matching is case-insensitive, and a
+    /// domain entry matches only the part after the `@` — `notexample.com`
+    /// must never satisfy an `example.com` entry.
+    ///
+    /// An empty list allows everyone, which is why `reply_policy` exists:
+    /// an unconfigured mailbox would otherwise auto-reply to newsletters and
+    /// spam.
     fn is_allowed(&self, sender: &str) -> bool {
         if self.config.allowed_users.is_empty() {
             return true;
         }
-        let sender_lower = sender.to_lowercase();
-        self.config
-            .allowed_users
-            .iter()
-            .any(|u| u.to_lowercase() == sender_lower)
+        let sender_lower = sender.trim().to_lowercase();
+        let sender_domain = sender_lower.rsplit('@').next().unwrap_or_default().to_string();
+
+        self.config.allowed_users.iter().any(|entry| {
+            let e = entry.trim().to_lowercase();
+            if e.is_empty() {
+                return false;
+            }
+            match e.strip_prefix('@') {
+                // "@example.com" - domain entry
+                Some(domain) => !domain.is_empty() && sender_domain == domain,
+                None if e.contains('@') => e == sender_lower, // full address
+                // Bare "example.com" is treated as a domain too: it is what
+                // people write, and it can never be a valid address anyway.
+                None => sender_domain == e,
+            }
+        })
     }
 
     /// Effective poll interval (minimum 5 seconds).
@@ -976,6 +999,33 @@ impl Channel for EmailChannel {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn allow_list_supports_domains_and_addresses() {
+        let mut cfg = make_config();
+        cfg.allowed_users = vec![
+            "alice@example.com".into(),
+            "@sempelsgroep.be".into(),
+            "partner.com".into(),
+        ];
+        let bus = std::sync::Arc::new(MessageBus::new(8));
+        let ch = EmailChannel::new(cfg, bus);
+
+        // exact address
+        assert!(ch.is_allowed("alice@example.com"));
+        assert!(ch.is_allowed("ALICE@Example.com"), "case-insensitive");
+        assert!(!ch.is_allowed("bob@example.com"), "other user at a listed address's domain");
+
+        // @domain and bare domain entries
+        assert!(ch.is_allowed("gerard@sempelsgroep.be"));
+        assert!(ch.is_allowed("anyone@partner.com"));
+
+        // near-miss domains must not match
+        assert!(!ch.is_allowed("attacker@notsempelsgroep.be"));
+        assert!(!ch.is_allowed("attacker@sempelsgroep.be.evil.com"));
+        assert!(!ch.is_allowed("random@elsewhere.org"));
+    }
+
     use super::*;
 
     fn make_config() -> EmailConfig {
