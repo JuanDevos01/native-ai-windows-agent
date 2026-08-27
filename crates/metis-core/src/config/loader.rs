@@ -46,11 +46,25 @@ fn load_config_from_path(path: &Path) -> Config {
         }
     };
 
+    // Strip a UTF-8 BOM if present. Windows editors and PowerShell's
+    // `Set-Content -Encoding utf8` (5.1) prepend EF BB BF, which serde_json
+    // rejects at the first byte ("expected value at line 1 column 1"). The
+    // config would then be silently ignored in favour of defaults, surfacing
+    // much later as a baffling "no configured provider" error.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+
     // Parse JSON → Value first for migration
-    let mut raw: serde_json::Value = match serde_json::from_str(&content) {
+    let mut raw: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Failed to parse config JSON: {}", e);
+            // Loud and specific: falling back to defaults silently discards
+            // every API key and channel the user configured.
+            warn!(
+                "Failed to parse config JSON at {}: {}. USING DEFAULTS - your API keys, \
+                 channels and settings in that file are being ignored until it parses.",
+                path.display(),
+                e
+            );
             return apply_env_overrides(Config::default());
         }
     };
@@ -292,6 +306,26 @@ fn apply_provider_env(provider: &mut super::schema::ProviderConfig, name: &str) 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn config_with_utf8_bom_still_loads() {
+        // PowerShell 5.1's `Set-Content -Encoding utf8` prepends EF BB BF.
+        // Without stripping it the whole config is discarded and Metis
+        // starts with default settings and no API keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let json = r#"{"agents":{"defaults":{"model":"my-model"}}}"#;
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(json.as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let cfg = load_config(Some(&path));
+        assert_eq!(
+            cfg.agents.defaults.model, "my-model",
+            "BOM-prefixed config must still parse"
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

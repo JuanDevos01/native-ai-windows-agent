@@ -409,7 +409,12 @@ if ($WriteConfig) {
         }.GetEnumerator()) {
             $e | Add-Member $kv.Key $kv.Value -Force
         }
-        $cfg | ConvertTo-Json -Depth 20 | Set-Content $cfgPath -Encoding utf8
+        # NOT Set-Content -Encoding utf8: on Windows PowerShell 5.1 that
+        # writes a UTF-8 BOM, and Metis' JSON parser rejects the file at its
+        # first byte - the config is then ignored entirely and Metis starts
+        # with no API keys at all.
+        $json = $cfg | ConvertTo-Json -Depth 20
+        [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding $false))
         Write-Ok "Wrote Graph settings into $cfgPath"
         Write-Warn "config.json now contains a client secret - keep it out of any repo or backup you share."
     }
