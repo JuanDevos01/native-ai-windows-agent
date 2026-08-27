@@ -98,6 +98,8 @@ pub struct MetisDesktopApp {
     approval_edits: std::collections::HashMap<String, String>,
     approval_status: String,
     approvals_last_load: f64,
+    /// In-flight email diagnostic (connection test / test send).
+    email_diag_rx: Option<oneshot::Receiver<Result<String, String>>>,
 }
 
 
@@ -131,6 +133,7 @@ impl MetisDesktopApp {
             approval_edits: std::collections::HashMap::new(),
             approval_status: String::new(),
             approvals_last_load: 0.0,
+            email_diag_rx: None,
             config,
             agent,
             sessions,
@@ -529,6 +532,29 @@ impl MetisDesktopApp {
         });
     }
 
+    /// Surface the result of a mailbox check or test send once it lands.
+    fn poll_email_diag(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.email_diag_rx.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.email_diag_rx = None;
+                self.settings_status = format!("✓ {msg}");
+            }
+            Ok(Err(e)) => {
+                self.email_diag_rx = None;
+                self.settings_status = format!("✗ {e}");
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                // Still running - keep the UI ticking so the result appears
+                // without the user having to move the mouse.
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            Err(_) => self.email_diag_rx = None,
+        }
+    }
+
     fn poll_model_test(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.model_test_rx.as_mut() else {
             return;
@@ -587,6 +613,7 @@ impl eframe::App for MetisDesktopApp {
         self.poll_pending(ctx);
         self.poll_model_discovery(ctx);
         self.poll_model_test(ctx);
+        self.poll_email_diag(ctx);
 
         let now = ctx.input(|i| i.time);
         if now - self.last_refresh > 5.0 {
@@ -1163,6 +1190,136 @@ impl MetisDesktopApp {
         }
     }
 
+    /// Run a mailbox check (or a test send) off the UI thread.
+    ///
+    /// Reads config from disk rather than the form, so what is tested is what
+    /// the gateway will actually use — testing unsaved edits would report a
+    /// success the running system does not share.
+    fn start_email_diag(&mut self, send: bool) {
+        #[cfg(feature = "email")]
+        {
+            let cfg = load_config(None).channels.email;
+            let to = self.settings.email_test_recipient.trim().to_string();
+            let (tx, rx) = oneshot::channel();
+            self.email_diag_rx = Some(rx);
+            self.settings_status = if send {
+                format!("Sending a test message to {to}…")
+            } else {
+                "Checking the mailbox connection…".to_string()
+            };
+            self.runtime.spawn(async move {
+                let result = if send {
+                    metis_channels::email::send_test_message(&cfg, &to).await
+                } else {
+                    metis_channels::email::test_connection(&cfg).await
+                };
+                let _ = tx.send(result);
+            });
+        }
+        #[cfg(not(feature = "email"))]
+        {
+            let _ = send;
+            self.settings_status =
+                "This build has no email support. Rebuild with --features email.".to_string();
+        }
+    }
+
+    /// Collect a troubleshooting report and write it next to the config.
+    ///
+    /// Deliberately leads with whether a gateway is running: the desktop app
+    /// hosts no channels, so "mail never arrives" is most often simply that
+    /// nothing is polling the mailbox.
+    fn write_diagnostics(&mut self) {
+        let cfg = load_config(None);
+        let e = &cfg.channels.email;
+        let mask = |v: &str| {
+            if v.trim().is_empty() {
+                "(not set)".to_string()
+            } else {
+                format!("set, {} chars", v.trim().len())
+            }
+        };
+
+        let pid_path = metis_core::utils::get_data_path().join("gateway.pid");
+        let gateway = match std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|p| p.trim().parse::<u32>().ok())
+        {
+            Some(pid) => format!("gateway.pid present (pid {pid})"),
+            None => "NO gateway.pid - the gateway does not appear to be running".to_string(),
+        };
+
+        let queue = metis_core::approvals::load(&metis_core::approvals::default_path())
+            .map(|st| {
+                let pend = metis_core::approvals::with_status(
+                    &st,
+                    metis_core::approvals::ApprovalStatus::Pending,
+                )
+                .len();
+                let appr = metis_core::approvals::with_status(
+                    &st,
+                    metis_core::approvals::ApprovalStatus::Approved,
+                )
+                .len();
+                format!("{pend} pending, {appr} approved-not-yet-sent")
+            })
+            .unwrap_or_else(|err| format!("unreadable: {err}"));
+
+        let provider = if e.provider.trim().is_empty() { "imap" } else { e.provider.trim() };
+        let mailbox = if e.graph_user_id.trim().is_empty() {
+            e.imap_username.clone()
+        } else {
+            e.graph_user_id.clone()
+        };
+        let allowed = if e.allowed_users.is_empty() {
+            "(empty - everyone allowed)".to_string()
+        } else {
+            e.allowed_users.join(", ")
+        };
+
+        let mut report = String::new();
+        report.push_str("Metis diagnostics\n");
+        report.push_str(&format!("Generated       : {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+        report.push_str(&format!("Build           : {}\n", metis_core::build::version_line()));
+        report.push_str(&format!("OS              : {}/{}\n\n", std::env::consts::OS, std::env::consts::ARCH));
+        report.push_str("MAIL IS ONLY RECEIVED WHILE `metis gateway` IS RUNNING.\n");
+        report.push_str("The desktop app hosts no channels; it is a GUI over the same config.\n");
+        report.push_str(&format!("  {gateway}\n\n"));
+        report.push_str("Email\n");
+        report.push_str(&format!("  backend       : {provider}\n"));
+        report.push_str(&format!("  mailbox       : {mailbox}\n"));
+        report.push_str(&format!("  folder        : {}\n", e.imap_mailbox));
+        report.push_str(&format!("  reply policy  : {}\n", e.reply_policy));
+        report.push_str(&format!("  allowed users : {allowed}\n"));
+        report.push_str(&format!("  poll interval : {}s\n", e.poll_interval_seconds));
+        report.push_str(&format!("  graph tenant  : {}\n", mask(&e.graph_tenant_id)));
+        report.push_str(&format!("  graph client  : {}\n", mask(&e.graph_client_id)));
+        report.push_str(&format!("  graph secret  : {}\n", mask(&e.graph_client_secret)));
+        report.push_str(&format!("  imap host     : {}\n", if e.imap_host.trim().is_empty() { "(not set)" } else { &e.imap_host }));
+        report.push_str(&format!("  imap user     : {}\n", if e.imap_username.trim().is_empty() { "(not set)" } else { &e.imap_username }));
+        report.push_str(&format!("  imap password : {}\n", mask(&e.imap_password)));
+        report.push_str(&format!("  smtp host     : {}\n\n", if e.smtp_host.trim().is_empty() { "(not set)" } else { &e.smtp_host }));
+        report.push_str("Agent\n");
+        report.push_str(&format!("  model         : {}\n", cfg.agents.defaults.model));
+        report.push_str(&format!("  workspace     : {}\n\n", cfg.agents.defaults.workspace));
+        report.push_str(&format!("Approval queue  : {queue}\n\n"));
+        report.push_str("Notes\n");
+        report.push_str("  - reply policy 'allowlist_only' ignores senders not in allowed users.\n");
+        report.push_str("  - allowed users accepts addresses and whole domains (@yourdomain.com).\n");
+        report.push_str("  - Office 365 cannot use the IMAP backend at all; it needs Microsoft Graph.\n");
+
+        let path = metis_core::utils::get_data_path().join("diagnostics.txt");
+        match std::fs::write(&path, &report) {
+            // Secrets appear only as "set, N chars", so the file is safe to
+            // hand to someone for help.
+            Ok(()) => {
+                self.settings_status =
+                    format!("Wrote {} (secrets masked - safe to share).", path.display())
+            }
+            Err(err) => self.settings_status = format!("Could not write the report: {err}"),
+        }
+    }
+
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         if self.show_first_run {
             egui::Frame::none()
@@ -1219,6 +1376,9 @@ impl MetisDesktopApp {
                 self.settings_status = "Reloaded from config.json.".to_string();
             }
             super::settings::SettingsAction::RunGraphSetup => self.run_graph_setup(),
+            super::settings::SettingsAction::TestEmailConnection => self.start_email_diag(false),
+            super::settings::SettingsAction::SendTestEmail => self.start_email_diag(true),
+            super::settings::SettingsAction::WriteDiagnostics => self.write_diagnostics(),
             super::settings::SettingsAction::None => {}
         }
     }

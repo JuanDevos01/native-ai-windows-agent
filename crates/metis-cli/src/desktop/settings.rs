@@ -29,6 +29,12 @@ pub enum SettingsAction {
     Reload,
     /// Launch the Azure app-registration script for the Graph backend.
     RunGraphSetup,
+    /// Connect to the mailbox and report what happened.
+    TestEmailConnection,
+    /// Send a test message to `email_test_recipient`.
+    SendTestEmail,
+    /// Write a troubleshooting report to disk.
+    WriteDiagnostics,
 }
 
 /// Editable mirror of the parts of `MetisConfig` worth exposing in a GUI.
@@ -76,6 +82,8 @@ pub struct SettingsForm {
     pub email_graph_user_id: String,
     pub email_allowed: String,
     pub email_reply_policy: String,
+    /// Where "Send test message" should send to (not persisted to config).
+    pub email_test_recipient: String,
 
     // ── Tools ──
     pub exec_timeout: String,
@@ -170,6 +178,13 @@ impl SettingsForm {
                 "allowlist_only".into()
             } else {
                 e.reply_policy.clone()
+            },
+            // Default to the mailbox itself: sending to yourself proves the
+            // path without bothering anyone.
+            email_test_recipient: if e.provider.trim().eq_ignore_ascii_case("graph") {
+                e.graph_user_id.clone()
+            } else {
+                e.imap_username.clone()
             },
 
             exec_timeout: c.tools.exec.timeout.to_string(),
@@ -592,6 +607,34 @@ pub fn draw(
                             .color(egui::Color32::GRAY),
                     ),
                 };
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Troubleshooting").strong());
+                ui.label(
+                    egui::RichText::new("Save first — these use what is on disk, not unsaved edits.")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("🔌  Check connection").clicked() {
+                        action = SettingsAction::TestEmailConnection;
+                    }
+                    if ui.button("📄  Generate report").clicked() {
+                        action = SettingsAction::WriteDiagnostics;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Send test to");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.email_test_recipient)
+                            .desired_width(240.0)
+                            .hint_text("you@yourdomain.com"),
+                    );
+                    if ui.button("✉  Send test message").clicked() {
+                        action = SettingsAction::SendTestEmail;
+                    }
+                });
             });
 
         // ── Tools ──

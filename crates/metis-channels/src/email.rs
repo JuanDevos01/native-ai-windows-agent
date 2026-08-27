@@ -1066,6 +1066,105 @@ impl Channel for EmailChannel {
 }
 
 // ─────────────────────────────────────────────
+// Diagnostics (used by the desktop app)
+// ─────────────────────────────────────────────
+
+/// Try to reach the configured mailbox and report what happened, in words a
+/// user can act on. Runs the same code paths the channel uses, so a pass here
+/// means the channel itself can connect.
+pub async fn test_connection(cfg: &EmailConfig) -> Result<String, String> {
+    if config_uses_graph(cfg) {
+        let client = crate::graph_mail::GraphMailClient::new(
+            cfg.graph_tenant_id.clone(),
+            cfg.graph_client_id.clone(),
+            cfg.graph_client_secret.clone(),
+            cfg.graph_user_id.clone(),
+        );
+        if !client.is_configured() {
+            return Err("Graph is selected but tenant id / client id / secret / mailbox are not all filled in.".into());
+        }
+        let folder = if cfg.imap_mailbox.trim().is_empty() { "Inbox" } else { cfg.imap_mailbox.trim() };
+        return match client.fetch_unread(folder, 1).await {
+            Ok(msgs) => Ok(format!(
+                "Connected to {} via Microsoft Graph. Folder '{}' reachable; {} unread message(s) waiting.",
+                cfg.graph_user_id, folder, msgs.len()
+            )),
+            Err(e) => Err(format!("{e}")),
+        };
+    }
+
+    if cfg.imap_host.trim().is_empty() {
+        return Err("IMAP is selected but no IMAP host is configured.".into());
+    }
+    let port = if cfg.imap_port > 0 { cfg.imap_port } else { 993 };
+    let mut imap = ImapClient::connect(&cfg.imap_host, port, cfg.imap_use_ssl)
+        .await
+        .map_err(|e| format!("Could not connect to {}:{} — {e}", cfg.imap_host, port))?;
+    imap.login(&cfg.imap_username, &cfg.imap_password)
+        .await
+        .map_err(|e| format!(
+            "Connected to {} but login failed — {e}. (Office 365 mailboxes cannot use IMAP at all;              switch the backend to Microsoft Graph.)",
+            cfg.imap_host
+        ))?;
+    let mailbox = if cfg.imap_mailbox.trim().is_empty() { "INBOX" } else { cfg.imap_mailbox.trim() };
+    imap.select(mailbox)
+        .await
+        .map_err(|e| format!("Logged in, but folder '{mailbox}' could not be opened — {e}"))?;
+    let unseen = imap.search_unseen().await.unwrap_or_default();
+    let _ = imap.logout().await;
+    Ok(format!(
+        "Connected to {} as {}. Folder '{}' reachable; {} unread message(s) waiting.",
+        cfg.imap_host, cfg.imap_username, mailbox, unseen.len()
+    ))
+}
+
+/// Send a message to `to` using the configured backend, to prove sending
+/// works end to end without waiting for someone to email in.
+pub async fn send_test_message(cfg: &EmailConfig, to: &str) -> Result<String, String> {
+    let to = to.trim();
+    if to.is_empty() {
+        return Err("Enter an address to send the test to.".into());
+    }
+    let subject = "Metis test message";
+    let body = format!(
+        "This is a test message from Metis.
+
+Backend: {}
+Sent: {}
+
+If you received this, outbound mail works.",
+        if config_uses_graph(cfg) { "Microsoft Graph" } else { "SMTP" },
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if config_uses_graph(cfg) {
+        let client = crate::graph_mail::GraphMailClient::new(
+            cfg.graph_tenant_id.clone(),
+            cfg.graph_client_id.clone(),
+            cfg.graph_client_secret.clone(),
+            cfg.graph_user_id.clone(),
+        );
+        if !client.is_configured() {
+            return Err("Graph settings are incomplete.".into());
+        }
+        return client
+            .send_mail(to, subject, &body)
+            .await
+            .map(|_| format!("Sent a test message to {to} via Microsoft Graph."))
+            .map_err(|e| format!("{e}"));
+    }
+
+    let bus = Arc::new(MessageBus::new(4));
+    let channel = EmailChannel::new(cfg.clone(), bus);
+    let msg = OutboundMessage::new("email", to, body);
+    channel
+        .send_email(&msg)
+        .await
+        .map(|_| format!("Sent a test message to {to} via SMTP."))
+        .map_err(|e| format!("{e}"))
+}
+
+// ─────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────
 
