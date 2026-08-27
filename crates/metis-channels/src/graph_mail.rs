@@ -328,3 +328,206 @@ mod tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────
+// Diagnostics
+// ─────────────────────────────────────────────
+
+/// Decode the payload of a JWT without verifying it.
+///
+/// Only used to read the `roles` claim of our own freshly-issued token, to
+/// tell "the tenant never granted the permission" apart from "the permission
+/// is granted but this mailbox is out of scope". Both surface as a bare 403.
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    // JWTs use base64url without padding.
+    let mut b64: String = payload.replace('-', "+").replace('_', "/");
+    while b64.len() % 4 != 0 {
+        b64.push('=');
+    }
+    let bytes = base64_decode(&b64)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() < 4 {
+            return None;
+        }
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        let mut n = 0u32;
+        for &c in chunk {
+            let v = if c == b'=' { 0 } else { val(c)? };
+            n = (n << 6) | v;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+impl GraphMailClient {
+    /// Work out *why* the mailbox is unreachable, rather than reporting the
+    /// first error verbatim.
+    ///
+    /// A Graph app-only setup fails at one of four distinct points, and all
+    /// but the first look identical from the outside (`403
+    /// ErrorAccessDenied`): bad credentials, permission never consented,
+    /// mailbox does not exist, or the app is scoped away from this mailbox
+    /// by an Application Access Policy / RBAC assignment. Each needs a
+    /// different fix, so each is reported separately.
+    pub async fn diagnose(&self, folder: &str) -> Result<String, String> {
+        if !self.is_configured() {
+            return Err("Graph is selected but tenant id / client id / secret / mailbox are not all filled in.".into());
+        }
+
+        // 1. Credentials.
+        let token = self.token().await.map_err(|e| {
+            format!(
+                "Could not get a token — the tenant id, client id or client secret is wrong, \
+                 or the secret has expired.\n\nAzure said: {e}"
+            )
+        })?;
+        let mut report = String::from("✓ Token acquired (tenant id, client id and secret are valid).\n");
+
+        // 2. Permissions actually granted to the app.
+        let roles: Vec<String> = decode_jwt_payload(&token)
+            .and_then(|v| v.get("roles").cloned())
+            .and_then(|r| serde_json::from_value::<Vec<String>>(r).ok())
+            .unwrap_or_default();
+        if roles.is_empty() {
+            return Err(format!(
+                "{report}\n✗ The token carries NO application permissions.\n\n\
+                 The permissions were requested but never granted admin consent, so Graph will \
+                 refuse every call with 403 ErrorAccessDenied.\n\n\
+                 Fix: an administrator must grant consent — Azure portal → App registrations → \
+                 your app → API permissions → \"Grant admin consent\", or open:\n\
+                 https://login.microsoftonline.com/{}/adminconsent?client_id={}",
+                self.tenant_id, self.client_id
+            ));
+        }
+        report.push_str(&format!("✓ Permissions granted: {}\n", roles.join(", ")));
+        if !roles.iter().any(|r| r.starts_with("Mail.")) {
+            report.push_str("  ! No Mail.* permission in the token — reading mail will fail.\n");
+        }
+
+        // 3. Does the mailbox exist / is it visible to this app?
+        let url = format!("{}?$select=id,userPrincipalName,mail", self.base());
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("{report}\n✗ Network error contacting Graph: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(format!(
+                "{report}\n✗ Mailbox '{}' was not found in this tenant.\n\n\
+                 Check the address is exactly right, and that it is a real mailbox rather than \
+                 an alias or a distribution list.",
+                self.user_id
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(format!(
+                "{report}\n✗ 403 ErrorAccessDenied reading mailbox '{}'.\n\n\
+                 The permission IS granted, so this is mailbox scoping: the app is restricted to \
+                 a set of mailboxes that does not include this one. That restriction is what the \
+                 setup script creates to stop the app reading the whole tenant.\n\n\
+                 Check which mailboxes it may access:\n\
+                 \x20 Get-ManagementRoleAssignment -App {} | Format-List Name,Role,CustomResourceScope\n\
+                 \x20 Test-ApplicationAccessPolicy -Identity {} -AppId {}\n\n\
+                 Scoping changes can take up to ~30 minutes to take effect, so if you only just \
+                 ran the setup, wait and try again.",
+                self.user_id, self.client_id, self.user_id, self.client_id
+            ));
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "{report}\n✗ Graph returned {status} for the mailbox: {}",
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        report.push_str(&format!("✓ Mailbox '{}' is visible to the app.\n", self.user_id));
+
+        // 4. The actual thing the channel does every poll.
+        let folder = if folder.trim().is_empty() { "Inbox" } else { folder.trim() };
+        match self.fetch_unread(folder, 1).await {
+            Ok(msgs) => {
+                report.push_str(&format!(
+                    "✓ Folder '{folder}' readable — {} unread message(s) waiting.\n\nEverything works.",
+                    msgs.len()
+                ));
+                Ok(report)
+            }
+            Err(e) => Err(format!(
+                "{report}\n✗ Could not read folder '{folder}': {e}\n\n\
+                 If the mailbox itself was visible above, check the folder name."
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn base64_decode_matches_known_vectors() {
+        assert_eq!(base64_decode("SGVsbG8=").unwrap(), b"Hello");
+        assert_eq!(base64_decode("SGk=").unwrap(), b"Hi");
+        assert_eq!(base64_decode("QUJD").unwrap(), b"ABC");
+    }
+
+    #[test]
+    fn reads_roles_from_a_jwt_payload() {
+        // header.payload.signature — only the payload is looked at, and the
+        // signature is deliberately not verified (this is our own token).
+        let payload = r#"{"aud":"https://graph.microsoft.com","roles":["Mail.ReadWrite","Mail.Send"]}"#;
+        let b64 = {
+            const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let data = payload.as_bytes();
+            let mut out = String::new();
+            for chunk in data.chunks(3) {
+                let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                out.push(T[(n >> 18) as usize & 63] as char);
+                out.push(T[(n >> 12) as usize & 63] as char);
+                out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+                out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+            }
+            out
+        };
+        let token = format!("header.{b64}.signature");
+        let claims = decode_jwt_payload(&token).expect("payload should decode");
+        let roles: Vec<String> =
+            serde_json::from_value(claims.get("roles").unwrap().clone()).unwrap();
+        assert_eq!(roles, vec!["Mail.ReadWrite", "Mail.Send"]);
+    }
+
+    #[test]
+    fn garbage_token_does_not_panic() {
+        assert!(decode_jwt_payload("not-a-jwt").is_none());
+        assert!(decode_jwt_payload("a.!!!.c").is_none());
+    }
+}

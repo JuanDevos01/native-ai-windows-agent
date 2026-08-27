@@ -1083,14 +1083,10 @@ pub async fn test_connection(cfg: &EmailConfig) -> Result<String, String> {
         if !client.is_configured() {
             return Err("Graph is selected but tenant id / client id / secret / mailbox are not all filled in.".into());
         }
+        // Staged diagnosis: credentials, consent, mailbox, folder. A bare
+        // 403 cannot distinguish those, and they need different fixes.
         let folder = if cfg.imap_mailbox.trim().is_empty() { "Inbox" } else { cfg.imap_mailbox.trim() };
-        return match client.fetch_unread(folder, 1).await {
-            Ok(msgs) => Ok(format!(
-                "Connected to {} via Microsoft Graph. Folder '{}' reachable; {} unread message(s) waiting.",
-                cfg.graph_user_id, folder, msgs.len()
-            )),
-            Err(e) => Err(format!("{e}")),
-        };
+        return client.diagnose(folder).await;
     }
 
     if cfg.imap_host.trim().is_empty() {
