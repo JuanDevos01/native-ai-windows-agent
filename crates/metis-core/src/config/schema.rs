@@ -685,6 +685,9 @@ pub struct ToolsConfig {
     /// Whether to restrict file/exec operations to the workspace directory.
     #[serde(default)]
     pub restrict_to_workspace: bool,
+    /// SharePoint document access via Microsoft Graph.
+    #[serde(default)]
+    pub sharepoint: SharePointConfig,
 }
 
 impl Default for ToolsConfig {
@@ -693,8 +696,32 @@ impl Default for ToolsConfig {
             web: WebToolsConfig::default(),
             exec: ExecToolConfig::default(),
             restrict_to_workspace: false,
+            sharepoint: SharePointConfig::default(),
         }
     }
+}
+
+/// SharePoint document access via Microsoft Graph.
+///
+/// Deliberately opt-in and site-scoped. The `Sites.Selected` application
+/// permission grants nothing until an administrator authorizes each named
+/// site, which is the SharePoint equivalent of the mailbox scoping applied
+/// to email — unlike `Sites.Read.All`, which would expose every site in the
+/// tenant.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SharePointConfig {
+    /// Register the SharePoint tools at all.
+    pub enabled: bool,
+    /// Sites the app may read, as `host:/sites/Name`, e.g.
+    /// `contoso.sharepoint.com:/sites/Finance`. The first entry is the
+    /// default when a tool call does not name a site.
+    pub sites: Vec<String>,
+    /// Optional credential overrides. When empty the Graph app already
+    /// configured for email is reused, so the secret lives in one place.
+    pub tenant_id: String,
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 /// Web tools configuration.

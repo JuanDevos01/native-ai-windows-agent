@@ -8,6 +8,7 @@ pub mod web;
 pub mod browser;
 pub mod pagetree;
 pub mod pdf;
+pub mod sharepoint;
 pub mod skill_writer;
 pub mod vision;
 pub mod memory;

@@ -54,6 +54,17 @@
 .PARAMETER SkipConsent
   Create the app but do not attempt admin consent (for non-admin operators).
 
+.PARAMETER EnableSharePoint
+    Also request Sites.Selected, the site-scoped SharePoint permission.
+    On its own it grants nothing: pair it with -GrantSite to authorize a
+    specific site. Sites.Read.All is deliberately NOT used, because it would
+    let the app read every site collection in the organisation.
+
+.PARAMETER GrantSite
+    Authorize the app to read one SharePoint site, given as host:/sites/Name,
+    for example contoso.sharepoint.com:/sites/Finance. Run it again later for
+    each additional site; nothing else is touched.
+
 .PARAMETER SkipMailboxRestriction
   Do not scope the app to one mailbox. Not recommended - see SECURITY above.
 
@@ -74,6 +85,17 @@ param(
     [switch]$WriteConfig,
     [switch]$SkipConsent,
     [switch]$SkipMailboxRestriction,
+
+    # Also request the SharePoint permission. Sites.Selected grants NOTHING
+    # on its own: each site must then be authorized with -GrantSite. That is
+    # the point - Sites.Read.All would expose every site in the tenant.
+    [switch]$EnableSharePoint,
+
+    # Authorize this app to read ONE SharePoint site, e.g.
+    #   -GrantSite contoso.sharepoint.com:/sites/Finance
+    # Can be combined with -EnableSharePoint, or run on its own later to add
+    # another site without touching anything else.
+    [string]$GrantSite = "",
 
     # Re-apply permissions, consent and mailbox scoping to the EXISTING app
     # without creating another client secret. Use when access is denied but
@@ -96,6 +118,10 @@ $GraphAppId = "00000003-0000-0000-c000-000000000000"
 # Permission NAMES, not GUIDs: the ids are looked up from the tenant at run
 # time so a mistyped/stale GUID cannot silently grant the wrong permission.
 $WantedRoles = @("Mail.ReadWrite", "Mail.Send")
+# Sites.Selected is the site-scoped SharePoint permission: the app can read
+# nothing until an administrator grants it a named site. Deliberately NOT
+# Sites.Read.All, which reads every site collection in the organisation.
+if ($EnableSharePoint -or $GrantSite) { $WantedRoles += "Sites.Selected" }
 
 # Rebuild this script's own arguments, for the two places that hand over to a
 # fresh PowerShell session.
@@ -119,6 +145,13 @@ function Get-ForwardArgs {
     if ($WriteConfig)            { $a += '-WriteConfig' }
     if ($SkipConsent)            { $a += '-SkipConsent' }
     if ($SkipMailboxRestriction) { $a += '-SkipMailboxRestriction' }
+    # -RepairAccess MUST survive the relaunch. Dropping it would turn a
+    # repair into a full re-registration, minting a new client secret and
+    # invalidating the working one in config.json - the exact outcome repair
+    # mode exists to avoid.
+    if ($RepairAccess)           { $a += '-RepairAccess' }
+    if ($EnableSharePoint)       { $a += '-EnableSharePoint' }
+    if ($GrantSite)              { $a += '-GrantSite'; $a += (Format-Arg $GrantSite) }
     if ($MarkBootstrapped)       { $a += '-Bootstrapped' }
     return $a
 }
@@ -287,6 +320,56 @@ $access = @{
 Update-MgApplication -ApplicationId $app.Id -RequiredResourceAccess @($access)
 Write-Ok "Permissions requested"
 
+# ── 4b. SharePoint site grant ─────────────────────────────────────────────
+# Runs after consent so the permission exists before it is scoped; see the
+# call further down.
+function Grant-SharePointSite {
+    param([string]$SitePath, [string]$ClientId, [string]$DisplayName)
+
+    if (-not $SitePath) { return }
+    Write-Step "Authorizing the app to read SharePoint site '$SitePath'"
+
+    if ($SitePath -notmatch '^[^/]+:/') {
+        throw "Site must look like host:/sites/Name, for example contoso.sharepoint.com:/sites/Finance (got '$SitePath')."
+    }
+
+    try {
+        $site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$SitePath"
+    } catch {
+        throw "Could not find SharePoint site '$SitePath'. Check the host and path. Graph said: $($_.Exception.Message)"
+    }
+    $siteId = $site.id
+    Write-Ok "Site id $siteId"
+
+    # Already granted? Adding a duplicate is harmless but noisy, and telling
+    # the user it was already there is more useful than a second entry.
+    $existing = $null
+    try {
+        $perms = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/permissions"
+        $existing = $perms.value | Where-Object {
+            $_.grantedToIdentitiesV2.application.id -eq $ClientId
+        }
+    } catch { }
+
+    if ($existing) {
+        Write-Ok "Already authorized for this site"
+        return
+    }
+
+    $body = @{
+        roles = @("read")
+        grantedToIdentities = @(
+            @{ application = @{ id = $ClientId; displayName = $DisplayName } }
+        )
+    }
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/permissions" `
+        -Body ($body | ConvertTo-Json -Depth 6) | Out-Null
+    Write-Ok "Read access granted to '$SitePath'"
+    Write-Host "    Add this to config.json under tools.sharepoint.sites:" -ForegroundColor DarkGray
+    Write-Host "      `"$SitePath`"" -ForegroundColor DarkGray
+}
+
 # ── 5. Admin consent ──────────────────────────────────────────────────────
 if ($SkipConsent) {
     Write-Warn "Skipping admin consent (-SkipConsent). An administrator must grant it before Metis can connect."
@@ -305,6 +388,17 @@ if ($SkipConsent) {
             Write-Warn "You are probably not an admin. Re-run as one, or have an admin approve at:"
             Write-Warn "  https://login.microsoftonline.com/$TenantId/adminconsent?client_id=$($app.AppId)"
         }
+    }
+}
+
+# Site scoping runs here, after consent: Sites.Selected must exist on the app
+# before a site can be attached to it.
+if ($GrantSite) {
+    try {
+        Grant-SharePointSite -SitePath $GrantSite -ClientId $app.AppId -DisplayName $AppName
+    } catch {
+        Write-Warn "Could not grant the SharePoint site: $($_.Exception.Message)"
+        Write-Warn "Everything else above still applied. Re-run with -GrantSite once it is sorted."
     }
 }
 

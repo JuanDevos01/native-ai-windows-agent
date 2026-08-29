@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use metis_agent::tools::sharepoint::SharePointSettings;
 use metis_agent::{AgentLoop, ExecToolConfig, MemorySettings, OutboundFormatting};
 use metis_core::bus::queue::MessageBus;
 use metis_core::config::Config;
@@ -88,6 +89,8 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     };
 
     let memory_settings = build_memory_settings(config, &providers_map);
+    let sharepoint = build_sharepoint_settings(config);
+    let sp_workspace = workspace.clone();
 
     Ok(AgentLoop::new(
         bus,
@@ -106,7 +109,31 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
         Some(outbound),
     )
     .with_memory(memory_settings)
+    .with_sharepoint(sharepoint, sp_workspace)
     .with_direct_chat_context(defaults.chat_context_length))
+}
+
+/// Build SharePoint settings, falling back to the Graph app configured for
+/// email so the client secret is stored in exactly one place.
+pub fn build_sharepoint_settings(config: &Config) -> SharePointSettings {
+    let sp = &config.tools.sharepoint;
+    let mail = &config.channels.email;
+    let pick = |specific: &str, shared: &str| {
+        let s = specific.trim();
+        if s.is_empty() { shared.trim().to_string() } else { s.to_string() }
+    };
+    SharePointSettings {
+        enabled: sp.enabled,
+        sites: sp
+            .sites
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        tenant_id: pick(&sp.tenant_id, &mail.graph_tenant_id),
+        client_id: pick(&sp.client_id, &mail.graph_client_id),
+        client_secret: pick(&sp.client_secret, &mail.graph_client_secret),
+    }
 }
 
 /// Initialize tracing/logging.
@@ -124,4 +151,73 @@ pub fn init_logging(verbose: bool) {
         .with_target(false)
         .compact()
         .try_init();
+}
+
+#[cfg(test)]
+mod sharepoint_settings_tests {
+    use super::*;
+
+    fn base() -> Config {
+        let mut c = Config::default();
+        c.channels.email.graph_tenant_id = "mail-tenant".into();
+        c.channels.email.graph_client_id = "mail-client".into();
+        c.channels.email.graph_client_secret = "mail-secret".into();
+        c
+    }
+
+    #[test]
+    fn credentials_fall_back_to_the_email_graph_app() {
+        // One Azure app, one secret, stored once.
+        let mut c = base();
+        c.tools.sharepoint.enabled = true;
+        c.tools.sharepoint.sites = vec!["host:/sites/Finance".into()];
+
+        let s = build_sharepoint_settings(&c);
+        assert_eq!(s.tenant_id, "mail-tenant");
+        assert_eq!(s.client_id, "mail-client");
+        assert_eq!(s.client_secret, "mail-secret");
+        assert!(s.is_usable());
+    }
+
+    #[test]
+    fn explicit_credentials_win_over_the_email_app() {
+        let mut c = base();
+        c.tools.sharepoint.enabled = true;
+        c.tools.sharepoint.sites = vec!["host:/sites/Finance".into()];
+        c.tools.sharepoint.tenant_id = "own-tenant".into();
+        c.tools.sharepoint.client_id = "own-client".into();
+        c.tools.sharepoint.client_secret = "own-secret".into();
+
+        let s = build_sharepoint_settings(&c);
+        assert_eq!(s.tenant_id, "own-tenant");
+        assert_eq!(s.client_secret, "own-secret");
+    }
+
+    #[test]
+    fn disabled_by_default_even_when_email_graph_is_configured() {
+        // Configuring Graph for mail must never silently hand the agent
+        // SharePoint as well.
+        let s = build_sharepoint_settings(&base());
+        assert!(!s.enabled);
+        assert!(!s.is_usable(), "must not be usable without opting in");
+    }
+
+    #[test]
+    fn enabled_without_sites_is_still_not_usable() {
+        let mut c = base();
+        c.tools.sharepoint.enabled = true;
+        let s = build_sharepoint_settings(&c);
+        assert!(!s.is_usable(), "no site means nothing was authorized");
+    }
+
+    #[test]
+    fn blank_site_entries_are_dropped() {
+        let mut c = base();
+        c.tools.sharepoint.enabled = true;
+        c.tools.sharepoint.sites =
+            vec!["  ".into(), "host:/sites/Finance".into(), "".into()];
+        let s = build_sharepoint_settings(&c);
+        assert_eq!(s.sites, vec!["host:/sites/Finance".to_string()]);
+        assert!(s.is_usable());
+    }
 }

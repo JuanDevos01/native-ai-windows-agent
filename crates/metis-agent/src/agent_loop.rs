@@ -2173,6 +2173,38 @@ impl AgentLoop {
     ///
     /// Not attaching (or `enabled: false`) leaves memory off entirely — the
     /// agent then behaves exactly as before this feature existed.
+    /// Register the SharePoint tools, if configured.
+    ///
+    /// Opt-in on purpose: the underlying Graph permission is site-scoped, and
+    /// an agent that cannot reach SharePoint at all is the right default for
+    /// anyone who has not deliberately granted a site.
+    pub fn with_sharepoint(
+        mut self,
+        settings: crate::tools::sharepoint::SharePointSettings,
+        workspace: PathBuf,
+    ) -> Self {
+        use crate::tools::sharepoint::{
+            GraphSites, SharePointDownloadTool, SharePointSearchTool,
+        };
+        if !settings.is_usable() {
+            if settings.enabled {
+                info!(
+                    "sharepoint tools disabled: needs at least one site plus tenant id, client \
+                     id and client secret"
+                );
+            }
+            return self;
+        }
+        let sites = settings.sites.join(", ");
+        let graph = Arc::new(GraphSites::new(settings));
+        self.tools
+            .register(Arc::new(SharePointSearchTool::new(graph.clone())));
+        self.tools
+            .register(Arc::new(SharePointDownloadTool::new(graph, workspace)));
+        info!(sites = %sites, "sharepoint tools enabled");
+        self
+    }
+
     pub fn with_memory(mut self, settings: MemorySettings) -> Self {
         if !settings.enabled {
             self.memory = None;
