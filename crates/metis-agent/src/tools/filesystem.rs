@@ -433,6 +433,329 @@ impl Tool for ListDirTool {
 }
 
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// SearchFilesTool
+// ─────────────────────────────────────────────
+
+// Windows marks OneDrive/SharePoint "Files On-Demand" stubs with these.
+// A stub reports its full remote size but holds no data locally, so merely
+// opening one makes Windows download it — on a synced document library that
+// can mean hundreds of megabytes for a file the search then discards.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+/// Is this file a cloud placeholder rather than real local data?
+fn is_cloud_placeholder(md: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let a = md.file_attributes();
+        a & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = md;
+        false
+    }
+}
+
+/// Directories that are never worth walking and would swamp the results.
+fn is_noise_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | "target"
+            | ".git"
+            | ".svn"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".cargo"
+            | ".rustup"
+            | "AppData"
+            | "$RECYCLE.BIN"
+            | "System Volume Information"
+    )
+}
+
+/// Only files up to this size are scanned for content; anything larger is
+/// almost certainly not a document worth searching.
+const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+/// Directory depth cap, so a stray path cannot walk an entire drive.
+const MAX_DEPTH: usize = 12;
+
+/// Strip the Windows `\\?\` extended-length prefix that `canonicalize`
+/// adds, which is correct but unreadable in output the user sees.
+fn pretty_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
+/// One match inside a file.
+struct Hit {
+    path: PathBuf,
+    line_no: usize,
+    line: String,
+}
+
+/// What the walk deliberately did not look at, so a miss is never silently
+/// mistaken for "it is not there".
+#[derive(Default)]
+struct SearchStats {
+    scanned: usize,
+    skipped_cloud: usize,
+    skipped_binary: usize,
+    skipped_large: usize,
+    truncated: bool,
+}
+
+/// Searches a directory tree by filename and/or by text inside files.
+pub struct SearchFilesTool {
+    allowed_dir: Option<PathBuf>,
+}
+
+impl SearchFilesTool {
+    pub fn new(allowed_dir: Option<PathBuf>) -> Self {
+        Self { allowed_dir }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    dir: &Path,
+    depth: usize,
+    name_needle: Option<&str>,
+    content_needle: Option<&str>,
+    include_cloud: bool,
+    max_results: usize,
+    name_matches: &mut Vec<PathBuf>,
+    hits: &mut Vec<Hit>,
+    stats: &mut SearchStats,
+) {
+    if depth > MAX_DEPTH || stats.truncated {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // unreadable directory: skip it rather than abort the search
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(md) = entry.metadata() else { continue };
+
+        if md.is_dir() {
+            if !is_noise_dir(&name) {
+                walk(
+                    &path,
+                    depth + 1,
+                    name_needle,
+                    content_needle,
+                    include_cloud,
+                    max_results,
+                    name_matches,
+                    hits,
+                    stats,
+                );
+                if stats.truncated {
+                    return;
+                }
+            }
+            continue;
+        }
+        if !md.is_file() {
+            continue;
+        }
+
+        if let Some(n) = name_needle {
+            if !name.to_lowercase().contains(n) {
+                continue;
+            }
+        }
+
+        // Filename-only search never opens the file, so placeholders cost
+        // nothing and are safe to report.
+        let Some(needle) = content_needle else {
+            name_matches.push(path);
+            if name_matches.len() >= max_results {
+                stats.truncated = true;
+                return;
+            }
+            continue;
+        };
+
+        // Content search from here on — this is where opening a placeholder
+        // would trigger a download.
+        if !include_cloud && is_cloud_placeholder(&md) {
+            stats.skipped_cloud += 1;
+            continue;
+        }
+        if md.len() > MAX_SCAN_BYTES {
+            stats.skipped_large += 1;
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if bytes.contains(&0) {
+            stats.skipped_binary += 1;
+            continue;
+        }
+        stats.scanned += 1;
+        let text = String::from_utf8_lossy(&bytes);
+        for (i, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(needle) {
+                hits.push(Hit {
+                    path: path.clone(),
+                    line_no: i + 1,
+                    line: line.trim().chars().take(200).collect(),
+                });
+                if hits.len() >= max_results {
+                    stats.truncated = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SearchFilesTool {
+    fn name(&self) -> &str {
+        "search_files"
+    }
+
+    fn description(&self) -> &str {
+        "Search a folder tree for files by name and/or by text inside them. Use this instead of \
+         listing and reading files one by one. Works on any folder, including synced OneDrive and \
+         SharePoint libraries. Cloud-only placeholder files are skipped by default so the search \
+         does not trigger large downloads."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Folder to search in, searched recursively"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Text to find inside files (case-insensitive). Omit to search by filename only."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Only look at files whose name contains this (case-insensitive), e.g. 'invoice' or '.pdf'"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum matches to return (default 50)"
+                },
+                "include_cloud_files": {
+                    "type": "boolean",
+                    "description": "Also search OneDrive/SharePoint files that are not downloaded to this PC yet. Default false, because opening them downloads them and can be very slow."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, params: HashMap<String, Value>) -> anyhow::Result<String> {
+        let path_str = require_string(&params, "path")?;
+        let root = resolve_path(&path_str, self.allowed_dir.as_deref())?;
+        if !root.is_dir() {
+            anyhow::bail!("Not a directory: {}", root.display());
+        }
+
+        let lower = |k: &str| {
+            params
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+        };
+        let query = lower("query");
+        let name = lower("name");
+        if query.is_none() && name.is_none() {
+            anyhow::bail!("Give at least one of 'query' (text inside files) or 'name' (filename).");
+        }
+        let max_results = params
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 500) as usize;
+        let include_cloud = params
+            .get("include_cloud_files")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut name_matches = Vec::new();
+        let mut hits = Vec::new();
+        let mut stats = SearchStats::default();
+        walk(
+            &root,
+            0,
+            name.as_deref(),
+            query.as_deref(),
+            include_cloud,
+            max_results,
+            &mut name_matches,
+            &mut hits,
+            &mut stats,
+        );
+
+        let mut out = String::new();
+        if let Some(q) = query.as_deref() {
+            if hits.is_empty() {
+                out.push_str(&format!("No matches for '{q}' in {}.\n", pretty_path(&root)));
+            } else {
+                out.push_str(&format!("{} match(es):\n\n", hits.len()));
+                for h in &hits {
+                    out.push_str(&format!("{}:{}: {}\n", pretty_path(&h.path), h.line_no, h.line));
+                }
+            }
+            out.push_str(&format!("\n({} file(s) scanned)", stats.scanned));
+        } else if name_matches.is_empty() {
+            out.push_str(&format!("No files matching that name under {}.\n", pretty_path(&root)));
+        } else {
+            out.push_str(&format!("{} file(s):\n\n", name_matches.len()));
+            for p in &name_matches {
+                out.push_str(&format!("{}\n", pretty_path(p)));
+            }
+        }
+
+        // Say what was skipped. A search that quietly ignored half the folder
+        // and reported "no matches" would be worse than no search at all.
+        if stats.skipped_cloud > 0 {
+            out.push_str(&format!(
+                "\n\nNote: {} file(s) were skipped because they live in the cloud and are not \
+                 downloaded to this PC. They were NOT searched, so a match could be hiding in \
+                 them. Re-run with include_cloud_files=true to download and search them (slow).",
+                stats.skipped_cloud
+            ));
+        }
+        if stats.skipped_large > 0 {
+            out.push_str(&format!("\nSkipped {} file(s) larger than 8 MB.", stats.skipped_large));
+        }
+        if stats.skipped_binary > 0 {
+            out.push_str(&format!(
+                "\nSkipped {} binary file(s). For PDFs use read_pdf; for images use analyze_image.",
+                stats.skipped_binary
+            ));
+        }
+        if stats.truncated {
+            out.push_str("\nStopped at the result limit — narrow the search or raise max_results.");
+        }
+        Ok(out)
+    }
+}
+
 // Tests
 // ─────────────────────────────────────────────
 
@@ -675,5 +998,105 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("path".into(), Value::String(txt.display().to_string()));
         assert_eq!(tool.execute(p).await.unwrap(), "hello world");
+    }
+
+    // ── SearchFilesTool ──
+
+    #[tokio::test]
+    async fn search_finds_text_inside_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
+        std::fs::write(dir.path().join("sub/deeper/note.txt"), "hello\nInvoice 4711 total\nbye")
+            .unwrap();
+        std::fs::write(dir.path().join("other.txt"), "nothing here").unwrap();
+
+        let tool = SearchFilesTool::new(None);
+        let out = tool
+            .execute(make_params(&[
+                ("path", dir.path().to_str().unwrap()),
+                ("query", "invoice 4711"),
+            ]))
+            .await
+            .unwrap();
+
+        assert!(out.contains("note.txt"), "{out}");
+        assert!(out.contains(":2:"), "should report the line number: {out}");
+        assert!(!out.contains("other.txt"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn search_by_name_does_not_need_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Invoice_2026.pdf"), "%PDF-1.4 binary").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "text").unwrap();
+
+        let tool = SearchFilesTool::new(None);
+        let out = tool
+            .execute(make_params(&[
+                ("path", dir.path().to_str().unwrap()),
+                ("name", "invoice"),
+            ]))
+            .await
+            .unwrap();
+
+        assert!(out.contains("Invoice_2026.pdf"), "{out}");
+        assert!(!out.contains("readme.md"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn search_requires_query_or_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SearchFilesTool::new(None);
+        let err = tool
+            .execute(make_params(&[("path", dir.path().to_str().unwrap())]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_skips_binaries_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A NUL byte marks this as binary; grepping it would emit garbage.
+        std::fs::write(dir.path().join("blob.bin"), b"secret\x00\x00payload").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "secret payload").unwrap();
+
+        let tool = SearchFilesTool::new(None);
+        let out = tool
+            .execute(make_params(&[
+                ("path", dir.path().to_str().unwrap()),
+                ("query", "secret"),
+            ]))
+            .await
+            .unwrap();
+
+        assert!(out.contains("plain.txt"), "{out}");
+        assert!(!out.contains("blob.bin"), "binary should not be a hit: {out}");
+        assert!(out.contains("binary file"), "should disclose the skip: {out}");
+    }
+
+    #[tokio::test]
+    async fn search_respects_allowed_dir() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = SearchFilesTool::new(Some(allowed.path().to_path_buf()));
+        let err = tool
+            .execute(make_params(&[
+                ("path", outside.path().to_str().unwrap()),
+                ("query", "x"),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Access denied"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_local_files_are_not_mistaken_for_cloud_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("real.txt");
+        std::fs::write(&f, "on disk").unwrap();
+        assert!(!is_cloud_placeholder(&std::fs::metadata(&f).unwrap()));
     }
 }

@@ -27,7 +27,9 @@ use crate::tools::memory::{MemorySaveTool, MemorySearchTool};
 use crate::tools::message::MessageTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::browser::BrowserTool;
-use crate::tools::filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::filesystem::{
+    EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
+};
 use crate::tools::shell::ExecTool;
 use crate::tools::spawn::SpawnTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
@@ -2079,7 +2081,8 @@ impl AgentLoop {
         tools.register(Arc::new(ReadFileTool::new(allowed_dir.clone())));
         tools.register(Arc::new(WriteFileTool::new(allowed_dir.clone())));
         tools.register(Arc::new(EditFileTool::new(allowed_dir.clone())));
-        tools.register(Arc::new(ListDirTool::new(allowed_dir)));
+        tools.register(Arc::new(ListDirTool::new(allowed_dir.clone())));
+        tools.register(Arc::new(SearchFilesTool::new(allowed_dir)));
         tools.register(Arc::new(ExecTool::new(
             workspace.clone(),
             Some(exec_config.timeout),
@@ -4719,7 +4722,8 @@ Write-Output "hello"
         assert!(names.contains(&"save_skill".into()));
         assert!(names.contains(&"message".into()));
         assert!(names.contains(&"spawn".into()));
-        assert_eq!(names.len(), 12);
+        assert!(names.contains(&"search_files".into()));
+        assert_eq!(names.len(), 13);
     }
 
     #[test]

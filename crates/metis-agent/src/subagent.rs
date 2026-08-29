@@ -23,14 +23,14 @@ use tracing::{debug, error, info};
 
 use metis_core::bus::queue::MessageBus;
 use metis_core::bus::types::{InboundMessage, OutboundMessage};
-use metis_core::types::{Message, ToolCall};
+use metis_core::types::Message;
 use metis_providers::traits::{LlmProvider, LlmRequestConfig};
 
 use crate::agent_loop::{is_chat_app_channel, tool_outcome_preview, tool_progress_preview};
 
 use crate::agent_loop::ExecToolConfig;
 use crate::context::ContextBuilder;
-use crate::tools::filesystem::{ListDirTool, ReadFileTool, WriteFileTool};
+use crate::tools::filesystem::{ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::ExecTool;
 use crate::tools::web::{WebFetchTool, WebSearchTool};
@@ -224,7 +224,8 @@ impl SubagentManager {
 
         tools.register(Arc::new(ReadFileTool::new(allowed_dir.clone())));
         tools.register(Arc::new(WriteFileTool::new(allowed_dir.clone())));
-        tools.register(Arc::new(ListDirTool::new(allowed_dir)));
+        tools.register(Arc::new(ListDirTool::new(allowed_dir.clone())));
+        tools.register(Arc::new(SearchFilesTool::new(allowed_dir)));
         tools.register(Arc::new(ExecTool::new(
             self.workspace.clone(),
             Some(self.exec_config.timeout),
@@ -425,7 +426,7 @@ fn generate_task_id() -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use metis_core::types::{LlmResponse, ToolDefinition};
+    use metis_core::types::{LlmResponse, ToolCall, ToolDefinition};
 
     /// Mock provider for testing subagent.
     struct MockSubagentProvider {
@@ -703,6 +704,7 @@ mod tests {
         tools.register(Arc::new(ReadFileTool::new(None)));
         tools.register(Arc::new(WriteFileTool::new(None)));
         tools.register(Arc::new(ListDirTool::new(None)));
+        tools.register(Arc::new(SearchFilesTool::new(None)));
         tools.register(Arc::new(ExecTool::new(
             std::env::temp_dir(),
             Some(60),
@@ -714,8 +716,8 @@ mod tests {
         tools.register(Arc::new(WebFetchTool::new()));
 
         let names = tools.tool_names();
-        // Should have exactly 6 tools
-        assert_eq!(names.len(), 6);
+        // Should have exactly 7 tools
+        assert_eq!(names.len(), 7);
         // Should NOT have message, spawn, or edit_file
         assert!(!names.contains(&"message".into()));
         assert!(!names.contains(&"spawn".into()));
