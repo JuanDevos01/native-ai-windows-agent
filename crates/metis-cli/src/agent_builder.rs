@@ -110,6 +110,7 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     )
     .with_memory(memory_settings)
     .with_sharepoint(sharepoint, sp_workspace)
+    .with_builtin_skills(builtin_skills_dir())
     .with_direct_chat_context(defaults.chat_context_length))
 }
 
@@ -220,4 +221,25 @@ mod sharepoint_settings_tests {
         assert_eq!(s.sites, vec!["host:/sites/Finance".to_string()]);
         assert!(s.is_usable());
     }
+}
+
+/// Locate the skills that ship with Metis.
+///
+/// `ContextBuilder::with_builtin_skills` existed but nothing ever called it,
+/// so only the user's own workspace skills were ever loaded and every shipped
+/// skill was dead weight. Looked up next to the executable first (an installed
+/// copy), then relative to the source tree (a dev run).
+pub fn builtin_skills_dir() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("skills"));
+            // target/{debug,release}/metis.exe -> repo root
+            if let Some(root) = dir.parent().and_then(|p| p.parent()) {
+                candidates.push(root.join("skills"));
+            }
+        }
+    }
+    candidates.push(std::path::PathBuf::from("skills"));
+    candidates.into_iter().find(|p| p.is_dir())
 }

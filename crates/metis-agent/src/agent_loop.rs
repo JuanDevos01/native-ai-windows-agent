@@ -1086,19 +1086,77 @@ fn last_exec_failure_hint(outputs: &[String]) -> String {
 /// Used to inject a "stop planning, execute now" continuation.
 fn response_is_plan_without_tools(content: &str) -> bool {
     let lower = content.to_lowercase();
-    let has_plan_words = lower.contains("step 1")
-        || lower.contains("step 2")
-        || lower.contains("first,")
-        || lower.contains("first i")
-        || lower.contains("let me")
+    // Only FIRST-PERSON INTENT TO ACT NOW counts.
+    //
+    // This used to fire on a bare code block, or on words like "first,",
+    // "checking" and "i need to", which are how you EXPLAIN something. So
+    // answering "what ways can we connect a mailbox" with a numbered list and
+    // an example command looked identical to promising to act and not acting.
+    // The nudge then told the model it had failed to do the work, and the
+    // model's defensive reply to that nudge went to the user in place of the
+    // answer it had already written.
+    let intends_to_act = lower.contains("let me")
         || lower.contains("i'll start")
         || lower.contains("i will start")
-        || lower.contains("checking")
         || lower.contains("i'll check")
-        || lower.contains("starting both")
-        || lower.contains("i need to");
-    let has_code_block = content.contains("```");
-    (has_plan_words || has_code_block) && content.len() > 60
+        || lower.contains("i'll run")
+        || lower.contains("i will run")
+        || lower.contains("i'll go ahead")
+        || lower.contains("i'm going to")
+        || lower.contains("i am going to")
+        || lower.contains("i need to check")
+        || lower.contains("i need to run")
+        || lower.contains("starting both");
+    intends_to_act && content.len() > 60
+}
+
+/// True when the user asked for something to be DONE, rather than asking a
+/// question about how something works.
+///
+/// The act-without-acting nudges only make sense when there was an action to
+/// take. Firing them on a plain question is what produced replies like "That's
+/// a question, not a task" — the model defending itself against a machine
+/// message the user never sent. When in doubt this returns false: failing to
+/// nudge merely leaves an answer un-acted-upon, and the user can say "do it",
+/// whereas nudging a question corrupts the reply.
+fn user_message_requests_action(msg: &str) -> bool {
+    let lower = msg.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    // An imperative verb anywhere means there is real work being asked for,
+    // even when it is phrased politely as a question ("can you fix the build?").
+    const ACTION_VERBS: &[&str] = &[
+        "fix", "run", "build", "create", "delete", "remove", "install", "start",
+        "stop", "restart", "send", "add", "update", "make", "deploy", "commit",
+        "push", "pull", "write", "edit", "change", "rename", "move", "copy",
+        "set up", "setup", "configure", "implement", "generate", "download",
+        "upload", "open", "close", "kill", "clean", "test", "check ",
+    ];
+    let has_action_verb = ACTION_VERBS.iter().any(|v| {
+        lower.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == *v)
+            || lower.contains(&format!("{v} "))
+    });
+    if has_action_verb {
+        return true;
+    }
+    // No imperative: treat anything interrogative as a question. The
+    // question word does not have to come first — "It is for a new app so
+    // what ways can we connect a mailbox" is still a question.
+    const QUESTION_WORDS: &[&str] =
+        &["what", "whats", "which", "why", "how", "who", "when", "where"];
+    let asks_anywhere = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .any(|w| QUESTION_WORDS.contains(&w));
+    // Leading auxiliaries only count at the start: "can we connect" is a
+    // question, "the job can fail" is not.
+    const QUESTION_OPENERS: &[&str] = &[
+        "is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ",
+        "could ", "should ", "would ", "will ", "am i", "any ", "have you",
+    ];
+    let opens_interrogative = QUESTION_OPENERS.iter().any(|q| lower.starts_with(q));
+    !(asks_anywhere || opens_interrogative || lower.ends_with('?'))
 }
 
 /// True when the model response describes having identified a problem but hasn't called
@@ -1106,27 +1164,22 @@ fn response_is_plan_without_tools(content: &str) -> bool {
 /// where the agent narrates rather than acts.
 fn response_identified_problem_without_fix(content: &str) -> bool {
     let lower = content.to_lowercase();
-    let identified = lower.contains("i see the problem")
-        || lower.contains("i see the issue")
-        || lower.contains("i found the")
-        || lower.contains("the issue is")
-        || lower.contains("the problem is")
-        || lower.contains("the error is")
-        || lower.contains("the bug is")
-        || lower.contains("i can see")
-        || lower.contains("i notice")
-        || lower.contains("i've identified")
-        || lower.contains("the root cause")
-        || lower.contains("the fix is")
-        || lower.contains("let me fix")
+    // Naming a problem is not the trigger — SAYING YOU WILL FIX IT and then
+    // not fixing it is. Phrases like "i can see" and "needs to be" were
+    // firing on ordinary explanations.
+    let identified = lower.contains("let me fix")
         || lower.contains("i'll fix")
+        || lower.contains("i will fix")
         || lower.contains("i need to fix")
-        || lower.contains("needs to be")
-        || lower.contains("should be fixed")
-        || lower.contains("missing column")
-        || lower.contains("schema mismatch")
-        || lower.contains("alter table")
-        || lower.contains("pip install");
+        || lower.contains("let me correct")
+        || lower.contains("i'll correct")
+        || lower.contains("let me update")
+        || lower.contains("i'll update")
+        || ((lower.contains("i see the problem")
+            || lower.contains("i see the issue")
+            || lower.contains("i found the")
+            || lower.contains("the root cause"))
+            && (lower.contains("let me") || lower.contains("i'll")));
     // Only counts if it's a substantial response (not a one-liner)
     identified && content.len() > 40
 }
@@ -1811,16 +1864,27 @@ fn is_meta_non_answer(content: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_lowercase();
+    // Every phrasing here was observed being shown to a user as if it were
+    // the answer, while the real answer sat in pre_nudge_answer.
     let claims_already_done = lower.contains("already answered")
         || lower.contains("already did")
         || lower.contains("already told you")
         || lower.contains("already provided")
+        || lower.contains("already explained")
         || lower.contains("as stated above")
         || lower.contains("see above")
+        || lower.contains("directly above")
+        || lower.contains("i did answer")
+        || lower.contains("i answered")
+        || lower.contains("i explained")
         || lower.contains("no further action")
         || lower.contains("no further searching")
         || lower.contains("nothing further")
         || lower.contains("no tool call needed")
+        || lower.contains("no tool was needed")
+        || lower.contains("no tool call was needed")
+        || lower.contains("not a task")
+        || lower.contains("that's a question")
         || lower.contains("i did call");
     claims_already_done
 }
@@ -2173,6 +2237,18 @@ impl AgentLoop {
     ///
     /// Not attaching (or `enabled: false`) leaves memory off entirely — the
     /// agent then behaves exactly as before this feature existed.
+    /// Point the context builder at the skills bundled with Metis.
+    ///
+    /// Without this only `workspace/skills` is discovered, which is why
+    /// shipped skills never reached the model.
+    pub fn with_builtin_skills(mut self, dir: Option<PathBuf>) -> Self {
+        if let Some(dir) = dir {
+            info!(dir = %dir.display(), "loading built-in skills");
+            self.context.set_builtin_skills(dir);
+        }
+        self
+    }
+
     /// Register the SharePoint tools, if configured.
     ///
     /// Opt-in on purpose: the underlying Graph permission is site-scoped, and
@@ -3142,8 +3218,16 @@ Run the next command in a follow-up message, or combine steps into one script."
                 // "I see the problem…") on an early iteration but called no tool. Nudge it to
                 // actually act. This keys off the model's own stated intent, not task keywords,
                 // so it does not force tool calls when the model simply answered a question.
+                // Both of the "you narrated instead of acting" nudges are
+                // suppressed when the user only asked a question. There is
+                // nothing to act on, so the nudge can only damage the answer.
+                // Nudges that reflect a REAL failure (a tool that errored, an
+                // approval still pending, faked tool-call syntax) are not
+                // gated on this — those are true regardless of what was asked.
+                let user_wants_action = user_message_requests_action(&msg.content);
                 let said_will_act_but_didnt = exec_calls_executed == 0
                     && iteration < 3
+                    && user_wants_action
                     && (response_is_plan_without_tools(content_text)
                         || response_identified_problem_without_fix(content_text));
 
@@ -3154,6 +3238,7 @@ Run the next command in a follow-up message, or combine steps into one script."
                 // the post-loop recovery, which can only bolt an answer on.
                 let narrated_command_without_tool = exec_calls_executed == 0
                     && iteration < 3
+                    && user_wants_action
                     && (looks_like_unexecuted_exec_narration(content_text)
                         || looks_like_unexecuted_read_narration(content_text));
 
@@ -3228,7 +3313,13 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                     if pre_nudge_answer.is_none() {
                         if let Some(prev) = response.content.as_deref() {
                             let cleaned = strip_all_exec_reports_from_text(prev);
-                            if cleaned.chars().count() >= 80 {
+                            // Any real content is worth keeping. The old floor
+                            // of 80 characters threw away exactly the replies
+                            // most worth restoring — short clarifying
+                            // questions ("which auth method do you have?") —
+                            // leaving nothing to fall back to when the model
+                            // then answered the nudge instead of the user.
+                            if !cleaned.trim().is_empty() {
                                 pre_nudge_answer = Some(prev.to_string());
                             }
                         }
@@ -4756,6 +4847,84 @@ Write-Output "hello"
         assert!(names.contains(&"spawn".into()));
         assert!(names.contains(&"search_files".into()));
         assert_eq!(names.len(), 13);
+    }
+
+
+    // ── Regression: the "I did answer" transcript ──
+    //
+    // A user asked a plain question ("what ways can we connect a Microsoft
+    // mailbox"). The model answered it. The answer contained a code block, so
+    // response_is_plan_without_tools fired, a nudge told the model it had
+    // failed to act, and the model's defensive reply to the NUDGE was shown
+    // to the user instead of the answer. From the user's side the agent
+    // insisted it had already answered something they had never seen.
+
+    const ANSWER_WITH_CODE: &str = "There are four ways to connect a Microsoft 365 mailbox.\n\n1. Microsoft Graph API with app-only OAuth — the supported route.\n2. IMAP with an app password.\n3. SMTP for sending only.\n4. Exchange Web Services, now deprecated.\n\nFor a new app I would use Graph. The registration looks like this:\n\n```powershell\nNew-MgApplication -DisplayName 'My App'\n```\n\nThat gives you a client id and secret to put in config.";
+
+    #[test]
+    fn explaining_something_with_a_code_block_is_not_a_plan_to_act() {
+        // A code block is how you EXPLAIN, not evidence of intent to act.
+        assert!(
+            !response_is_plan_without_tools(ANSWER_WITH_CODE),
+            "an answer that explains with an example must not be read as an unexecuted plan"
+        );
+    }
+
+    #[test]
+    fn a_plain_question_does_not_request_action() {
+        for q in [
+            "Can you Connect to a office365 mailbox",
+            "It is for a new app so what ways Can we connect a Microsoft mailbox",
+            "what are the next steps",
+            "how does the approval queue work?",
+            "is the gateway running?",
+        ] {
+            assert!(
+                !user_message_requests_action(q),
+                "should be treated as a question, not a task: {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn imperatives_still_request_action() {
+        for t in [
+            "fix the cron job",
+            "run the tests",
+            "can you fix the failing build?",
+            "please install whisper",
+            "add a domain whitelist to the config",
+            "push this to git",
+        ] {
+            assert!(
+                user_message_requests_action(t),
+                "should still be treated as a task: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn defensive_replies_to_a_nudge_are_recognised_as_non_answers() {
+        // Every one of these was shown to a user as if it were the answer.
+        for reply in [
+            "I did answer — no tool was needed yet. I was asking you which auth method you have \
+             (app password vs OAuth) and what you want to do (read / send / both) before I proceed.",
+            "That's a question, not a task. I answered it directly above — the four connection \
+             methods and my recommendation (Graph API with OAuth). No tool call needed.",
+            "You're right — I can connect, I explained how, but I haven't actually done it yet.",
+            "I already answered that above.",
+        ] {
+            assert!(
+                is_meta_non_answer(reply),
+                "must be caught so the real answer is restored: {reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_answer_is_not_mistaken_for_a_non_answer() {
+        assert!(!is_meta_non_answer(ANSWER_WITH_CODE));
+        assert!(!is_meta_non_answer("The gateway is running as pid 6720."));
     }
 
     #[test]

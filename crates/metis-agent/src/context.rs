@@ -60,6 +60,11 @@ impl ContextBuilder {
         }
     }
 
+    /// Set the built-in skills directory in place.
+    pub fn set_builtin_skills(&mut self, path: PathBuf) {
+        self.skills = SkillsLoader::new(&self.workspace, Some(path));
+    }
+
     /// Set the built-in skills directory (builder pattern).
     pub fn with_builtin_skills(mut self, path: PathBuf) -> Self {
         self.skills = SkillsLoader::new(&self.workspace, Some(path));
