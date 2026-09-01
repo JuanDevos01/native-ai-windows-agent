@@ -1,0 +1,28 @@
+{
+  "skills": [
+    {
+      "name": "voice-transcribe",
+      "description": "Automatically transcribe voice messages from Telegram using whisper.cpp",
+      "location": "C:\\Users\\chack\\.metis\\workspace\\skills\\voice-transcribe",
+      "enabled": true
+    },
+    {
+      "name": "invoice-processor",
+      "description": "Process invoices from emails, extract data using regex, display on web interface, upload to FTP",
+      "location": "C:\\Users\\chack\\.metis\\workspace\\skills\\invoice-processor",
+      "enabled": true
+    },
+    {
+      "name": "skill-creator",
+      "description": "Create or update skills. Use when designing, structuring, or packaging skills with scripts, references, and assets.",
+      "location": "C:\\Users\\chack\\.metis\\workspace\\skills\\skill-creator",
+      "enabled": true
+    },
+    {
+      "name": "tts-telegram",
+      "description": "tts-telegram",
+      "location": "C:\\Users\\chack\\.metis\\workspace\\skills\\tts-telegram",
+      "enabled": true
+    }
+  ]
+}
