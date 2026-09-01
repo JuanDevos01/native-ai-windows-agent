@@ -53,7 +53,21 @@ pub struct CronService {
     shutdown: Arc<Notify>,
     /// Re-arm signal (when jobs are added/modified).
     rearm: Arc<Notify>,
+    /// Modification time of the store as of our last read or write.
+    ///
+    /// The store is shared with every `metis cron ...` CLI invocation, which
+    /// is a separate process. Without this, a long-running gateway kept the
+    /// copy it loaded at startup and every save silently overwrote whatever
+    /// the CLI had added in the meantime.
+    last_seen_mtime: Arc<Mutex<Option<std::time::SystemTime>>>,
 }
+
+/// How long the scheduler may sleep before re-checking the store on disk.
+///
+/// The re-arm signal is in-process only, so a job added by the CLI cannot
+/// wake this loop. Capping the sleep bounds how long such a job stays
+/// invisible.
+const STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl CronService {
     /// Create a new cron service.
@@ -72,6 +86,47 @@ impl CronService {
             on_job: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(Notify::new()),
             rearm: Arc::new(Notify::new()),
+            last_seen_mtime: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Modification time of the store file, if it exists.
+    async fn store_mtime(&self) -> Option<std::time::SystemTime> {
+        tokio::fs::metadata(&self.store_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+    }
+
+    /// True when the file changed since we last read or wrote it.
+    async fn changed_on_disk(&self) -> bool {
+        let current = self.store_mtime().await;
+        let seen = *self.last_seen_mtime.lock().await;
+        match (current, seen) {
+            (Some(c), Some(s)) => c != s,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// Re-read the store when another process has changed it.
+    ///
+    /// Job definitions AND run state both live in the file, so adopting the
+    /// on-disk copy wholesale is correct: whoever wrote it last had loaded
+    /// our state first.
+    pub async fn reload_if_changed(&self) -> bool {
+        if !self.changed_on_disk().await {
+            return false;
+        }
+        match self.load().await {
+            Ok(()) => {
+                debug!("cron store changed on disk, reloaded");
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "cron store changed on disk but could not be re-read");
+                false
+            }
         }
     }
 
@@ -92,12 +147,17 @@ impl CronService {
             return Ok(());
         }
 
+        // Read the mtime BEFORE the contents: if a writer lands between the
+        // two, we record an older stamp and re-read next tick, rather than
+        // recording a newer one and never noticing the change.
+        let mtime = self.store_mtime().await;
         let data = tokio::fs::read_to_string(&self.store_path).await?;
         let loaded: CronStore = serde_json::from_str(&data)
             .map_err(|e| anyhow::anyhow!("failed to parse cron store: {}", e))?;
 
         let mut store = self.store.lock().await;
         *store = loaded;
+        *self.last_seen_mtime.lock().await = mtime;
         info!(
             path = %self.store_path.display(),
             jobs = store.jobs.len(),
@@ -113,9 +173,33 @@ impl CronService {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let store = self.store.lock().await;
+        let mut store = self.store.lock().await;
+
+        // Another process may have added a job since we last read the file.
+        // Writing our copy verbatim would delete it — which is exactly what
+        // happened to jobs added with `metis cron add` while the gateway was
+        // running: the add succeeded, then the next scheduled run wrote the
+        // gateway's stale copy back over it.
+        if self.changed_on_disk().await {
+            if let Ok(data) = tokio::fs::read_to_string(&self.store_path).await {
+                if let Ok(disk) = serde_json::from_str::<CronStore>(&data) {
+                    for job in disk.jobs {
+                        if !store.jobs.iter().any(|j| j.id == job.id) {
+                            info!(id = %job.id, name = %job.name, "adopting job added by another process");
+                            store.jobs.push(job);
+                        }
+                    }
+                }
+            }
+        }
+
         let json = serde_json::to_string_pretty(&*store)?;
-        tokio::fs::write(&self.store_path, json).await?;
+        // Write to a temp file and rename, so a concurrent reader never sees
+        // a half-written store.
+        let tmp = self.store_path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, json).await?;
+        tokio::fs::rename(&tmp, &self.store_path).await?;
+        *self.last_seen_mtime.lock().await = self.store_mtime().await;
         debug!(path = %self.store_path.display(), "saved cron store");
         Ok(())
     }
@@ -210,6 +294,9 @@ impl CronService {
         info!("cron service started");
 
         loop {
+            // Adopt anything the CLI changed while we were asleep.
+            self.reload_if_changed().await;
+
             // Find how long to sleep
             let sleep_ms = {
                 let store = self.store.lock().await;
@@ -220,9 +307,12 @@ impl CronService {
                 let delay = (ms - Utc::now().timestamp_millis()).max(0) as u64;
                 std::time::Duration::from_millis(delay)
             } else {
-                // No scheduled jobs — sleep a long time, rearm will wake us
+                // No scheduled jobs — wait for a rearm or an external change.
                 std::time::Duration::from_secs(3600)
-            };
+            }
+            // Never sleep past the poll interval: a job the CLI adds cannot
+            // signal this process, so the only way to notice it is to look.
+            .min(STORE_POLL_INTERVAL);
 
             debug!(sleep_ms = sleep_duration.as_millis() as u64, "cron timer armed");
 
@@ -810,5 +900,121 @@ mod tests {
         let a = CronService::next_run_after_execution(&schedule, Some(now - 60_000), now);
         let b = compute_next_run_from(&schedule, now);
         assert_eq!(a, b);
+    }
+
+    // ── Regression: a job added by another process must survive ──────────
+    //
+    // A user asked the agent to schedule a news job. `metis cron add` ran in
+    // its own process and succeeded. The gateway had loaded the store at
+    // startup the previous evening and never re-read it, so the next
+    // scheduled run wrote its stale copy back and the new job was gone. The
+    // add really had worked, which is why the agent reported success — the
+    // job was destroyed afterwards, silently.
+
+    /// Build a job with a stable id derived from its name.
+    fn make_job(name: &str) -> CronJob {
+        let mut j = CronJob::new(name, CronSchedule::every(600_000), CronPayload::default());
+        j.name = name.to_string();
+        j
+    }
+
+    /// Write a store file directly, as a separate process would.
+    fn write_store_file(path: &std::path::Path, jobs: Vec<CronJob>) {
+        let store = CronStore { version: 1, jobs };
+        std::fs::write(path, serde_json::to_string_pretty(&store).unwrap()).unwrap();
+    }
+
+    fn read_job_names(path: &std::path::Path) -> Vec<String> {
+        let data = std::fs::read_to_string(path).unwrap();
+        let store: CronStore = serde_json::from_str(&data).unwrap();
+        store.jobs.into_iter().map(|j| j.name).collect()
+    }
+
+    #[tokio::test]
+    async fn saving_does_not_delete_a_job_added_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let bus = Arc::new(MessageBus::new(10));
+
+        // The gateway starts and loads one job.
+        write_store_file(&path, vec![make_job("existing")]);
+        let svc = CronService::new(bus, Some(path.clone()));
+        svc.load().await.unwrap();
+
+        // The CLI, a separate process, adds another job.
+        let mut jobs = vec![make_job("existing"), make_job("added-by-cli")];
+        jobs[1].id = "cli00001".to_string();
+        write_store_file(&path, jobs);
+
+        // The gateway finishes a run and saves.
+        svc.save().await.unwrap();
+
+        let names = read_job_names(&path);
+        assert!(
+            names.iter().any(|n| n == "added-by-cli"),
+            "the CLI's job was destroyed by the gateway's save: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "existing"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn an_externally_added_job_is_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let bus = Arc::new(MessageBus::new(10));
+
+        write_store_file(&path, vec![make_job("existing")]);
+        let svc = CronService::new(bus, Some(path.clone()));
+        svc.load().await.unwrap();
+        assert_eq!(svc.list_jobs().await.len(), 1);
+
+        // Someone runs `metis cron add`.
+        let mut jobs = vec![make_job("existing"), make_job("added-by-cli")];
+        jobs[1].id = "cli00001".to_string();
+        // Filesystem mtime resolution is coarse; make the change unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_store_file(&path, jobs);
+
+        assert!(svc.reload_if_changed().await, "the change should be noticed");
+        assert_eq!(
+            svc.list_jobs().await.len(),
+            2,
+            "the scheduler must see the new job, or it will never run it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_store_is_not_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let bus = Arc::new(MessageBus::new(10));
+
+        write_store_file(&path, vec![make_job("existing")]);
+        let svc = CronService::new(bus, Some(path.clone()));
+        svc.load().await.unwrap();
+        assert!(!svc.reload_if_changed().await, "nothing changed");
+
+        // Our own save must not look like an external change either.
+        svc.save().await.unwrap();
+        assert!(!svc.reload_if_changed().await, "our own write is not external");
+    }
+
+    #[tokio::test]
+    async fn the_store_is_never_left_half_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let bus = Arc::new(MessageBus::new(10));
+
+        let svc = CronService::new(bus, Some(path.clone()));
+        svc.add_job(make_job("a")).await.unwrap();
+        svc.add_job(make_job("b")).await.unwrap();
+
+        // A reader at any point must get valid JSON, and no temp file is left.
+        let data = std::fs::read_to_string(&path).unwrap();
+        serde_json::from_str::<CronStore>(&data).expect("store must always parse");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file should have been renamed away"
+        );
     }
 }

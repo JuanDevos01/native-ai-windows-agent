@@ -144,7 +144,11 @@ fn format_duration_ms(ms: i64) -> String {
 fn format_timestamp_ms(ms: i64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_millis_opt(ms) {
-        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        // The offset is not decoration. This is machine time printed for a
+        // reader whose own clock reference is UTC (the agent is told the
+        // time in UTC), so an unlabelled local time is genuinely ambiguous —
+        // it led to "next run 09:00" being reported when it was already 12:00.
+        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M %:z").to_string(),
         _ => "—".to_string(),
     }
 }
@@ -216,6 +220,15 @@ async fn list_jobs(include_disabled: bool) -> Result<()> {
     println!();
 
     // Header
+    // State the current time in both zones, so a reader never has to infer
+    // which zone "Next Run" is in or how far away it is.
+    let now_local = chrono::Local::now();
+    println!(
+        "  now: {}  ({} UTC)",
+        now_local.format("%Y-%m-%d %H:%M %:z"),
+        chrono::Utc::now().format("%H:%M")
+    );
+    println!();
     println!(
         "  {:<10} {:<20} {:<18} {:<10} {}",
         "ID".bold(),
@@ -224,7 +237,7 @@ async fn list_jobs(include_disabled: bool) -> Result<()> {
         "Status".bold(),
         "Next Run".bold(),
     );
-    println!("  {}", "─".repeat(76));
+    println!("  {}", "─".repeat(84));
 
     for job in &jobs {
         // Format schedule

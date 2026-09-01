@@ -3005,6 +3005,9 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // become the final answer and throw the real one away. A nudge must
         // be able to improve the reply, never destroy it.
         let mut pre_nudge_answer: Option<String> = None;
+        // Bounds the single retry when the model claims it already answered
+        // but there is nothing it could have been referring to.
+        let mut meta_answer_retries = 0usize;
 
         // For any non-trivial request, post a visible "goal" line up-front so the user can see
         // what the agent set out to do (helps when work takes a while). Marked intermediate so
@@ -3341,7 +3344,37 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 // nudge fired earlier and this reply is just an
                 // acknowledgement ("I already answered that"), keep the
                 // substantive answer it replaced.
-                final_content = match (response.content, pre_nudge_answer.take()) {
+                let latest = response.content;
+                let earlier = pre_nudge_answer.take();
+
+                // A reply that says "I already answered" when there is no
+                // earlier answer to point at must never be sent. The user
+                // sees only an accusation that they missed something that was
+                // never there. Worse, once such a reply is in the session
+                // history the model copies the pattern from itself, so it
+                // spreads: this is why the behaviour got steadily worse
+                // rather than staying an occasional glitch.
+                if earlier.is_none() && meta_answer_retries == 0 {
+                    if latest.as_deref().is_some_and(is_meta_non_answer) {
+                        meta_answer_retries += 1;
+                        ContextBuilder::add_assistant_message(
+                            &mut messages,
+                            latest.clone(),
+                            vec![],
+                        );
+                        messages.push(Message::user(
+                            "[Metis automatic check — the user did NOT send this. Do not \
+                             apologise or reply to it as if they had.]\n\
+                             Your reply said the question was already answered, but there is no \
+                             earlier answer the user can see. Answer it now, in full, as if for \
+                             the first time. Do not refer to anything \"above\", do not explain \
+                             whether a tool was needed, and do not comment on the question.",
+                        ));
+                        continue;
+                    }
+                }
+
+                final_content = match (latest, earlier) {
                     (Some(latest), Some(earlier)) if is_meta_non_answer(&latest) => Some(earlier),
                     (latest, _) => latest,
                 };
