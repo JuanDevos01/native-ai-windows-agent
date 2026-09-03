@@ -89,6 +89,19 @@ impl Tool for MessageTool {
         let ctx = self.context.lock().await;
         let channel = param_channel.unwrap_or_else(|| ctx.0.clone());
         let chat_id = param_chat_id.unwrap_or_else(|| ctx.1.clone());
+
+        // "cron" is the scheduler's internal channel — nothing consumes it.
+        // A send would report success while the message vanished, and the
+        // model would then truthfully tell the user it delivered something
+        // that never arrived.
+        if channel == "cron" {
+            anyhow::bail!(
+                "This is a scheduled job with no live chat, so there is nowhere to send a \
+                 message. If this job was created with --deliver, your final reply IS the \
+                 delivered message — put the content in your reply instead of calling this \
+                 tool. If it was not, the output is only logged."
+            );
+        }
         drop(ctx);
 
         debug!(channel = %channel, chat_id = %chat_id, "sending message via tool");
@@ -113,6 +126,31 @@ impl Tool for MessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[tokio::test]
+    async fn sending_from_the_scheduler_channel_is_refused_with_guidance() {
+        // A send into "cron" reports success while the message vanishes; the
+        // model then truthfully tells the user it delivered something that
+        // never arrived. Refusing with instructions is the honest failure.
+        let tool = MessageTool::new(None);
+        tool.set_context("cron", "77008abf").await;
+        let mut params = HashMap::new();
+        params.insert("content".into(), json!("5 headlines"));
+        let err = tool.execute(params).await.unwrap_err().to_string();
+        assert!(err.contains("final reply IS the"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_channel_still_works_from_a_scheduled_session() {
+        let tool = MessageTool::new(None);
+        tool.set_context("cron", "77008abf").await;
+        let mut params = HashMap::new();
+        params.insert("content".into(), json!("hello"));
+        params.insert("channel".into(), json!("telegram"));
+        params.insert("chat_id".into(), json!("8582973375"));
+        assert!(tool.execute(params).await.is_ok());
+    }
 
     #[test]
     fn test_tool_definition() {

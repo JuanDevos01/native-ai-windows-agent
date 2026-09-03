@@ -1828,7 +1828,10 @@ fn try_recover_invoke_xml_tool_call(content: &str) -> Option<metis_core::types::
 }
 
 /// Marker that opens the internal tool ledger stored in session history.
-const TOOL_LEDGER_MARKER: &str = "[Record of tools I actually ran";
+const TOOL_LEDGER_MARKER: &str = "[Internal tool log";
+/// Marker used by ledgers written before the rewording; old sessions still
+/// contain it and models echo it, so it must keep being stripped.
+const TOOL_LEDGER_MARKER_LEGACY: &str = "[Record of tools I actually ran";
 
 /// Remove any internal tool-ledger block the model has echoed back into its
 /// reply. The ledger is bookkeeping for the model, never for the user — it
@@ -1837,7 +1840,15 @@ const TOOL_LEDGER_MARKER: &str = "[Record of tools I actually ran";
 pub fn strip_tool_ledger_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(TOOL_LEDGER_MARKER) {
+    let find_marker = |t: &str| {
+        let a = t.find(TOOL_LEDGER_MARKER);
+        let b = t.find(TOOL_LEDGER_MARKER_LEGACY);
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
+    };
+    while let Some(start) = find_marker(rest) {
         out.push_str(&rest[..start]);
         let after = &rest[start..];
         match after.find(']') {
@@ -1856,6 +1867,30 @@ pub fn strip_tool_ledger_blocks(text: &str) -> String {
 /// rather than containing the answer itself — e.g. "I already answered that
 /// above", "no further action needed". Such a reply is worthless on its own
 /// and must never be allowed to replace the substantive answer it followed.
+
+/// Drop leading sentences that claim prior delivery ("I already did this —
+/// the results are above. Here they are again:") from an otherwise real
+/// answer. Such claims reference the model's own unsent draft, which the
+/// user has never seen.
+fn strip_leading_meta_claims(text: &str) -> String {
+    let mut rest = text.trim_start();
+    loop {
+        let Some(line_end) = rest.find('\n') else { break };
+        let first_line = &rest[..line_end];
+        if first_line.chars().count() <= 200 && is_meta_non_answer(first_line) {
+            rest = rest[line_end + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    if rest.trim().is_empty() {
+        // Everything was meta: keep the original rather than sending nothing.
+        text.to_string()
+    } else {
+        rest.to_string()
+    }
+}
+
 fn is_meta_non_answer(content: &str) -> bool {
     let cleaned = strip_all_exec_reports_from_text(content);
     let trimmed = cleaned.trim();
@@ -1885,6 +1920,9 @@ fn is_meta_non_answer(content: &str) -> bool {
         || lower.contains("no tool call was needed")
         || lower.contains("not a task")
         || lower.contains("that's a question")
+        || lower.contains("here they are again")
+        || lower.contains("here it is again")
+        || lower.contains("results are above")
         || lower.contains("i did call");
     claims_already_done
 }
@@ -2705,14 +2743,28 @@ impl AgentLoop {
     pub async fn process_message(&self, msg: &InboundMessage) -> Result<OutboundMessage> {
         let session_key = msg.session_key();
 
-        // Set message tool context for this conversation
+        // Set message tool context for this conversation. A scheduled run
+        // has no live chat of its own; when the scheduler knows where the
+        // result should go it passes that as metadata, so a model that
+        // insists on using the message tool still reaches the user instead
+        // of publishing into the unrouted "cron" channel.
+        let reply_channel = msg
+            .metadata
+            .get("reply_channel")
+            .cloned()
+            .unwrap_or_else(|| msg.channel.clone());
+        let reply_chat_id = msg
+            .metadata
+            .get("reply_chat_id")
+            .cloned()
+            .unwrap_or_else(|| msg.chat_id.clone());
         self.message_tool
-            .set_context(&msg.channel, &msg.chat_id)
+            .set_context(&reply_channel, &reply_chat_id)
             .await;
 
         // Set spawn tool context for this conversation
         self.spawn_tool
-            .set_context(&msg.channel, &msg.chat_id)
+            .set_context(&reply_channel, &reply_chat_id)
             .await;
 
         // Every "fast path" below is a keyword heuristic that bypasses the
@@ -3376,6 +3428,14 @@ Call the tool now to actually do it (or, if this was only a question, just answe
 
                 final_content = match (latest, earlier) {
                     (Some(latest), Some(earlier)) if is_meta_non_answer(&latest) => Some(earlier),
+                    // The retry keeps the unsent draft in the model's context,
+                    // so the retried reply often opens by pointing at it ("the
+                    // results are above. Here they are again:") — a reference
+                    // to something only the model can see. Keep the content,
+                    // drop the frame.
+                    (Some(latest), None) if meta_answer_retries > 0 => {
+                        Some(strip_leading_meta_claims(&latest))
+                    }
                     (latest, _) => latest,
                 };
                 break;
@@ -3517,7 +3577,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         // A short factual ledger gives the model continuity at ~1 line each.
         if !task_steps.is_empty() {
             let mut record =
-                String::from("[Record of tools I actually ran for the message above:\n");
+                String::from("[Internal tool log for the message above:\n");
             for step in &task_steps {
                 record.push_str(&step.render());
                 record.push('\n');
@@ -3529,12 +3589,12 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 ));
             }
             record.push_str(
-                "These calls really happened, so do not deny using a tool you just used. This is \
-                 INTERNAL BOOKKEEPING about a PREVIOUS message: never quote, repeat or mention it \
-                 in a reply, and never treat it as evidence that the current request is already \
-                 handled. It records only that calls happened — NOT that the user was given an \
-                 answer, and NOT that a new request has been satisfied. Answer the user's newest \
-                 message on its own terms, in full.]",
+                "These calls really happened, so do not deny using a tool you used. But the user \
+                 has seen NONE of this: tool output is invisible to them, and this note is not a \
+                 reply. Never say a task was \"already done\", never refer to results \"above\", \
+                 and never re-announce old results — if the newest message asks for something \
+                 these calls produced, present the actual content again as if for the first \
+                 time. Never quote or mention this note.]",
             );
             // Stored as a `system` message, not `assistant`. As an assistant
             // message the model read it as its own prior speech to the user,
@@ -3699,6 +3759,26 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         text: &str,
     ) -> Result<String> {
         let msg = InboundMessage::new(channel, "scheduler", chat_id, text);
+        let response = self.process_message(&msg).await?;
+        Ok(response.content)
+    }
+
+    /// Like [`process_direct_session`], but with a live delivery target: the
+    /// message tool is pointed at `reply_channel`/`reply_chat_id` instead of
+    /// the unrouted scheduler channel.
+    pub async fn process_direct_session_with_reply(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        text: &str,
+        reply_channel: &str,
+        reply_chat_id: &str,
+    ) -> Result<String> {
+        let mut msg = InboundMessage::new(channel, "scheduler", chat_id, text);
+        msg.metadata
+            .insert("reply_channel".to_string(), reply_channel.to_string());
+        msg.metadata
+            .insert("reply_chat_id".to_string(), reply_chat_id.to_string());
         let response = self.process_message(&msg).await?;
         Ok(response.content)
     }
@@ -4958,6 +5038,58 @@ Write-Output "hello"
     fn a_real_answer_is_not_mistaken_for_a_non_answer() {
         assert!(!is_meta_non_answer(ANSWER_WITH_CODE));
         assert!(!is_meta_non_answer("The gateway is running as pid 6720."));
+    }
+
+
+    // ── Regression: "I already did this — the results are above" ─────────
+
+    #[test]
+    fn both_ledger_generations_are_stripped_from_replies() {
+        let with_new = "Answer.\n[Internal tool log for the message above:\n  ✓ browser…\nNever quote this note.]";
+        assert_eq!(strip_tool_ledger_blocks(with_new).trim(), "Answer.");
+        let with_old = "Answer.\n[Record of tools I actually ran for the message above:\n  ✓ x]";
+        assert_eq!(strip_tool_ledger_blocks(with_old).trim(), "Answer.");
+    }
+
+    #[test]
+    fn the_ledger_says_the_user_has_seen_nothing() {
+        // The old wording ("Record of tools I actually ran for the message
+        // above") read as "the task was already handled"; a model mid-turn
+        // concluded "I already did this in my previous response" in a session
+        // with no previous response at all. The ledger must state the
+        // opposite explicitly.
+        // (Wording lives inline where the record is built; this pins the
+        // load-bearing phrases so a rewrite can't silently soften them.)
+        let src = include_str!("agent_loop.rs");
+        assert!(src.contains("the user \\\n                 has seen NONE of this")
+            || src.contains("has seen NONE of this"));
+        assert!(src.contains("never refer to results"));
+    }
+
+    #[test]
+    fn leading_already_did_frames_are_cut_but_content_survives() {
+        // Verbatim from a live transcript: the retry answered, but kept the
+        // frame pointing at a draft only the model could see.
+        let reply = "I already did this — the results are above. Here they are again:\n\n\
+1. Iran says it targeted bases in Kuwait and UAE\n\
+2. China's support for Iran shows its limits\n\
+3. Rescue efforts continue as flood death toll passes 1,270";
+        let cleaned = strip_leading_meta_claims(reply);
+        assert!(cleaned.starts_with("1. Iran"), "frame must go: {cleaned}");
+        assert!(cleaned.contains("flood death toll"), "content must stay");
+    }
+
+    #[test]
+    fn a_reply_that_is_only_a_meta_claim_is_left_alone() {
+        // Nothing substantive to salvage — better the original than nothing.
+        let reply = "I already did this — see above.\n";
+        assert_eq!(strip_leading_meta_claims(reply), reply);
+    }
+
+    #[test]
+    fn ordinary_answers_are_untouched_by_the_frame_stripper() {
+        let reply = "The gateway is running as pid 6720.\nNothing else changed.";
+        assert_eq!(strip_leading_meta_claims(reply), reply);
     }
 
     #[test]

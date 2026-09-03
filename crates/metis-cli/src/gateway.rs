@@ -130,6 +130,23 @@ pub async fn restart() -> Result<()> {
 /// file is the only channel between them: the desktop flips an entry to
 /// Approved, and this loop notices and puts it on the bus. Polling (rather
 /// than watching) keeps it simple and survives either side restarting.
+
+/// Wrap a scheduled job's prompt with the delivery contract.
+///
+/// The scheduler sends the agent's FINAL REPLY to the user verbatim. Without
+/// saying so, the model narrates instead — a real run ended with the user
+/// receiving "Done! Sent 5 headlines to Telegram." while the headlines
+/// themselves went nowhere.
+fn cron_delivery_prompt(message: &str) -> String {
+    format!(
+        "{message}\n\n[Metis scheduler note — not from the user: your final reply is \
+         delivered to the user's chat EXACTLY as you write it. Write ONLY the content \
+         itself. Do not send it with the message tool, do not describe what you did, do \
+         not announce that something was sent, and do not add a greeting about this being \
+         a scheduled task.]"
+    )
+}
+
 async fn run_approval_sender(bus: Arc<MessageBus>) {
     use metis_core::approvals::{self, ApprovalStatus};
     use metis_core::bus::types::OutboundMessage;
@@ -257,10 +274,33 @@ pub async fn run() -> Result<()> {
             .set_on_job(Arc::new(move |job: metis_cron::CronJob| {
                 let agent = agent.clone();
                 Box::pin(async move {
-                    let response = agent
-                        .process_direct_session("cron", &job.id, &job.payload.message)
-                        .await
-                        .unwrap_or_else(|e| format!("Error: {e}"));
+                    // Date-scoped session: a recurring job that reuses one
+                    // session forever accumulates its own past answers, and
+                    // the model starts replying "I already did this" to a
+                    // prompt it genuinely has answered — yesterday. Each day
+                    // starts clean.
+                    let session_id =
+                        format!("{}-{}", job.id, chrono::Utc::now().format("%Y%m%d"));
+
+                    let response = if job.payload.deliver {
+                        let to = job.payload.to.clone().unwrap_or_default();
+                        let channel = job
+                            .payload
+                            .channel
+                            .clone()
+                            .unwrap_or_else(|| "telegram".to_string());
+                        let prompt = cron_delivery_prompt(&job.payload.message);
+                        agent
+                            .process_direct_session_with_reply(
+                                "cron", &session_id, &prompt, &channel, &to,
+                            )
+                            .await
+                    } else {
+                        agent
+                            .process_direct_session("cron", &session_id, &job.payload.message)
+                            .await
+                    }
+                    .unwrap_or_else(|e| format!("Error: {e}"));
 
                     Ok(response)
                 })

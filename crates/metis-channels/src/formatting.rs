@@ -344,4 +344,19 @@ mod tests {
         assert!(chunks.len() >= 2);
         assert_eq!(chunks.concat(), text);
     }
+
+    #[test]
+    fn plain_sentences_pass_through_byte_for_byte() {
+        // A delivered cron reply arrived at the user as "one! Sent 5
+        // headlines to Telegram." — missing its leading "D". This pins the
+        // formatter as innocent for plain text so the mangling, if it recurs,
+        // is known to live elsewhere.
+        let text = "Done! Sent 5 headlines to Telegram.";
+        assert_eq!(markdown_to_telegram_html(text), text);
+        // And a realistic delivered list survives intact.
+        let list = "1. First headline
+2. Second headline
+3. Third headline";
+        assert_eq!(markdown_to_telegram_html(list), list);
+    }
 }
