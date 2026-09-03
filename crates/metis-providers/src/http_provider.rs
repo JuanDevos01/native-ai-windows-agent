@@ -509,10 +509,66 @@ impl LlmProvider for HttpProvider {
 /// reads the config, and creates the HttpProvider.
 ///
 /// Replaces nanobot's CLI instantiation logic.
+/// A provider chosen at runtime by wire format.
+///
+/// Almost every backend speaks OpenAI's `/chat/completions`; Anthropic's
+/// native Messages API is the exception, with its own auth header, request
+/// shape, and content-block responses. Dispatching here keeps the rest of
+/// the codebase working against `LlmProvider` without caring which.
+#[derive(Debug)]
+pub enum Provider {
+    Http(HttpProvider),
+    Anthropic(crate::anthropic::AnthropicProvider),
+}
+
+#[async_trait]
+impl LlmProvider for Provider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        model: &str,
+        config: &LlmRequestConfig,
+    ) -> LlmResponse {
+        match self {
+            Provider::Http(p) => p.chat(messages, tools, model, config).await,
+            Provider::Anthropic(p) => p.chat(messages, tools, model, config).await,
+        }
+    }
+
+    async fn embeddings(&self, texts: &[String], model: &str) -> Result<Vec<Vec<f32>>, String> {
+        match self {
+            Provider::Http(p) => p.embeddings(texts, model).await,
+            Provider::Anthropic(p) => p.embeddings(texts, model).await,
+        }
+    }
+
+    async fn supports_tools(&self, model: &str) -> bool {
+        match self {
+            Provider::Http(p) => p.supports_tools(model).await,
+            Provider::Anthropic(p) => p.supports_tools(model).await,
+        }
+    }
+
+    fn default_model(&self) -> &str {
+        match self {
+            Provider::Http(p) => p.default_model(),
+            Provider::Anthropic(p) => p.default_model(),
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            Provider::Http(p) => p.display_name(),
+            Provider::Anthropic(p) => p.display_name(),
+        }
+    }
+}
+
 pub fn create_provider(
     model: &str,
     providers: &std::collections::HashMap<String, ProviderConfig>,
-) -> Result<HttpProvider, String> {
+) -> Result<Provider, String> {
     let (config, spec) = crate::registry::match_provider(model, providers)
         .ok_or_else(|| {
             format!(
@@ -529,7 +585,15 @@ pub fn create_provider(
         "Creating LLM provider"
     );
 
-    Ok(HttpProvider::new(config, spec, model))
+    // Direct-to-Anthropic gets the native Messages API; a Claude model
+    // reached through a gateway (OpenRouter etc.) matched that gateway's
+    // spec above and stays on the OpenAI wire format the gateway expects.
+    if spec.name == "anthropic" {
+        return Ok(Provider::Anthropic(crate::anthropic::AnthropicProvider::new(
+            config, model,
+        )));
+    }
+    Ok(Provider::Http(HttpProvider::new(config, spec, model)))
 }
 
 // ─────────────────────────────────────────────
