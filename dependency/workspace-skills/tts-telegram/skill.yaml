@@ -1,0 +1,17 @@
+name: tts-telegram
+description: Text-to-speech with automatic Telegram audio delivery
+location: C:\Users\chack\.metis\workspace\tools\tts
+version: 1.0.0
+
+endpoints:
+  - name: TTS API
+    url: http://localhost:5003/synthesize
+    method: POST
+  - name: File Server
+    url: http://localhost:8888/
+    method: GET
+
+dependencies:
+  - TTS
+  - Flask
+  - requests

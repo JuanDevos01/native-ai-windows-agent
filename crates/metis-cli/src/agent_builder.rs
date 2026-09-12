@@ -234,6 +234,9 @@ pub fn builtin_skills_dir() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("skills"));
+            // Deployment layout: the exe ships beside a `dependency/` folder
+            // holding everything that is not the Rust build (bridge, skills).
+            candidates.push(dir.join("dependency").join("skills"));
             // target/{debug,release}/metis.exe -> repo root
             if let Some(root) = dir.parent().and_then(|p| p.parent()) {
                 candidates.push(root.join("skills"));
@@ -241,5 +244,6 @@ pub fn builtin_skills_dir() -> Option<std::path::PathBuf> {
         }
     }
     candidates.push(std::path::PathBuf::from("skills"));
+    candidates.push(std::path::PathBuf::from("dependency").join("skills"));
     candidates.into_iter().find(|p| p.is_dir())
 }

@@ -27,21 +27,77 @@ const DEFAULT_MODEL: &str = "gemma3:4b";
 const DEFAULT_PROMPT: &str =
     "Describe this image. If it contains any text, transcribe the text exactly and completely.";
 
+
+/// Strip channel attachment markers (`[image: C:\\...jpg]`) from an inbound
+/// message, leaving the user's actual words - or `None` when nothing
+/// meaningful is left, as when an image arrives with no caption.
+fn clean_user_question(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let after = &rest[start..];
+        let Some(end) = after.find(']') else { break };
+        let inner = &after[1..end];
+        let is_marker = matches!(
+            inner.split(':').next().map(str::trim),
+            Some("image") | Some("photo") | Some("audio") | Some("voice") | Some("document")
+        );
+        out.push_str(&rest[..start]);
+        if !is_marker {
+            out.push_str(&after[..=end]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    let cleaned = out.trim();
+    if cleaned.chars().count() < 2 {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
 /// Analyze an image with a vision model and return a text description.
 pub struct VisionTool {
     workspace: PathBuf,
     client: reqwest::Client,
+    /// What the user asked in the message that carried the image.
+    ///
+    /// A model that calls this tool without a `question` otherwise gets the
+    /// generic "describe this image" prompt, which answers a question nobody
+    /// asked: told to "list me the names" in a screenshot, the vision model
+    /// returned an analysis of what those files were. The user's own words
+    /// are a far better default than a fixed prompt.
+    question_context: tokio::sync::Mutex<Option<String>>,
 }
 
 impl VisionTool {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
+            question_context: tokio::sync::Mutex::new(None),
             client: reqwest::Client::builder()
                 // Local vision models are slow on CPU; be patient but bounded.
                 .timeout(Duration::from_secs(180))
                 .build()
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Record what the user asked, for use when the model supplies no
+    /// `question` of its own. Called once per inbound message.
+    pub async fn set_question_context(&self, user_message: &str) {
+        *self.question_context.lock().await = clean_user_question(user_message);
+    }
+
+    /// The prompt to send when the model passed no explicit question.
+    async fn fallback_prompt(&self) -> String {
+        match self.question_context.lock().await.clone() {
+            Some(q) => format!(
+                "{q}\n\nAnswer that about this image. If the image contains text, transcribe \
+                 it exactly and completely rather than summarising or interpreting it."
+            ),
+            None => DEFAULT_PROMPT.to_string(),
         }
     }
 
@@ -195,9 +251,11 @@ impl Tool for VisionTool {
 
     async fn execute(&self, params: HashMap<String, Value>) -> anyhow::Result<String> {
         let path_arg = require_string(&params, "path")?;
-        let question = optional_string(&params, "question")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+        let question =
+            match optional_string(&params, "question").filter(|s| !s.trim().is_empty()) {
+                Some(q) => q,
+                None => self.fallback_prompt().await,
+            };
 
         let path = self.resolve_path(&path_arg);
         if !path.is_file() {
@@ -292,6 +350,54 @@ impl Tool for VisionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Regression: "list me the names" returned an analysis ─────────────
+    //
+    // The user sent a screenshot of a Kaspersky quarantine list and asked to
+    // list the names. The model called analyze_image with no `question`, so
+    // the tool sent "Describe this image" and the vision model answered a
+    // question nobody asked - explaining what each trojan does instead of
+    // listing the filenames that were on screen.
+
+    #[test]
+    fn attachment_markers_are_stripped_from_the_question() {
+        let q = clean_user_question(
+            "list me the names [image: C:\\Users\\chack\\.metis\\media\\AgACAgEA.jpg]",
+        );
+        assert_eq!(q.as_deref(), Some("list me the names"));
+    }
+
+    #[test]
+    fn an_image_with_no_caption_has_no_question() {
+        // Nothing the user said - fall back to the generic prompt.
+        assert!(clean_user_question("[image: C:\\x\\y.jpg]").is_none());
+        assert!(clean_user_question("   ").is_none());
+    }
+
+    #[test]
+    fn non_marker_brackets_survive() {
+        let q = clean_user_question("what does [DRAFT] mean here? [image: a.jpg]");
+        assert_eq!(q.as_deref(), Some("what does [DRAFT] mean here?"));
+    }
+
+    #[tokio::test]
+    async fn the_users_words_become_the_default_prompt() {
+        let tool = VisionTool::new(std::path::PathBuf::from("."));
+        tool.set_question_context("list me the names [image: C:\\x\\y.jpg]")
+            .await;
+        let prompt = tool.fallback_prompt().await;
+        assert!(prompt.starts_with("list me the names"), "{prompt}");
+        // And it must still ask for verbatim text, or a list of filenames
+        // comes back summarised.
+        assert!(prompt.contains("transcribe"), "{prompt}");
+        assert!(!prompt.contains("Describe this image"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn with_no_user_context_the_generic_prompt_is_used() {
+        let tool = VisionTool::new(std::path::PathBuf::from("."));
+        assert_eq!(tool.fallback_prompt().await, DEFAULT_PROMPT);
+    }
 
     #[test]
     fn tool_definition() {

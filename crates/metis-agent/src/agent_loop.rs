@@ -2118,6 +2118,8 @@ pub struct AgentLoop {
     sessions: SessionManager,
     /// Reference to the message tool (for set_context).
     message_tool: Arc<MessageTool>,
+    /// Vision tool, kept so each turn can hand it the user's real question.
+    vision_tool: Arc<crate::tools::vision::VisionTool>,
     /// Spawn tool reference (for set_context).
     spawn_tool: Arc<SpawnTool>,
     /// Subagent manager (also held by SpawnTool; kept for direct access).
@@ -2203,9 +2205,8 @@ impl AgentLoop {
             restrict_to_workspace,
         )));
         // Lets a text-only agent model still handle images (see vision.rs).
-        tools.register(Arc::new(crate::tools::vision::VisionTool::new(
-            workspace.clone(),
-        )));
+        let vision_tool = Arc::new(crate::tools::vision::VisionTool::new(workspace.clone()));
+        tools.register(vision_tool.clone());
         // Exact text from PDFs (invoice amounts/dates) — see tools/pdf.rs.
         tools.register(Arc::new(crate::tools::pdf::ReadPdfTool::new(
             workspace.clone(),
@@ -2252,6 +2253,7 @@ impl AgentLoop {
             context,
             sessions,
             message_tool,
+            vision_tool,
             spawn_tool,
             subagent_manager,
             outbound,
@@ -2761,6 +2763,12 @@ impl AgentLoop {
         self.message_tool
             .set_context(&reply_channel, &reply_chat_id)
             .await;
+
+        // Hand the vision tool what the user actually asked. Without it the
+        // tool falls back to "Describe this image", so "list me the names"
+        // came back as an ANALYSIS of a screenshot rather than the list of
+        // names that was in it.
+        self.vision_tool.set_question_context(&msg.content).await;
 
         // Set spawn tool context for this conversation
         self.spawn_tool
@@ -3406,6 +3414,12 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 // history the model copies the pattern from itself, so it
                 // spreads: this is why the behaviour got steadily worse
                 // rather than staying an occasional glitch.
+                // The restored answer is only useful if it is an ANSWER. When a
+                // nudge fired and the pre-nudge reply was itself "Already
+                // done - no further action needed", restoring it shipped the
+                // very text this guard exists to suppress. Treat a meta
+                // `earlier` as if there were nothing to restore.
+                let earlier = earlier.filter(|e| !is_meta_non_answer(e));
                 if earlier.is_none() && meta_answer_retries == 0 {
                     if latest.as_deref().is_some_and(is_meta_non_answer) {
                         meta_answer_retries += 1;
@@ -3434,6 +3448,12 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                     // to something only the model can see. Keep the content,
                     // drop the frame.
                     (Some(latest), None) if meta_answer_retries > 0 => {
+                        Some(strip_leading_meta_claims(&latest))
+                    }
+                    // Belt and braces: by whatever path we got here, a reply
+                    // whose whole substance is "I already answered" is not an
+                    // answer and must not reach the user intact.
+                    (Some(latest), _) if is_meta_non_answer(&latest) => {
                         Some(strip_leading_meta_claims(&latest))
                     }
                     (latest, _) => latest,
@@ -5090,6 +5110,30 @@ Write-Output "hello"
     fn ordinary_answers_are_untouched_by_the_frame_stripper() {
         let reply = "The gateway is running as pid 6720.\nNothing else changed.";
         assert_eq!(strip_leading_meta_claims(reply), reply);
+    }
+
+
+
+
+    #[test]
+    fn a_meta_pre_nudge_answer_is_not_worth_restoring() {
+        // The restore path hands back the reply a nudge displaced. When THAT
+        // reply was itself "Already done - no further action needed", the
+        // guard restored the exact text it exists to suppress, and the user
+        // was told their question had been answered when it had not. Both
+        // sides must be checked.
+        let meta = "Already done - analyze_image ran successfully and returned the full list in \
+                    my previous reply. No further action needed on my end.";
+        assert!(is_meta_non_answer(meta));
+
+        let real = "The quarantine log lists 000.exe through 0004.exe plus three cookie files.";
+        assert!(!is_meta_non_answer(real));
+
+        // Only the genuine answer survives the filter the loop applies.
+        let restorable = Some(meta.to_string()).filter(|e| !is_meta_non_answer(e));
+        assert!(restorable.is_none(), "a meta answer must not be restored");
+        let restorable = Some(real.to_string()).filter(|e| !is_meta_non_answer(e));
+        assert!(restorable.is_some(), "a real answer must still be restored");
     }
 
     #[test]
