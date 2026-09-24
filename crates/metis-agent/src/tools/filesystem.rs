@@ -306,9 +306,16 @@ impl Tool for EditFileTool {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
 
-        let count = content.matches(&old_text).count();
+        // Match without caring whether the file uses CRLF, LF, or both.
+        let ranges = find_ranges_ignoring_line_endings(&content, &old_text);
+        let count = ranges.len();
         if count == 0 {
-            anyhow::bail!("old_text not found in {}", path.display());
+            anyhow::bail!(
+                "old_text not found in {}.{} (Line-ending differences are already handled, so \
+                 this is a real difference in the text.)",
+                path.display(),
+                describe_match_failure(&content, &old_text)
+            );
         }
 
         let mut warning = String::new();
@@ -318,8 +325,16 @@ impl Tool for EditFileTool {
             );
         }
 
-        // Replace exactly one occurrence
-        let updated = content.replacen(&old_text, &new_text, 1);
+        // Write the replacement in the file's own line-ending style, so
+        // editing a CRLF file does not leave an LF island behind.
+        let new_text = with_line_ending(&new_text, dominant_line_ending(&content));
+
+        // Replace exactly one occurrence, by byte range.
+        let (start, end) = ranges[0];
+        let mut updated = String::with_capacity(content.len() + new_text.len());
+        updated.push_str(&content[..start]);
+        updated.push_str(&new_text);
+        updated.push_str(&content[end..]);
         std::fs::write(&path, &updated)
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
 
@@ -433,6 +448,133 @@ impl Tool for ListDirTool {
 }
 
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// Line-ending-tolerant matching
+// ─────────────────────────────────────────────
+
+/// Rewrite CR and CRLF to LF, returning the result plus a map from each byte
+/// offset in the normalised string back to its offset in the original.
+///
+/// The map has one entry per normalised byte plus a final entry for the end,
+/// so a normalised range `a..b` maps to the original range `map[a]..map[b]`.
+fn normalize_newlines_with_map(s: &str) -> (String, Vec<usize>) {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut map: Vec<usize> = Vec::with_capacity(bytes.len() + 1);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            map.push(i);
+            out.push(b'\n');
+            // Consume CRLF as one unit; a lone CR also becomes one LF.
+            i += if i + 1 < bytes.len() && bytes[i + 1] == b'\n' { 2 } else { 1 };
+        } else {
+            map.push(i);
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    map.push(bytes.len());
+    // Only ASCII CR bytes were dropped, and CR never appears inside a
+    // multi-byte UTF-8 sequence, so the result is still valid UTF-8.
+    match String::from_utf8(out) {
+        Ok(norm) => (norm, map),
+        Err(_) => (s.to_string(), (0..=s.len()).collect()),
+    }
+}
+
+/// Normalise every line ending in `s` to LF.
+fn to_lf(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Which line ending the file mostly uses, so an edit does not introduce a
+/// third style into a file that already mixes two.
+fn dominant_line_ending(s: &str) -> &'static str {
+    let crlf = s.matches("\r\n").count();
+    let total_lf = s.matches('\n').count();
+    if crlf * 2 > total_lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Rewrite `text` to use `ending` for every line break.
+fn with_line_ending(text: &str, ending: &str) -> String {
+    let lf = to_lf(text);
+    if ending == "\n" {
+        lf
+    } else {
+        lf.replace('\n', ending)
+    }
+}
+
+/// Byte ranges in `haystack` matching `needle`, ignoring line-ending style.
+///
+/// Exact matching is tried first and is the common case. The fallback exists
+/// because a model reproducing a block of code almost always emits LF, while
+/// a Windows-authored file is CRLF — and a file with *mixed* endings cannot be
+/// reproduced by guessing either way. The result was `old_text not found` on
+/// text that was provably in the file, which drove the agent to rewrite code
+/// through PowerShell scripts instead.
+fn find_ranges_ignoring_line_endings(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let exact: Vec<(usize, usize)> = haystack
+        .match_indices(needle)
+        .map(|(i, m)| (i, i + m.len()))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let (norm_hay, map) = normalize_newlines_with_map(haystack);
+    let norm_needle = to_lf(needle);
+    norm_hay
+        .match_indices(&norm_needle)
+        .filter_map(|(i, m)| {
+            let end = i + m.len();
+            Some((*map.get(i)?, *map.get(end)?))
+        })
+        .collect()
+}
+
+/// Best-effort hint about why `old_text` did not match, for the error message.
+fn describe_match_failure(content: &str, old_text: &str) -> String {
+    let first = to_lf(old_text).lines().next().unwrap_or("").trim().to_string();
+    if first.is_empty() {
+        return String::new();
+    }
+    // A unique first line means the anchor is there but the block diverges
+    // further down — usually indentation or an intervening edit.
+    let hits: Vec<usize> = to_lf(content)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == first)
+        .map(|(i, _)| i + 1)
+        .collect();
+    if hits.is_empty() {
+        format!(
+            " Its first line ({first:?}) does not appear in the file either, so re-read the file \
+             — it may have changed."
+        )
+    } else {
+        format!(
+            " Its first line ({first:?}) IS present at line {}, so the rest of old_text differs \
+             — most often indentation or a trailing space. Re-read that region and copy it exactly.",
+            hits.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 // ─────────────────────────────────────────────
 // SearchFilesTool
 // ─────────────────────────────────────────────
@@ -998,6 +1140,156 @@ mod tests {
         let mut p = HashMap::new();
         p.insert("path".into(), Value::String(txt.display().to_string()));
         assert_eq!(tool.execute(p).await.unwrap(), "hello world");
+    }
+
+
+    // ── Regression: edit_file could not touch a CRLF file ────────────────
+    //
+    // A Python project (619 CRLF lines + 26 LF-only) could not be edited at
+    // all: the model reproduces code with LF, the file stored CRLF, so every
+    // old_text was rejected as "not found" despite provably being present.
+    // The agent worked around it by writing PowerShell scripts that used
+    // .NET ReadAllText/WriteAllText to do the replacements, which is how a
+    // one-line feature turned into a pile of fixN.ps1 files.
+
+    #[tokio::test]
+    async fn edits_a_crlf_file_when_old_text_uses_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("script.py");
+        // Written exactly as a Windows editor would.
+        std::fs::write(&file, "def setup_logging():\r\n    pass\r\n\r\nx = 1\r\n").unwrap();
+
+        let tool = EditFileTool::new(None);
+        // The model supplies LF, as models do.
+        let out = tool
+            .execute(make_params(&[
+                ("path", file.to_str().unwrap()),
+                ("old_text", "def setup_logging():\n    pass"),
+                ("new_text", "def setup_logging():\n    configure()"),
+            ]))
+            .await
+            .expect("a CRLF file must be editable with LF old_text");
+        assert!(out.contains("Successfully edited"), "{out}");
+
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(after.contains("configure()"), "{after:?}");
+        // The file's CRLF style must survive the edit.
+        assert!(after.contains("configure()\r\n"), "line endings changed: {after:?}");
+        assert!(!after.contains("configure()\n\n"), "introduced an LF island: {after:?}");
+    }
+
+    #[tokio::test]
+    async fn edits_a_mixed_ending_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mixed.py");
+        // Mostly CRLF with a couple of LF-only lines - unguessable by hand.
+        std::fs::write(
+            &file,
+            "import os\r\nimport sys\n\r\ndef extract_encrypted_7z(path):\r\n    return None\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool::new(None);
+        let out = tool
+            .execute(make_params(&[
+                ("path", file.to_str().unwrap()),
+                ("old_text", "def extract_encrypted_7z(path):\n    return None"),
+                ("new_text", "def extract_encrypted_7z(path):\n    return unpack(path)"),
+            ]))
+            .await
+            .expect("a mixed-ending file must be editable");
+        assert!(out.contains("Successfully edited"), "{out}");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("unpack(path)"));
+    }
+
+    #[tokio::test]
+    async fn an_lf_file_is_still_edited_and_stays_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("unix.py");
+        std::fs::write(&file, "a = 1\nb = 2\n").unwrap();
+
+        let tool = EditFileTool::new(None);
+        tool.execute(make_params(&[
+            ("path", file.to_str().unwrap()),
+            ("old_text", "a = 1\nb = 2"),
+            ("new_text", "a = 1\nb = 3"),
+        ]))
+        .await
+        .unwrap();
+
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(after, "a = 1\nb = 3\n", "an LF file must not gain CRLF");
+    }
+
+    #[tokio::test]
+    async fn genuinely_absent_text_still_fails_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.py");
+        std::fs::write(&file, "def real():\r\n    pass\r\n").unwrap();
+
+        let tool = EditFileTool::new(None);
+        let err = tool
+            .execute(make_params(&[
+                ("path", file.to_str().unwrap()),
+                ("old_text", "def imaginary():\n    pass"),
+                ("new_text", "x"),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        // The message must rule line endings OUT, so the next attempt does not
+        // chase the wrong cause.
+        assert!(err.contains("already handled"), "{err}");
+        assert!(err.contains("does not appear"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_diverging_block_is_diagnosed_by_its_anchor_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.py");
+        std::fs::write(&file, "def setup():\r\n        deep_indent()\r\n").unwrap();
+
+        let tool = EditFileTool::new(None);
+        let err = tool
+            .execute(make_params(&[
+                ("path", file.to_str().unwrap()),
+                ("old_text", "def setup():\n    deep_indent()"),
+                ("new_text", "x"),
+            ]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IS present at line 1"), "{err}");
+        assert!(err.contains("indentation"), "{err}");
+    }
+
+    // ── the helpers themselves ──
+
+    #[test]
+    fn normalisation_map_round_trips_offsets() {
+        let original = "a\r\nb\nc\r\n";
+        let (norm, map) = normalize_newlines_with_map(original);
+        assert_eq!(norm, "a\nb\nc\n");
+        // "b" is at normalised offset 2; in the original it sits after "a\r\n".
+        let i = norm.find('b').unwrap();
+        assert_eq!(&original[map[i]..map[i + 1]], "b");
+    }
+
+    #[test]
+    fn normalisation_preserves_multibyte_text() {
+        let original = "héllo → wörld\r\nsecond\r\n";
+        let (norm, map) = normalize_newlines_with_map(original);
+        assert_eq!(norm, "héllo → wörld\nsecond\n");
+        let i = norm.find("second").unwrap();
+        assert_eq!(&original[map[i]..map[i + 6]], "second");
+    }
+
+    #[test]
+    fn dominant_ending_follows_the_majority() {
+        assert_eq!(dominant_line_ending("a\r\nb\r\nc\n"), "\r\n");
+        assert_eq!(dominant_line_ending("a\nb\nc\r\n"), "\n");
+        assert_eq!(dominant_line_ending("no newlines"), "\n");
     }
 
     // ── SearchFilesTool ──
