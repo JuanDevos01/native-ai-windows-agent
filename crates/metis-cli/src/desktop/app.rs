@@ -1755,27 +1755,87 @@ pub fn run(logs: bool) -> Result<()> {
     let width = desktop_config.window.width;
     let height = desktop_config.window.height;
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([width, height])
-            .with_title("Metis Desktop"),
-        ..Default::default()
+    // The window is opened at most once, but the attempt may be made twice
+    // with different renderers, so the pieces the app owns live behind a
+    // take-once cell rather than being moved into a single closure.
+    let parts = Arc::new(std::sync::Mutex::new(Some((
+        desktop_config,
+        agent,
+        sessions,
+        runtime,
+    ))));
+
+    let attempt = |renderer: eframe::Renderer| -> std::result::Result<(), eframe::Error> {
+        let parts = parts.clone();
+        eframe::run_native(
+            &title,
+            eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([width, height])
+                    .with_title("Metis Desktop"),
+                renderer,
+                ..Default::default()
+            },
+            Box::new(move |cc| {
+                setup_theme(&cc.egui_ctx);
+                let (config, agent, sessions, runtime) = parts
+                    .lock()
+                    .expect("desktop state mutex poisoned")
+                    .take()
+                    .expect("desktop app state was already consumed");
+                Ok(Box::new(MetisDesktopApp::new(
+                    config, agent, sessions, runtime,
+                )))
+            }),
+        )
     };
 
-    eframe::run_native(
-        &title,
-        native_options,
-        Box::new(move |cc| {
-            setup_theme(&cc.egui_ctx);
-            Ok(Box::new(MetisDesktopApp::new(
-                desktop_config,
-                agent,
-                sessions,
-                runtime,
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("desktop GUI error: {e}"))
+    // An explicit choice wins, for when the automatic one guesses wrong.
+    match std::env::var("METIS_DESKTOP_RENDERER")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
+        "wgpu" => return attempt(eframe::Renderer::Wgpu).map_err(|e| desktop_error(e, true)),
+        "glow" => return attempt(eframe::Renderer::Glow).map_err(|e| desktop_error(e, false)),
+        _ => {}
+    }
+
+    match attempt(eframe::Renderer::Glow) {
+        Ok(()) => Ok(()),
+        Err(e) if is_opengl_failure(&e) => {
+            // Windows ships only a 1.1 software OpenGL when no GPU driver is
+            // installed, so this is the normal case on a fresh machine, a VM,
+            // or over Remote Desktop - not an exotic failure.
+            tracing::warn!(error = %e, "OpenGL unavailable; retrying with the Direct3D renderer");
+            eprintln!("  OpenGL is not available here; retrying with Direct3D…");
+            attempt(eframe::Renderer::Wgpu).map_err(|e2| desktop_error(e2, true))
+        }
+        Err(e) => Err(desktop_error(e, false)),
+    }
+}
+
+/// Does this failure mean "this machine has no usable OpenGL"?
+fn is_opengl_failure(e: &eframe::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("opengl") || msg.contains("glow") || msg.contains("glutin")
+}
+
+/// Turn a renderer failure into something the reader can act on.
+fn desktop_error(e: eframe::Error, tried_fallback: bool) -> anyhow::Error {
+    if tried_fallback {
+        anyhow::anyhow!(
+            "desktop GUI could not start: {e}\n\n             Neither OpenGL nor Direct3D could open a window here. That usually means a \
+             Remote Desktop session or a virtual machine with no graphics driver.\n\
+             Metis does not need the GUI: `metis gateway` runs the channels and `metis agent` \
+             gives you a chat prompt. Settings can be edited directly in \
+             ~/.metis/config.json.\n\
+             To force one renderer, set METIS_DESKTOP_RENDERER=glow or =wgpu."
+        )
+    } else {
+        anyhow::anyhow!("desktop GUI error: {e}")
+    }
 }
 
 #[cfg(test)]

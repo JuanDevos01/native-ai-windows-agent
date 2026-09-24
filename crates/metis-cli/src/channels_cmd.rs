@@ -191,25 +191,31 @@ fn channel_login() -> Result<()> {
     }
     let npm = npm.unwrap();
 
-    // Check if bridge is built
-    let dist_index = bridge_dir.join("dist").join("index.js");
-    if !dist_index.exists() {
-        println!("  Building bridge...");
-
-        // npm install
-        let install = Command::new(&npm)
-            .arg("install")
+    // Dependencies and build output are INDEPENDENT. A release install ships
+    // `dist/` but deliberately omits `node_modules` (69 MB the lockfile can
+    // rebuild), so gating the install on a missing `dist/` skipped it exactly
+    // when it was needed and node failed with ERR_MODULE_NOT_FOUND.
+    let node_modules = bridge_dir.join("node_modules");
+    if !node_modules.exists() {
+        // `npm ci` is exact and fast when a lockfile is present; fall back to
+        // `install` when it is not.
+        let (verb, args): (&str, &[&str]) = if bridge_dir.join("package-lock.json").exists() {
+            ("ci", &["ci", "--omit=dev"])
+        } else {
+            ("install", &["install"])
+        };
+        println!("  Installing bridge dependencies (npm {verb}) — this can take a minute…");
+        // Inherit stdio so npm's own progress is visible; a silent multi-minute
+        // wait is indistinguishable from a hang.
+        let status = Command::new(&npm)
+            .args(args)
             .current_dir(&bridge_dir)
-            .output();
-
-        match install {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                eprintln!(
-                    "  {} npm install failed:\n{}",
-                    "✗".red(),
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            .status();
+        match status {
+            Ok(st) if st.success() => println!("  {} Dependencies installed", "✓".green()),
+            Ok(st) => {
+                eprintln!("  {} npm {verb} failed (exit {st}).", "✗".red());
+                eprintln!("     Run it yourself in {} to see why.", bridge_dir.display());
                 return Ok(());
             }
             Err(e) => {
@@ -217,23 +223,19 @@ fn channel_login() -> Result<()> {
                 return Ok(());
             }
         }
+    }
 
-        // npm run build
-        let build = Command::new(&npm)
+    let dist_index = bridge_dir.join("dist").join("index.js");
+    if !dist_index.exists() {
+        println!("  Building bridge…");
+        let status = Command::new(&npm)
             .args(["run", "build"])
             .current_dir(&bridge_dir)
-            .output();
-
-        match build {
-            Ok(out) if out.status.success() => {
-                println!("  {} Bridge built", "✓".green());
-            }
-            Ok(out) => {
-                eprintln!(
-                    "  {} npm run build failed:\n{}",
-                    "✗".red(),
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            .status();
+        match status {
+            Ok(st) if st.success() => println!("  {} Bridge built", "✓".green()),
+            Ok(st) => {
+                eprintln!("  {} npm run build failed (exit {st}).", "✗".red());
                 return Ok(());
             }
             Err(e) => {
@@ -280,20 +282,30 @@ fn find_bridge_dir() -> Result<std::path::PathBuf> {
         return Ok(data_bridge);
     }
 
-    // Check next to the binary
+    // Check next to the binary, including the `dependency/` folder that
+    // ships everything cargo does not build. Omitting that made a correct
+    // install look like a missing bridge.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let dev_bridge = parent.join("bridge");
-            if dev_bridge.join("package.json").exists() {
-                return Ok(dev_bridge);
+            for candidate in [
+                parent.join("bridge"),
+                parent.join("dependency").join("bridge"),
+            ] {
+                if candidate.join("package.json").exists() {
+                    return Ok(candidate);
+                }
             }
         }
     }
 
     // Check current directory
-    let cwd_bridge = std::path::PathBuf::from("bridge");
-    if cwd_bridge.join("package.json").exists() {
-        return Ok(cwd_bridge);
+    for candidate in [
+        std::path::PathBuf::from("bridge"),
+        std::path::PathBuf::from("dependency").join("bridge"),
+    ] {
+        if candidate.join("package.json").exists() {
+            return Ok(candidate);
+        }
     }
 
     anyhow::bail!(
@@ -301,8 +313,11 @@ fn find_bridge_dir() -> Result<std::path::PathBuf> {
          - {}\n\
          - <next to the metis binary>/bridge/\n\
          - ./bridge/\n\n\
-         The WhatsApp bridge is the Node.js helper shipped in the Metis repo under `bridge/`.\n\
-         Copy that `bridge/` folder to `{}` (or next to the metis binary), then run\n\
+         - <next to the metis binary>/dependency/bridge/\n\
+         - ./dependency/bridge/\n\n\
+         The WhatsApp bridge is the Node.js helper shipped in the Metis repo under `bridge/`,\n\
+         and in a release install under `dependency/bridge/`.\n\
+         Copy that folder to `{}` (or beside the metis binary), then run\n\
          `metis channels login` again. It needs Node.js >= 20 installed.",
         data_bridge.display(),
         data_bridge.display()

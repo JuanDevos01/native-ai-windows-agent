@@ -27,19 +27,24 @@ be copied out of here by hand:
 
 ## WhatsApp bridge
 
-`node_modules` is deliberately absent: it is 69 MB and `package-lock.json`
-reproduces it byte-for-byte. On the target machine:
+Run this and everything happens for you — it finds the bridge inside this
+folder, installs its dependencies, starts it, and prints the QR code:
 
-```bash
-cd bridge
-npm ci --omit=dev
-npm start
+```
+metis channels login
 ```
 
-Needs Node 20+. `dist/` is included, so no TypeScript build is required —
-only run `npm run build` if you edit `src/`.
+Needs Node 20+ on PATH. Scan the QR from WhatsApp on your phone.
 
-The first run prints a QR code; scan it from WhatsApp on your phone.
+Onboarding only asks for the bridge **URL** (`ws://localhost:3001`); it does
+not show a QR, because the QR comes from the bridge process itself. If you
+skipped onboarding's WhatsApp question, the URL can be set later in
+`config.json` under `channels.whatsapp.bridgeUrl`.
+
+`node_modules` is deliberately absent from this folder: it is 69 MB and
+`package-lock.json` reproduces it exactly, which is what `channels login`
+does. `dist/` **is** included, so no TypeScript build is needed — run
+`npm run build` only if you edit `src/`.
 Pairing creates `%USERPROFILE%\.metis\whatsapp-auth`, which is a **live
 credential** — anyone holding that folder holds your WhatsApp session. Never
 copy it between machines and never commit it; pair each machine separately.
@@ -59,6 +64,27 @@ cargo build --release -p metis-cli --features telegram,email
 
 And note `metis desktop` hosts **no channels**. Email, Telegram and WhatsApp
 run only under `metis gateway`.
+
+## If the desktop GUI will not open
+
+```
+egui_glow requires opengl 2.0+
+```
+
+Windows ships only a 1.1 software OpenGL when no GPU driver is installed, so
+this is normal on a fresh machine, inside a VM, or over Remote Desktop —
+nothing is misconfigured. Metis now retries automatically with Direct3D,
+which Windows always provides, so the window should open on its own.
+
+To pin a renderer:
+
+```powershell
+$env:METIS_DESKTOP_RENDERER = "wgpu"   # Direct3D
+$env:METIS_DESKTOP_RENDERER = "glow"   # OpenGL
+```
+
+And the GUI is never required: `metis gateway` runs the channels, `metis
+agent` gives you a chat prompt, and `config.json` can be edited directly.
 
 ## Microsoft 365 mail
 
