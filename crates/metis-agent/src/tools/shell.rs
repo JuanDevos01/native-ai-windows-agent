@@ -39,7 +39,14 @@ const DENY_PATTERNS: &[&str] = &[
     r">\s*/dev/sd",
     r":\(\)\s*\{.*\};\s*:",   // fork bomb
     r"\brd\s+/s\b",
-    r"\bremove-item\b.*\b(recurse|force)\b",
+    // `-Recurse` is the flag that turns a delete into a tree delete, so it
+    // alone is the trigger. `-Force` on a single named file is routine
+    // housekeeping (deleting a pidfile, a lock, a log) and flagging it made
+    // every ordinary cleanup demand a token — so it counts only alongside a
+    // wildcard, which is what makes the target open-ended.
+    r"\bremove-item\b[^|;&]*\brecurse\b",
+    r"\bremove-item\b[^|;&]*\bforce\b[^|;&]*[*?]",
+    r"\bremove-item\b[^|;&]*[*?][^|;&]*\bforce\b",
     r"\breg\s+delete\b",
     // Precise forms of the prose-colliding commands below: `format c:`,
     // `shutdown /s`, `erase d:` — real invocations, never prose.
@@ -570,6 +577,51 @@ impl Tool for ExecTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn deleting_one_named_file_with_force_is_not_gated() {
+        // The exact shape that stalled a project: clearing a pidfile.
+        let tool = ExecTool::new(
+            std::path::PathBuf::from("."),
+            None,
+            None,
+            Some("unsafe_only".to_string()),
+            false,
+        );
+        for cmd in [
+            "Remove-Item C:\\proj\\run.pid -Force",
+            "Remove-Item -Force C:\\proj\\imap.lock",
+            "Remove-Item \"C:\\proj\\out.log\" -Force -ErrorAction SilentlyContinue",
+        ] {
+            assert!(
+                tool.guard_command(cmd, ".").is_none(),
+                "deleting one named file should not need approval: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_or_wildcard_deletes_are_still_gated() {
+        let tool = ExecTool::new(
+            std::path::PathBuf::from("."),
+            None,
+            None,
+            Some("unsafe_only".to_string()),
+            false,
+        );
+        for cmd in [
+            "Remove-Item C:\\proj -Recurse -Force",
+            "Remove-Item -Recurse C:\\tmp",
+            "Remove-Item C:\\proj\\*.py -Force",
+            "Remove-Item -Force C:\\logs\\*",
+        ] {
+            assert!(
+                tool.guard_command(cmd, ".").is_some(),
+                "a tree or wildcard delete must still need approval: {cmd}"
+            );
+        }
+    }
 
     // ── Regression: "unsafe command pattern detected" explained nothing ──
     //

@@ -384,7 +384,10 @@ pub fn extract_approval_token(result: &str) -> Option<String> {
 /// One-line summary of an `<<<EXEC_RESULT>>>` report (header + optional stderr hint).
 pub fn summarize_exec_block(block: &str) -> String {
     if exec_result_needs_approval(block) {
-        return "⚠ NOT executed — needs approval (agent must retry with approve_token)".to_string();
+        // This is an internal safety re-check that the agent clears itself by
+        // re-calling with the token it was handed. Phrasing it as "needs
+        // approval" made users hunt for a prompt that is never shown.
+        return "⋯ safety check — retrying automatically (nothing for you to do)".to_string();
     }
     let mut command = None;
     let mut exit_code = None;
@@ -521,8 +524,10 @@ pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
         let inner = inner.trim_end_matches('`').trim();
         let lines = inner.lines().count();
         if lines > 1 || inner.len() > 120 {
-            // Multi-line or long block: silently drop it.
-            String::new()
+            // Dropping it silently left the sentence that introduced it
+            // pointing at nothing — "To verify without disturbing it:"
+            // followed by blank space. Say that something was removed.
+            format!("[{lines}-line code block omitted here]")
         } else {
             // Short single-line: keep as-is.
             block.to_string()
@@ -2071,7 +2076,9 @@ pub(crate) fn tool_outcome_preview(tool_name: &str, arguments: &str, result: &st
         let preview: String = cmd.chars().take(60).collect();
         let ellipsis = if cmd.len() > 60 { "…" } else { "" };
         if exec_result_needs_approval(result) {
-            return format!("⚠ `{preview}{ellipsis}` — NOT executed, needs approval");
+            return format!(
+                "⋯ `{preview}{ellipsis}` — safety check, retrying automatically"
+            );
         }
         if failed {
             let err = first_failure_summary_line(result)
@@ -4351,13 +4358,36 @@ mod tests {
 
     #[test]
     fn test_strip_markdown_fenced_code_blocks() {
-        // Multi-line code block should be silently removed.
+        // A multi-line block is removed, but NOT silently.
+        //
+        // This test previously asserted the opposite — "no placeholder noise".
+        // In use that was worse: a reply reading "To verify without disturbing
+        // it:" followed by a removed block left the reader staring at blank
+        // space, with no way to tell whether the agent had failed to write
+        // anything or the transport had eaten it. Saying something was removed
+        // is less noise than an unexplained gap.
         let s = "Hello\n```rust\nfn main() {}\nprintln!(\"hi\");\n```\nBye";
         let out = super::strip_markdown_fenced_code_blocks(s);
         assert!(out.contains("Hello"), "should keep surrounding text: {out}");
         assert!(out.contains("Bye"), "should keep surrounding text: {out}");
         assert!(!out.contains("fn main"), "code should be stripped: {out}");
-        assert!(!out.contains("code block"), "no placeholder noise: {out}");
+        assert!(out.contains("omitted"), "the gap must be explained: {out}");
+    }
+
+    #[test]
+    fn a_dropped_block_never_leaves_a_dangling_lead_in() {
+        // Verbatim shape from a user transcript: the sentence introducing the
+        // block survived, the block did not, and the result read as broken.
+        let s = "To verify without disturbing it:\n\n\
+                 ```powershell\nGet-Process -Id 12968\nGet-Content log.txt -Tail 5\n```\n\n\
+                 To stop it later:\n\n```\nStop-Process -Id 12968 -Force\n```";
+        let out = super::strip_markdown_fenced_code_blocks(s);
+        assert!(out.contains("To verify without disturbing it:"), "{out}");
+        // The multi-line block goes, but leaves a trace.
+        assert!(!out.contains("Get-Content log.txt"), "{out}");
+        assert!(out.contains("omitted"), "{out}");
+        // A single-line command is still short enough to keep.
+        assert!(out.contains("Stop-Process -Id 12968 -Force"), "{out}");
     }
 
     #[test]
