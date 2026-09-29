@@ -1287,36 +1287,88 @@ struct TaskStep {
     ok: bool,
     /// Optional outcome detail (error reason for failures).
     detail: Option<String>,
+    /// Bounded excerpt of what a SUCCESSFUL call actually returned.
+    ///
+    /// This is the difference between remembering that you looked and
+    /// remembering what you saw. Without it the model's whole record of a
+    /// call was "✓ exec" or "✓ analyze_image", so when asked what the
+    /// command printed or what the picture showed it had nothing to draw on
+    /// and produced something plausible instead: a PID and a memory figure
+    /// that were never on screen, or a description belonging to the previous
+    /// image. Truncated hard, because the point is grounding, not recall.
+    outcome: Option<String>,
+}
+
+/// How much of a tool's output to carry forward, per tool.
+///
+/// Tools whose output IS the answer (a picture, a page, a search) get the
+/// most; tools whose output can simply be fetched again get little.
+fn memory_budget_for(tool_name: &str) -> usize {
+    match tool_name {
+        "analyze_image" | "read_pdf" | "web_fetch" | "web_search" | "browser"
+        | "search_files" | "sharepoint_search" => 700,
+        "exec" => 500,
+        "read_file" | "list_dir" => 250,
+        _ => 160,
+    }
+}
+
+/// Condense a tool result into something worth remembering: blank lines and
+/// runs of spaces collapsed, internal markers dropped, then truncated.
+fn summarize_result_for_memory(tool_name: &str, result: &str) -> Option<String> {
+    let cleaned = strip_all_exec_reports_from_text(result);
+    // For exec the report wrapper carries the interesting parts, so fall back
+    // to the raw text when stripping leaves nothing.
+    let source = if cleaned.trim().is_empty() { result } else { &cleaned };
+    let condensed: String = source
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("<<<"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let condensed = condensed.trim();
+    if condensed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(condensed, memory_budget_for(tool_name)))
 }
 
 impl TaskStep {
     /// Build a step record from a completed tool call.
     fn from_tool_call(tool_name: &str, arguments: &str, result: &str) -> Self {
         let label = tool_progress_preview(tool_name, arguments);
-        if tool_name == "exec" {
-            let failed = exec_report_failed(result);
-            let detail = if failed {
+        let failed = if tool_name == "exec" {
+            exec_report_failed(result)
+        } else {
+            non_exec_tool_failed(result)
+        };
+        let detail = if failed {
+            if tool_name == "exec" {
                 first_failure_summary_line(result)
             } else {
-                None
-            };
-            TaskStep { label, ok: !failed, detail }
-        } else {
-            let failed = non_exec_tool_failed(result);
-            let detail = if failed {
                 Some(truncate_chars(result.lines().next().unwrap_or("failed"), 100))
-            } else {
-                None
-            };
-            TaskStep { label, ok: !failed, detail }
-        }
+            }
+        } else {
+            None
+        };
+        // Kept for successes too — that is the whole point.
+        let outcome = if failed {
+            None
+        } else {
+            summarize_result_for_memory(tool_name, result)
+        };
+        TaskStep { label, ok: !failed, detail, outcome }
     }
 
     fn render(&self) -> String {
         let mark = if self.ok { "✓" } else { "✗" };
-        match &self.detail {
+        let head = match &self.detail {
             Some(d) if !self.ok => format!("  {mark} {} — {d}", self.label),
             _ => format!("  {mark} {}", self.label),
+        };
+        match &self.outcome {
+            Some(o) => format!("{head}\n      → {o}"),
+            None => head,
         }
     }
 }
@@ -2061,7 +2113,29 @@ pub(crate) fn tool_progress_preview(tool_name: &str, arguments: &str) -> String 
             let preview: String = q.chars().take(60).collect();
             format!("Searching: {preview}")
         }
-        other => format!("{other}…"),
+        other => {
+            // Previously just the tool name, so two calls to analyze_image on
+            // different files were indistinguishable in memory. Carry the
+            // most identifying argument we can find.
+            let key = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| {
+                    for k in [
+                        "path", "url", "query", "item_id", "name", "question", "site", "chat_id",
+                    ] {
+                        if let Some(val) = v.get(k).and_then(|x| x.as_str()) {
+                            if !val.trim().is_empty() {
+                                return Some(format!("{k}={}", truncate_chars(val, 70)));
+                            }
+                        }
+                    }
+                    None
+                });
+            match key {
+                Some(k) => format!("{other}({k})"),
+                None => format!("{other}…"),
+            }
+        }
     }
 }
 
@@ -3605,8 +3679,31 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         if !task_steps.is_empty() {
             let mut record =
                 String::from("[Internal tool log for the message above:\n");
-            for step in &task_steps {
-                record.push_str(&step.render());
+            // Bound the whole log. Newest steps keep their output; older ones
+            // degrade to just the label, so a long turn cannot crowd out the
+            // conversation itself.
+            const LEDGER_BUDGET: usize = 3000;
+            let mut rendered: Vec<String> =
+                task_steps.iter().map(|s| s.render()).collect();
+            let mut total: usize = rendered.iter().map(|r| r.chars().count()).sum();
+            for (i, step) in task_steps.iter().enumerate() {
+                if total <= LEDGER_BUDGET {
+                    break;
+                }
+                if step.outcome.is_some() {
+                    let bare = TaskStep {
+                        label: step.label.clone(),
+                        ok: step.ok,
+                        detail: step.detail.clone(),
+                        outcome: None,
+                    }
+                    .render();
+                    total -= rendered[i].chars().count() - bare.chars().count();
+                    rendered[i] = bare;
+                }
+            }
+            for line in rendered {
+                record.push_str(&line);
                 record.push('\n');
             }
             if let Some(token) = exec_tool_outputs.last().and_then(|o| extract_approval_token(o)) {
@@ -3616,12 +3713,18 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 ));
             }
             record.push_str(
-                "These calls really happened, so do not deny using a tool you used. But the user \
-                 has seen NONE of this: tool output is invisible to them, and this note is not a \
-                 reply. Never say a task was \"already done\", never refer to results \"above\", \
-                 and never re-announce old results — if the newest message asks for something \
-                 these calls produced, present the actual content again as if for the first \
-                 time. Never quote or mention this note.]",
+                "The → lines are the REAL output of those calls, shortened. Use them as your \
+                 source of fact and quote from them rather than recalling. IF A FACT YOU WANT TO \
+                 STATE IS NOT IN THIS LOG, YOU DO NOT KNOW IT — call the tool again instead of \
+                 giving a value from memory. That applies to process ids, file and folder names, \
+                 sizes, timestamps, counts and command output; and if the log records an image or \
+                 document, describe THAT one, never an earlier one. These calls really happened, \
+                 so do not deny using a tool you used. But the user has seen NONE of this: tool \
+                 output is invisible to them, and this note is not a reply. Never say a task was \
+                 \"already done\", never refer to results \"above\", and never re-announce old \
+                 results — if the newest message asks for something these calls produced, present \
+                 the actual content again as if for the first time. Never quote or mention this \
+                 note itself.]",
             );
             // Stored as a `system` message, not `assistant`. As an assistant
             // message the model read it as its own prior speech to the user,
@@ -4885,8 +4988,8 @@ Write-Output "hello"
     #[test]
     fn test_build_task_summary_anchors_question() {
         let steps = vec![
-            TaskStep { label: "Read `invoice.pdf`".into(), ok: true, detail: None },
-            TaskStep { label: "Exec: `python check.py`".into(), ok: false, detail: Some("ModuleNotFoundError".into()) },
+            TaskStep { label: "Read `invoice.pdf`".into(), ok: true, detail: None, outcome: None },
+            TaskStep { label: "Exec: `python check.py`".into(), ok: false, detail: Some("ModuleNotFoundError".into()), outcome: None },
         ];
         let summary = build_task_summary("what is in the invoice pdf?", &steps, true);
         assert!(summary.contains("**Task:**"), "must restate task: {summary}");
@@ -4899,7 +5002,7 @@ Write-Output "hello"
     #[test]
     fn test_build_task_summary_all_success() {
         let steps = vec![
-            TaskStep { label: "Exec: `dir`".into(), ok: true, detail: None },
+            TaskStep { label: "Exec: `dir`".into(), ok: true, detail: None, outcome: None },
         ];
         let summary = build_task_summary("list files", &steps, true);
         assert!(summary.contains("✅ Completed"), "all-success outcome: {summary}");
@@ -5090,6 +5193,95 @@ Write-Output "hello"
         assert!(!is_meta_non_answer("The gateway is running as pid 6720."));
     }
 
+
+
+    // ── Regression: the harness gave the model nothing to be honest with ──
+    //
+    // Two reported hallucinations had one cause. A successful tool call was
+    // recorded as "✓ exec" or "✓ analyze_image" with the result thrown away,
+    // so when asked what a command printed the model produced a plausible
+    // PID and memory figure that had never been on screen, and when asked
+    // about a picture it described the previous one. Neither was reckless
+    // invention: there was literally nothing else in its memory.
+
+
+
+    #[test]
+    fn a_successful_call_remembers_what_it_returned() {
+        let step = TaskStep::from_tool_call(
+            "exec",
+            r#"{"command":"Get-Process -Id 312"}"#,
+            "<<<EXEC_RESULT>>>\nexit_code: 0\nstdout:\nHandles  NPM(K)  PM(K)   Id ProcessName\n    512      28  39320  12968 python\n<<<END>>>",
+        );
+        assert!(step.ok);
+        let rendered = step.render();
+        // The real numbers must be there to quote.
+        assert!(rendered.contains("12968"), "must carry the real pid: {rendered}");
+        assert!(rendered.contains("→"), "outcome must be marked: {rendered}");
+    }
+
+    #[test]
+    fn an_image_call_remembers_which_image_and_what_it_showed() {
+        let step = TaskStep::from_tool_call(
+            "analyze_image",
+            r#"{"path":"C:\\Users\\chack\\.metis\\media\\AgACAgEA.jpg"}"#,
+            "A Kaspersky quarantine window listing 000.exe through 0004.exe and three cookie files.",
+        );
+        let rendered = step.render();
+        // Which image...
+        assert!(rendered.contains("AgACAgEA"), "must identify the image: {rendered}");
+        // ...and what was in it, so a follow-up answers about THIS one.
+        assert!(rendered.contains("0004.exe"), "must carry the content: {rendered}");
+    }
+
+    #[test]
+    fn tools_without_a_bespoke_label_still_identify_themselves() {
+        // Previously every such tool rendered as just its name, so two calls
+        // on different inputs were indistinguishable in memory.
+        let p = tool_progress_preview("analyze_image", r#"{"path":"C:\\a\\b.jpg"}"#);
+        assert!(p.contains("b.jpg"), "{p}");
+        let p = tool_progress_preview("sharepoint_search", r#"{"query":"invoice 4711"}"#);
+        assert!(p.contains("invoice 4711"), "{p}");
+        // And a tool with no recognisable argument still degrades gracefully.
+        let p = tool_progress_preview("mystery_tool", "{}");
+        assert!(p.starts_with("mystery_tool"), "{p}");
+    }
+
+    #[test]
+    fn a_failed_call_keeps_its_error_and_claims_no_output() {
+        let step = TaskStep::from_tool_call(
+            "exec",
+            r#"{"command":"python missing.py"}"#,
+            "<<<EXEC_RESULT>>>\nSTATUS: FAILED\nEXIT_CODE: 1\nModuleNotFoundError: no module named x\n<<<END>>>",
+        );
+        assert!(!step.ok);
+        // The key property: a failed call must not leave a remembered
+        // "result" the model could later present as output.
+        assert!(step.outcome.is_none(), "a failure has no result to remember");
+        let rendered = step.render();
+        assert!(rendered.contains('✗'), "must be marked failed: {rendered}");
+        assert!(rendered.contains("python missing.py"), "must say what failed: {rendered}");
+    }
+
+    #[test]
+    fn result_memory_is_capped_per_tool() {
+        let huge = "x".repeat(50_000);
+        let step = TaskStep::from_tool_call("read_file", r#"{"path":"big.txt"}"#, &huge);
+        let o = step.outcome.expect("should remember something");
+        // read_file is re-runnable, so it gets the small budget.
+        assert!(o.chars().count() <= 251, "not capped: {} chars", o.chars().count());
+
+        let step = TaskStep::from_tool_call("analyze_image", r#"{"path":"a.jpg"}"#, &huge);
+        let o = step.outcome.unwrap();
+        // An image description IS the answer, so it gets more room.
+        assert!(o.chars().count() > 251 && o.chars().count() <= 701, "{}", o.chars().count());
+    }
+
+    #[test]
+    fn empty_output_is_not_remembered_as_something() {
+        let step = TaskStep::from_tool_call("exec", r#"{"command":"cd ."}"#, "   \n\n  ");
+        assert!(step.outcome.is_none(), "blank output must not become a fake fact");
+    }
 
     // ── Regression: "I already did this — the results are above" ─────────
 
