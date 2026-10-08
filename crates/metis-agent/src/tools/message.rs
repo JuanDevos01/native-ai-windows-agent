@@ -28,7 +28,10 @@ pub type SendCallback = Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output
 /// The agent loop calls `set_context` before each interaction to set
 /// the default channel/chat_id for the current conversation.
 pub struct MessageTool {
-    send_callback: Option<SendCallback>,
+    /// How a message actually leaves the process. `None` means no chat
+    /// channel is attached here (desktop, CLI, `cron run`) and a send is
+    /// impossible — which must be reported as a failure, never as success.
+    send_callback: std::sync::Mutex<Option<SendCallback>>,
     /// Default channel / chat_id set per-interaction by the agent loop.
     context: Mutex<(String, String)>,
 }
@@ -37,9 +40,18 @@ impl MessageTool {
     /// Create a new message tool with a send callback.
     pub fn new(send_callback: Option<SendCallback>) -> Self {
         Self {
-            send_callback,
+            send_callback: std::sync::Mutex::new(send_callback),
             context: Mutex::new(("cli".into(), "direct".into())),
         }
+    }
+
+    /// Attach the real delivery path. Only a process that actually
+    /// dispatches outbound messages to channels (the gateway) should do this.
+    pub fn set_send_callback(&self, cb: SendCallback) {
+        *self
+            .send_callback
+            .lock()
+            .expect("message tool callback mutex poisoned") = Some(cb);
     }
 
     /// Set the current context (called by the agent loop per-message).
@@ -108,14 +120,30 @@ impl Tool for MessageTool {
 
         let msg = OutboundMessage::new(&channel, &chat_id, &content);
 
-        if let Some(cb) = &self.send_callback {
-            cb(msg).await.map_err(|e| anyhow::anyhow!("Failed to send message: {e}"))?;
-        } else {
-            // No callback — just a no-op (CLI mode / tests)
-            debug!("No send callback configured; message discarded");
-        }
+        // Clone the callback out so the std mutex is not held across await.
+        let cb = self
+            .send_callback
+            .lock()
+            .expect("message tool callback mutex poisoned")
+            .clone();
 
-        Ok(format!("Message sent to {channel}:{chat_id}"))
+        // This branch used to discard the message and still return
+        // "Message sent to telegram:...". The tool was constructed with no
+        // callback in EVERY mode, so it had never delivered anything: a
+        // morning news briefing was "sent" to Telegram, the model reported
+        // it delivered, and the user received nothing but that report.
+        let Some(cb) = cb else {
+            anyhow::bail!(
+                "NOT SENT: no chat channel is attached to this process (desktop, CLI, or a \
+                 manual `cron run`), so a message to {channel}:{chat_id} cannot be delivered. \
+                 Put the content in your reply instead. Do not tell the user it was sent."
+            );
+        };
+        cb(msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("NOT SENT: delivery to {channel}:{chat_id} failed: {e}"))?;
+
+        Ok(format!("Message delivered to {channel}:{chat_id}"))
     }
 }
 
@@ -126,6 +154,50 @@ impl Tool for MessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A callback that records what was sent, so tests prove delivery
+    /// instead of trusting the return string.
+    fn capturing_callback() -> (SendCallback, std::sync::Arc<std::sync::Mutex<Vec<OutboundMessage>>>) {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let cb: SendCallback = Arc::new(move |m: OutboundMessage| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push(m);
+                Ok(())
+            })
+        });
+        (cb, sent)
+    }
+
+    #[tokio::test]
+    async fn with_no_delivery_path_a_send_fails_instead_of_pretending() {
+        // The regression that ate every news briefing: no callback, yet the
+        // tool said "Message sent". It must now refuse, loudly.
+        let tool = MessageTool::new(None);
+        tool.set_context("telegram", "8582973375").await;
+        let mut params = HashMap::new();
+        params.insert("content".into(), json!("five headlines"));
+        let err = tool.execute(params).await.unwrap_err().to_string();
+        assert!(err.contains("NOT SENT"), "{err}");
+        assert!(err.contains("Do not tell the user it was sent"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn with_a_delivery_path_the_message_really_goes_out() {
+        let (cb, sent) = capturing_callback();
+        let tool = MessageTool::new(None);
+        tool.set_send_callback(cb);
+        tool.set_context("telegram", "8582973375").await;
+        let mut params = HashMap::new();
+        params.insert("content".into(), json!("five headlines"));
+        let out = tool.execute(params).await.unwrap();
+        assert_eq!(out, "Message delivered to telegram:8582973375");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one message must actually leave");
+        assert_eq!(sent[0].content, "five headlines");
+        assert_eq!(sent[0].chat_id, "8582973375");
+    }
 
 
     #[tokio::test]
@@ -143,7 +215,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_explicit_channel_still_works_from_a_scheduled_session() {
-        let tool = MessageTool::new(None);
+        let (cb, _sent) = capturing_callback();
+        let tool = MessageTool::new(Some(cb));
         tool.set_context("cron", "77008abf").await;
         let mut params = HashMap::new();
         params.insert("content".into(), json!("hello"));
@@ -171,24 +244,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_no_callback() {
-        let tool = MessageTool::new(None);
+        let (cb, _sent) = capturing_callback();
+        let tool = MessageTool::new(Some(cb));
         tool.set_context("discord", "guild_1").await;
         let mut params = HashMap::new();
         params.insert("content".into(), json!("Hello from agent"));
         let result = tool.execute(params).await.unwrap();
-        assert_eq!(result, "Message sent to discord:guild_1");
+        assert_eq!(result, "Message delivered to discord:guild_1");
     }
 
     #[tokio::test]
     async fn test_execute_with_channel_override() {
-        let tool = MessageTool::new(None);
+        let (cb, _sent) = capturing_callback();
+        let tool = MessageTool::new(Some(cb));
         tool.set_context("cli", "direct").await;
         let mut params = HashMap::new();
         params.insert("content".into(), json!("Hello"));
         params.insert("channel".into(), json!("slack"));
         params.insert("chat_id".into(), json!("C12345"));
         let result = tool.execute(params).await.unwrap();
-        assert_eq!(result, "Message sent to slack:C12345");
+        assert_eq!(result, "Message delivered to slack:C12345");
     }
 
     #[tokio::test]
@@ -218,7 +293,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("content".into(), json!("ping"));
         let result = tool.execute(params).await.unwrap();
-        assert!(result.contains("Message sent"));
+        assert!(result.contains("Message delivered"));
         assert!(called.load(Ordering::SeqCst));
     }
 }

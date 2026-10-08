@@ -546,11 +546,20 @@ pub fn strip_markdown_fenced_code_blocks(text: &str) -> String {
 /// Strips hallucinated `<<<EXEC_RESULT>>>` blocks from model text when real exec ran this turn,
 /// so pasted `EXIT_CODE: 0` fiction cannot hide a failed tool call.
 fn reconcile_exec_with_reply(content: String, exec_outputs: &[String], compact_exec: bool) -> String {
-    let mut text = if exec_outputs.is_empty() {
-        content
-    } else {
-        strip_all_exec_reports_from_text(&content)
-    };
+    // ALWAYS strip exec reports from the model's own text. Only the harness
+    // may emit them, and it re-appends the genuine ones below. This used to
+    // strip only when the turn had real exec output, so in a turn with none
+    // a block the model WROTE ITSELF - in the exact format, with an mtime
+    // dated tomorrow - was delivered to the user as if a command had run.
+    let had_forgery = !exec_outputs.is_empty() || content.contains("<<<EXEC_RESULT>>>");
+    let mut text = strip_all_exec_reports_from_text(&content);
+    if exec_outputs.is_empty() && had_forgery && text.trim() != content.trim() {
+        text = format!(
+            "{}\n\n⚠ The reply above contained text formatted as command output, but no \
+             command was run in this turn - it was removed because it was not real.",
+            text.trim_end()
+        );
+    }
 
     if exec_turn_should_show_hard_failure(exec_outputs) {
         text = strip_optimistic_running_claims(&text);
@@ -1884,6 +1893,179 @@ fn try_recover_invoke_xml_tool_call(content: &str) -> Option<metis_core::types::
     Some(metis_core::types::ToolCall::new("recovered-1", name, args_str))
 }
 
+// ─────────────────────────────────────────────
+// Grounding check
+// ─────────────────────────────────────────────
+
+/// Join digits split by thousands separators ("3 284 028", "6,813,796",
+/// "18.179.568") so the same value matches however it was formatted.
+fn join_digit_groups(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let is_sep = matches!(c, ' ' | ',' | '.' | '\u{202F}' | '\u{00A0}' | '\'');
+        if is_sep
+            && i > 0
+            && i + 1 < chars.len()
+            && chars[i - 1].is_ascii_digit()
+            && chars[i + 1].is_ascii_digit()
+        {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Every maximal run of digits in `s`, both as written and with digit groups
+/// joined.
+///
+/// Both are needed. Joining is what lets "6,813,796" match "6813796", but on
+/// its own it also fuses adjacent table columns - PowerShell prints
+/// "6813796 10/3/2026", which joins to "681379610" and would make a TRUE
+/// value look unsupported. Indexing the raw runs as well means joining can
+/// only add matches, never remove one.
+fn digit_runs(s: &str) -> std::collections::HashSet<String> {
+    fn collect(text: &str, into: &mut std::collections::HashSet<String>) {
+        let mut cur = String::new();
+        for c in text.chars() {
+            if c.is_ascii_digit() {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                into.insert(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            into.insert(cur);
+        }
+    }
+    let mut runs = std::collections::HashSet::new();
+    collect(s, &mut runs);
+    collect(&join_digit_groups(s), &mut runs);
+    runs
+}
+
+/// Calendar dates mentioned in `s`, as (year, month, day). US-style M/D/Y is
+/// also recorded as D/M/Y, so an ambiguous date in tool output can only
+/// widen what counts as grounded, never narrow it.
+fn dates_in(s: &str, lenient: bool) -> Vec<((i32, u32, u32), String)> {
+    static ISO: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static US: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let iso = ISO.get_or_init(|| Regex::new(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b").unwrap());
+    let us = US.get_or_init(|| Regex::new(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b").unwrap());
+    let mut out = Vec::new();
+    for c in iso.captures_iter(s) {
+        if let (Ok(y), Ok(m), Ok(d)) = (c[1].parse(), c[2].parse(), c[3].parse()) {
+            out.push(((y, m, d), c[0].to_string()));
+        }
+    }
+    for c in us.captures_iter(s) {
+        if let (Ok(a), Ok(b), Ok(y)) = (c[1].parse::<u32>(), c[2].parse::<u32>(), c[3].parse()) {
+            out.push(((y, a, b), c[0].to_string()));
+            if lenient {
+                out.push(((y, b, a), c[0].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Values a reply states as fact that no tool output from this turn supports.
+///
+/// The reply that prompted this said "blf2.nam 3 284 028 B, 74 637 records,
+/// mtime 2026-09-13" while the directory listing returned in the SAME turn
+/// said 6813796 bytes, written 10/3/2026. The real numbers were in the
+/// model's context; it copied an earlier fabricated table from its own
+/// history instead. Telling the model to quote the log did not stop that, so
+/// the check happens on the way out: a size, count, process id or date that
+/// appears in no tool output is surfaced to the user as unverified.
+///
+/// Deliberately conservative - it only looks at tokens that read as data
+/// (numbers of five or more digits, process ids, calendar dates) and skips
+/// anything the user wrote themselves.
+fn ungrounded_facts(reply: &str, corpus: &str, user_msg: &str) -> Vec<String> {
+    static NUM: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PID: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let num = NUM.get_or_init(|| {
+        Regex::new(r"\b\d{1,3}(?:[ ,.\u{202F}\u{00A0}']\d{3})+\b|\b\d{5,}\b").unwrap()
+    });
+    let pid = PID.get_or_init(|| Regex::new(r"(?i)\bpid\s*[:=#]?\s*(\d{2,7})\b").unwrap());
+
+    let known = {
+        let mut k = digit_runs(corpus);
+        k.extend(digit_runs(user_msg));
+        k
+    };
+    let known_dates: std::collections::HashSet<(i32, u32, u32)> = dates_in(corpus, true)
+        .into_iter()
+        .chain(dates_in(user_msg, true))
+        .map(|(d, _)| d)
+        .collect();
+
+    let mut flagged: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !flagged.contains(&v) && flagged.len() < 8 {
+            flagged.push(v);
+        }
+    };
+
+    // Dates first, and blank them out so their digits are not re-read as
+    // standalone numbers below.
+    let mut scrubbed = reply.to_string();
+    for (d, text) in dates_in(reply, false) {
+        if !known_dates.contains(&d) {
+            push(text.clone());
+        }
+        scrubbed = scrubbed.replace(&text, " ");
+    }
+    for c in pid.captures_iter(&scrubbed) {
+        if !known.contains(&c[1]) {
+            push(format!("PID {}", &c[1]));
+        }
+    }
+    for m in num.find_iter(&scrubbed) {
+        let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 5 && !known.contains(&digits) {
+            push(m.as_str().to_string());
+        }
+    }
+    flagged
+}
+
+/// Append a visible warning listing unsupported values, if any.
+fn flag_ungrounded_facts(content: String, corpus: &str, user_msg: &str) -> String {
+    if corpus.trim().is_empty() {
+        // No tool ran this turn, so there is nothing to check against.
+        return content;
+    }
+    let bad = ungrounded_facts(&content, corpus, user_msg);
+    if bad.is_empty() {
+        return content;
+    }
+    format!(
+        "{}\n\n⚠ Unverified — not found in any tool output from this turn: {}. Treat these \
+         values as unconfirmed.",
+        content.trim_end(),
+        bad.join(", ")
+    )
+}
+
+/// The version of a reply that is safe to keep in session history.
+///
+/// Genuine exec reports are appended to the reply for the user's benefit,
+/// but stored in history they appear as the ASSISTANT's own words - dozens of
+/// examples of "itself" emitting that exact format. That is how the model
+/// learned to write one when it had no real output. The ledger already
+/// carries the real results, so history keeps only the prose.
+fn history_safe(content: &str) -> String {
+    let stripped = strip_all_exec_reports_from_text(content);
+    if stripped.trim().is_empty() {
+        content.to_string()
+    } else {
+        stripped
+    }
+}
+
 /// Marker that opens the internal tool ledger stored in session history.
 const TOOL_LEDGER_MARKER: &str = "[Internal tool log";
 /// Marker used by ledgers written before the rewording; old sessions still
@@ -2358,6 +2540,26 @@ impl AgentLoop {
     ///
     /// Not attaching (or `enabled: false`) leaves memory off entirely — the
     /// agent then behaves exactly as before this feature existed.
+    /// Let the `message` tool actually deliver, by publishing to the bus.
+    ///
+    /// Call this ONLY where something consumes outbound messages and routes
+    /// them to channels - the gateway. Everywhere else the tool now refuses
+    /// a send, which is honest; before, it was built with no callback in
+    /// every mode, discarded every message, and still reported success.
+    pub fn with_channel_delivery(self) -> Self {
+        let bus = self.bus.clone();
+        let cb: crate::tools::message::SendCallback = Arc::new(move |msg| {
+            let bus = bus.clone();
+            Box::pin(async move {
+                bus.publish_outbound(msg)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("outbound bus closed: {e}"))
+            })
+        });
+        self.message_tool.set_send_callback(cb);
+        self
+    }
+
     /// Point the context builder at the skills bundled with Metis.
     ///
     /// Without this only `workspace/skills` is discovered, which is why
@@ -2879,7 +3081,7 @@ impl AgentLoop {
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
-                .add_message(&session_key, Message::assistant(&content));
+                .add_message(&session_key, Message::assistant(&history_safe(&content)));
             return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
@@ -2899,7 +3101,7 @@ impl AgentLoop {
                     self.sessions
                         .add_message(&session_key, Message::user(&msg.content));
                     self.sessions
-                        .add_message(&session_key, Message::assistant(&content));
+                        .add_message(&session_key, Message::assistant(&history_safe(&content)));
                     return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
                 }
             }
@@ -2918,7 +3120,7 @@ impl AgentLoop {
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
-                .add_message(&session_key, Message::assistant(&content));
+                .add_message(&session_key, Message::assistant(&history_safe(&content)));
             return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
@@ -2945,7 +3147,7 @@ impl AgentLoop {
                 self.sessions
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
-                    .add_message(&session_key, Message::assistant(&content));
+                    .add_message(&session_key, Message::assistant(&history_safe(&content)));
                 return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
             }
         }
@@ -3032,7 +3234,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
-                .add_message(&session_key, Message::assistant(&content));
+                .add_message(&session_key, Message::assistant(&history_safe(&content)));
             return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
         }
 
@@ -3136,6 +3338,9 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let mut exec_tool_outputs: Vec<String> = Vec::new();
         // Durable record of every action taken this turn (the "checking" log).
         let mut task_steps: Vec<TaskStep> = Vec::new();
+        // Full text of every tool result this turn - the evidence a reply's
+        // stated facts are checked against before it is sent.
+        let mut grounding_corpus = String::new();
         let max_exec_calls = max_exec_calls_for_message(&msg.content);
         let mut exec_calls_executed: usize = 0;
         let mut wrapup_injected = false;
@@ -3315,6 +3520,9 @@ Run the next command in a follow-up message, or combine steps into one script."
                         exec_calls_executed += 1;
                         exec_tool_outputs.push(result.clone());
                     }
+
+                    grounding_corpus.push_str(&result);
+                    grounding_corpus.push('\n');
 
                     // Record the step in the durable task ledger.
                     task_steps.push(TaskStep::from_tool_call(
@@ -3565,6 +3773,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 compact_exec,
             )
         };
+        content = flag_ungrounded_facts(content, &grounding_corpus, &msg.content);
 
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
         // but never executed a tool call, force a deterministic read_file response.
@@ -3736,7 +3945,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         }
 
         self.sessions
-            .add_message(&session_key, Message::assistant(&content));
+            .add_message(&session_key, Message::assistant(&history_safe(&content)));
 
         // Token footer goes on the wire only — session history stays clean so
         // the model never sees (or pays for) old usage footers.
@@ -3858,7 +4067,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         self.sessions
             .add_message(&session_key, Message::user(&msg.content));
         self.sessions
-            .add_message(&session_key, Message::assistant(&content));
+            .add_message(&session_key, Message::assistant(&history_safe(&content)));
 
         // Route response to the original channel/chat (usage footer on the wire only)
         let mut outbound = self.outbound_message(&origin_channel, &origin_chat_id, &content);
@@ -5194,6 +5403,108 @@ Write-Output "hello"
     }
 
 
+
+
+    // ── Regression: real numbers in context, fabricated numbers in reply ──
+
+    /// The genuine directory listing returned in the turn that produced the
+    /// fabricated table below - copied from the session ledger.
+    const REAL_LISTING: &str = "Name              Length LastWriteTime\n\
+        ----              ------ -------------\n\
+        blf2 - Copy.nam  3515952 9/12/2026 5:27:49 PM\n\
+        blf2.nam         6813796 10/3/2026 9:03:11 AM\n\
+        blf2A.nam          27940 9/14/2026 3:52:00 PM\n\
+        blf2L.nam           6688 9/14/2026 3:52:00 PM\n\
+        blf2M.nam          13860 9/14/2026 3:52:00 PM\n\
+        blf2O.nam       18179568 9/14/2026 3:52:01 PM\n";
+
+    #[test]
+    fn the_fabricated_table_is_flagged_against_the_real_listing() {
+        // Verbatim from the reply the user received.
+        let reply = "blf2.nam   3 284 028 B   74 637 records   mtime 2026-09-13 20:29:37\n\
+                     blf2A.nam    224 532 B    5 103 records\n\
+                     blf2O.nam     38 236 B      869 records";
+        let bad = ungrounded_facts(reply, REAL_LISTING, "");
+        let joined = bad.join(" | ");
+        assert!(joined.contains("3 284 028"), "fake size not flagged: {joined}");
+        assert!(joined.contains("74 637"), "fake record count not flagged: {joined}");
+        assert!(joined.contains("224 532"), "{joined}");
+        assert!(joined.contains("2026-09-13"), "fake mtime date not flagged: {joined}");
+    }
+
+    #[test]
+    fn a_truthful_reply_about_the_same_listing_is_not_flagged() {
+        // Same facts the tool returned, formatted differently - must pass.
+        let reply = "blf2.nam is 6,813,796 bytes, last written 2026-10-03. \
+                     blf2O.nam is 18 179 568 bytes (2026-09-14).";
+        let bad = ungrounded_facts(reply, REAL_LISTING, "");
+        assert!(bad.is_empty(), "truthful reply wrongly flagged: {bad:?}");
+    }
+
+    #[test]
+    fn an_invented_pid_is_flagged() {
+        // "PID 312 — started 15:55, alive" with a process list that has no 312.
+        let real = "Handles  NPM(K)  PM(K)  Id ProcessName\n  512  28  39320  12968 python\n";
+        let bad = ungrounded_facts("It's running as PID 312.", real, "");
+        assert_eq!(bad, vec!["PID 312".to_string()]);
+        // The real one passes.
+        assert!(ungrounded_facts("It's running as PID 12968.", real, "").is_empty());
+    }
+
+    #[test]
+    fn a_date_in_the_future_is_flagged() {
+        // The forged block claimed an mtime of tomorrow.
+        let bad = ungrounded_facts("step3_extract.log mtime 2026-10-08 00:18:24", REAL_LISTING, "");
+        assert!(bad.iter().any(|b| b.contains("2026-10-08")), "{bad:?}");
+    }
+
+    #[test]
+    fn values_the_user_supplied_are_not_flagged() {
+        let bad = ungrounded_facts(
+            "You said the file should be 4 412 records.",
+            REAL_LISTING,
+            "it should have 4 412 records",
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    #[test]
+    fn with_no_tool_output_nothing_is_flagged() {
+        // No evidence this turn means no basis to judge - stay quiet.
+        let out = flag_ungrounded_facts("blf2.nam is 3 284 028 B".into(), "", "");
+        assert!(!out.contains("Unverified"), "{out}");
+    }
+
+    #[test]
+    fn the_warning_names_the_values() {
+        let out = flag_ungrounded_facts(
+            "blf2.nam is 3 284 028 B".into(),
+            REAL_LISTING,
+            "",
+        );
+        assert!(out.contains("⚠ Unverified"), "{out}");
+        assert!(out.contains("3 284 028"), "{out}");
+    }
+
+    // ── Regression: forged tool output and the format taught by history ──
+
+    #[test]
+    fn a_forged_exec_block_is_removed_when_no_command_ran() {
+        let forged = "Here is the state:\n\n<<<EXEC_RESULT>>>\nCOMMAND: Get-ChildItem x\n\
+                      EXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\n\
+                      step3_extract.log : 132 090 B   2026-10-08 00:18:24";
+        let out = reconcile_exec_with_reply(forged.to_string(), &[], false);
+        assert!(!out.contains("<<<EXEC_RESULT>>>"), "forged block survived: {out}");
+        assert!(out.contains("no command was run"), "removal must be explained: {out}");
+    }
+
+    #[test]
+    fn history_keeps_prose_but_not_exec_blocks() {
+        let reply = "Done.\n\n<<<EXEC_RESULT>>>\nCOMMAND: x\nEXIT_CODE: 0\n<<<END_EXEC_RESULT>>>";
+        let kept = history_safe(reply);
+        assert!(kept.contains("Done."), "{kept}");
+        assert!(!kept.contains("<<<EXEC_RESULT>>>"), "history would teach the format: {kept}");
+    }
 
     // ── Regression: the harness gave the model nothing to be honest with ──
     //

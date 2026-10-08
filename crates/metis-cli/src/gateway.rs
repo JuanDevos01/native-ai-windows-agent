@@ -263,7 +263,18 @@ pub async fn run() -> Result<()> {
             Some(outbound),
         )
         .with_memory(memory_settings)
-        .with_direct_chat_context(defaults.chat_context_length),
+        // The gateway built its agent separately from agent_builder and never
+        // picked up built-in skills, so the scheduling skill explaining
+        // --deliver was absent from exactly the agent that schedules jobs.
+        .with_builtin_skills(crate::agent_builder::builtin_skills_dir())
+        .with_sharepoint(
+            crate::agent_builder::build_sharepoint_settings(&config),
+            workspace.clone(),
+        )
+        .with_direct_chat_context(defaults.chat_context_length)
+        // The gateway is the one process that routes outbound messages to
+        // channels, so it is the only one where the message tool may send.
+        .with_channel_delivery(),
     );
 
     // 8. Create cron service
