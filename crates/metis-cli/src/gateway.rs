@@ -245,6 +245,9 @@ pub async fn run() -> Result<()> {
         show_token_usage: defaults.show_token_usage,
     };
     let memory_settings = crate::agent_builder::build_memory_settings(&config, &providers_map);
+    let gateway_events = Arc::new(metis_core::events::EventLog::new(
+        metis_core::events::EventLog::default_dir(),
+    ));
     let agent_loop = Arc::new(
         AgentLoop::new(
             bus.clone(),
@@ -275,9 +278,8 @@ pub async fn run() -> Result<()> {
         // The gateway is the one process that routes outbound messages to
         // channels, so it is the only one where the message tool may send.
         .with_channel_delivery()
-        .with_event_log(Arc::new(metis_core::events::EventLog::new(
-            metis_core::events::EventLog::default_dir(),
-        ))),
+        .with_event_log(gateway_events.clone())
+        .with_roster(crate::agent_builder::build_roster(&config, gateway_events.clone())),
     );
 
     // 8. Create cron service

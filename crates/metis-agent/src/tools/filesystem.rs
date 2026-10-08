@@ -608,6 +608,34 @@ fn is_cloud_placeholder(md: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Does a file name match the `name` filter?
+///
+/// With `*` or `?` the WHOLE name must match the pattern (`*.nam` means
+/// "ends in .nam"); without them it is a substring test, as before. A
+/// substring was the only option once, so asked for files "ending in .nam"
+/// the agent got every name merely containing ".nam" - 23 instead of 12,
+/// counting malware samples named like `Trojan.VB.nam-0679ea…`.
+fn file_name_matches(name: &str, filter: &str) -> bool {
+    let name = name.to_lowercase();
+    let filter = filter.to_lowercase();
+    if !filter.contains('*') && !filter.contains('?') {
+        return name.contains(&filter);
+    }
+    fn glob(n: &[char], p: &[char]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some('*'), _) => glob(n, &p[1..]) || (!n.is_empty() && glob(&n[1..], p)),
+            (Some('?'), Some(_)) => glob(&n[1..], &p[1..]),
+            (Some(pc), Some(nc)) if pc == nc => glob(&n[1..], &p[1..]),
+            _ => false,
+        }
+    }
+    let n: Vec<char> = name.chars().collect();
+    let p: Vec<char> = filter.chars().collect();
+    glob(&n, &p)
+}
+
 /// Directories that are never worth walking and would swamp the results.
 fn is_noise_dir(name: &str) -> bool {
     matches!(
@@ -717,7 +745,7 @@ fn walk(
         }
 
         if let Some(n) = name_needle {
-            if !name.to_lowercase().contains(n) {
+            if !file_name_matches(&name, n) {
                 continue;
             }
         }
@@ -774,9 +802,11 @@ impl Tool for SearchFilesTool {
 
     fn description(&self) -> &str {
         "Search a folder tree for files by name and/or by text inside them. Use this instead of \
-         listing and reading files one by one. Works on any folder, including synced OneDrive and \
-         SharePoint libraries. Cloud-only placeholder files are skipped by default so the search \
-         does not trigger large downloads."
+         listing and reading files one by one, and instead of `dir` / `Get-ChildItem` for finding \
+         files: on Windows `dir *.nam` also matches longer extensions such as `.nam-0679ea...` \
+         through 8.3 short names, so its counts are wrong. Works on any folder, including synced \
+         OneDrive and SharePoint libraries. Cloud-only placeholder files are skipped by default \
+         so the search does not trigger large downloads."
     }
 
     fn parameters(&self) -> Value {
@@ -793,7 +823,7 @@ impl Tool for SearchFilesTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Only look at files whose name contains this (case-insensitive), e.g. 'invoice' or '.pdf'"
+                    "description": "Which file names to include (case-insensitive). Use a pattern with * or ? to match the WHOLE name - '*.nam' means ending in .nam, 'invoice*' starts with invoice. Without * or ? it matches names CONTAINING the text."
                 },
                 "max_results": {
                     "type": "integer",
@@ -1290,6 +1320,27 @@ mod tests {
         assert_eq!(dominant_line_ending("a\r\nb\r\nc\n"), "\r\n");
         assert_eq!(dominant_line_ending("a\nb\nc\r\n"), "\n");
         assert_eq!(dominant_line_ending("no newlines"), "\n");
+    }
+
+
+    #[test]
+    fn a_pattern_matches_the_whole_name() {
+        assert!(file_name_matches("blf2.nam", "*.nam"));
+        assert!(file_name_matches("NINTEN95.NAM", "*.nam"), "case-insensitive");
+        // The malware sample that made the old count 23 instead of 12.
+        assert!(!file_name_matches(
+            "Trojan-Dropper.Win32.VB.nam-0679ea218bd2d5cc",
+            "*.nam"
+        ));
+        assert!(file_name_matches("invoice_2026.pdf", "invoice*"));
+        assert!(!file_name_matches("my_invoice.pdf", "invoice*"));
+        assert!(file_name_matches("a1.txt", "a?.txt"));
+    }
+
+    #[test]
+    fn a_plain_filter_still_means_contains() {
+        assert!(file_name_matches("Trojan.VB.nam-0679", ".nam"));
+        assert!(file_name_matches("my_invoice.pdf", "invoice"));
     }
 
     // ── SearchFilesTool ──

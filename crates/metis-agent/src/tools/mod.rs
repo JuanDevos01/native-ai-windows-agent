@@ -2,6 +2,7 @@
 
 pub mod base;
 pub mod registry;
+pub mod delegate;
 pub mod filesystem;
 pub mod shell;
 pub mod web;

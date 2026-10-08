@@ -357,7 +357,7 @@ impl LlmProvider for AnthropicProvider {
             );
             let body_text = resp.text().await.unwrap_or_default();
             if !status.is_success()
-                && crate::retry::is_transient_status(status.as_u16())
+                && crate::retry::should_retry(status.as_u16(), &body_text)
                 && attempt < crate::retry::MAX_TRANSIENT_RETRIES
             {
                 attempt += 1;

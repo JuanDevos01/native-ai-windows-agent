@@ -151,16 +151,30 @@ impl Default for AgentsConfig {
 }
 
 /// One named agent in the roster.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RosterAgent {
     /// Model id, in the same form as `defaults.model` - a cloud model
     /// (`claude-opus-5`, `minimax/MiniMax-M2.7`) or a local one
     /// (`ollama/llama3.1`).
     pub model: String,
-    /// What this agent is for. Shown in listings, and later offered to the
-    /// main agent so it can pick who to delegate to.
+    /// This agent's job. It is told to the agent as its role, and offered to
+    /// the main agent so it knows what to hand over.
     pub description: String,
+    /// Whether the agent gets tools. Turn off for text-only models (a small
+    /// local model that cannot call tools reliably), which then only receive
+    /// text jobs: summarise, translate, rewrite.
+    pub tools: bool,
+}
+
+impl Default for RosterAgent {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            description: String::new(),
+            tools: true,
+        }
+    }
 }
 
 /// An agent as the rest of the system sees it, main included.
@@ -169,6 +183,7 @@ pub struct AgentSpec {
     pub name: String,
     pub model: String,
     pub description: String,
+    pub tools: bool,
 }
 
 /// The name of the primary agent. Reserved: a roster entry cannot use it.
@@ -181,6 +196,7 @@ impl AgentsConfig {
             name: MAIN_AGENT.to_string(),
             model: self.defaults.model.clone(),
             description: "Primary agent: talks to you on every channel.".to_string(),
+            tools: true,
         }];
         for (name, a) in &self.roster {
             if name == MAIN_AGENT {
@@ -190,6 +206,7 @@ impl AgentsConfig {
                 name: name.clone(),
                 model: a.model.clone(),
                 description: a.description.clone(),
+                tools: a.tools,
             });
         }
         out
@@ -225,6 +242,12 @@ impl AgentsConfig {
             }
             if a.model.trim().is_empty() {
                 out.push(format!("agent \"{name}\" has no model"));
+            }
+            if a.description.trim().is_empty() {
+                out.push(format!(
+                    "agent \"{name}\" has no description - without a job the main agent \
+                     cannot tell when to hand it work"
+                ));
             }
         }
         out
@@ -1236,6 +1259,10 @@ mod roster_tests {
         assert_eq!(c.agent("worker").unwrap().model, "ollama/qwen2.5-coder");
         assert_eq!(c.agent("planner").unwrap().model, "claude-opus-5");
         assert!(c.roster_problems().is_empty());
+        // Tools are on unless switched off.
+        assert!(c.agent("worker").unwrap().tools);
+        let c2 = cfg(r#"{"defaults":{"model":"x"},"roster":{"writer":{"model":"ollama/gemma3:4b","description":"translate","tools":false}}}"#);
+        assert!(!c2.agent("writer").unwrap().tools);
     }
 
     #[test]
@@ -1244,14 +1271,16 @@ mod roster_tests {
             "defaults": {"model": "x"},
             "roster": {
                 "main":    {"model": "y"},
-                "Big Bad": {"model": "z"},
-                "empty":   {"model": "  "}
+                "Big Bad": {"model": "z", "description": "d"},
+                "empty":   {"model": "  ", "description": "d"},
+                "nojob":   {"model": "m"}
             }
         }"#);
         let problems = c.roster_problems().join("\n");
         assert!(problems.contains("reserved"), "{problems}");
         assert!(problems.contains("lowercase"), "{problems}");
         assert!(problems.contains("has no model"), "{problems}");
+        assert!(problems.contains("has no description"), "{problems}");
         // A roster "main" must never override the real main agent.
         assert_eq!(c.agent("main").unwrap().model, "x");
     }

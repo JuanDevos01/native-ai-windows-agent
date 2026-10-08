@@ -2121,7 +2121,14 @@ fn ungrounded_facts(reply: &str, corpus: &str, user_msg: &str) -> Vec<String> {
     }
     for m in num.find_iter(&scrubbed) {
         let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.len() >= 5 && !known.contains(&digits) {
+        // Five or more digits always reads as data. A four-digit number counts
+        // only when written with a thousands separator ("9 334", "4,412"):
+        // that formatting marks a quantity - the shape of the fabricated
+        // "+4 412 / +9 334 records" claims - while a bare 2026 or 3001 is far
+        // more often a year or a port.
+        let grouped = m.as_str().chars().any(|c| !c.is_ascii_digit());
+        let looks_like_data = digits.len() >= 5 || (digits.len() == 4 && grouped);
+        if looks_like_data && !known.contains(&digits) {
             push(m.as_str().to_string());
         }
     }
@@ -2258,6 +2265,7 @@ fn is_meta_non_answer(content: &str) -> bool {
         || lower.contains("here they are again")
         || lower.contains("here it is again")
         || lower.contains("results are above")
+        || lower.contains("already called")
         || lower.contains("i did call");
     claims_already_done
 }
@@ -2484,6 +2492,8 @@ pub struct AgentLoop {
     events: Option<Arc<metis_core::events::EventLog>>,
     /// This agent's name in the registry; `main` for the primary agent.
     agent_id: String,
+    /// Hand-off to other agents, when this agent has a roster.
+    delegate_tool: Option<Arc<crate::tools::delegate::DelegateTool>>,
     /// Spawn tool reference (for set_context).
     spawn_tool: Arc<SpawnTool>,
     /// Subagent manager (also held by SpawnTool; kept for direct access).
@@ -2620,6 +2630,7 @@ impl AgentLoop {
             vision_tool,
             events: None,
             agent_id: "main".to_string(),
+            delegate_tool: None,
             spawn_tool,
             subagent_manager,
             outbound,
@@ -2643,6 +2654,177 @@ impl AgentLoop {
     ///
     /// Not attaching (or `enabled: false`) leaves memory off entirely — the
     /// agent then behaves exactly as before this feature existed.
+    /// Make this agent a team member: a name, a job, and no tools that
+    /// would let it reach the user or spawn work of its own.
+    pub fn as_team_member(mut self, name: &str, job: &str, use_tools: bool) -> Self {
+        self.agent_id = name.to_string();
+        self.context.set_role(name, job);
+        // A team member answers the delegating agent, never the user, and
+        // must not start background work or further hand-offs of its own.
+        for t in ["message", "spawn", "delegate"] {
+            self.tools.unregister(t);
+        }
+        if !use_tools {
+            // Text-only model: offering tools it cannot call just makes it
+            // describe tool calls in prose instead of doing the job.
+            for t in self.tools.tool_names() {
+                self.tools.unregister(&t);
+            }
+        }
+        self
+    }
+
+    /// Give this agent other agents to hand work to.
+    pub fn with_roster(mut self, members: Vec<crate::tools::delegate::RosterMember>) -> Self {
+        if members.is_empty() {
+            return self;
+        }
+        let tool = Arc::new(crate::tools::delegate::DelegateTool::new(
+            &self.agent_id,
+            members,
+            self.events.clone(),
+        ));
+        self.tools.register(tool.clone());
+        self.delegate_tool = Some(tool);
+        self
+    }
+
+    /// Names of the agents this one can delegate to.
+    pub fn roster_names(&self) -> Vec<String> {
+        self.delegate_tool
+            .as_ref()
+            .map(|t| t.agent_names())
+            .unwrap_or_default()
+    }
+
+    /// Run one delegated task in a fresh conversation, recording this agent's
+    /// tool work in the delegator's session and turn.
+    pub async fn run_delegated(
+        &self,
+        task: &str,
+        parent_session: &str,
+        parent_turn: &str,
+        delegation_id: &str,
+    ) -> Result<String> {
+        let mut msg = InboundMessage::new("agent", "delegator", delegation_id, task);
+        msg.metadata
+            .insert("event_session".to_string(), parent_session.to_string());
+        msg.metadata
+            .insert("event_turn".to_string(), parent_turn.to_string());
+        let response = self.process_message(&msg).await?;
+        // The delegator cannot see this agent's tool log, so a lead-in like
+        // "I already called the tool above" points at nothing it can read.
+        Ok(strip_leading_meta_claims(&response.content))
+    }
+
+    /// Run a tool and record the call and its typed result.
+    ///
+    /// The main tool loop records as it goes, but the harness also runs
+    /// tools on its own - keyword fast paths, recovery guards, the system
+    /// message loop - and none of those were recorded. The event log is only
+    /// worth trusting if it is complete, so every direct execution goes
+    /// through here.
+    async fn exec_recorded(
+        &self,
+        session: &str,
+        turn: &str,
+        name: &str,
+        params: HashMap<String, serde_json::Value>,
+    ) -> String {
+        static AUTO_CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let call_id = format!(
+            "auto-{}",
+            AUTO_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let args = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        self.record(
+            session,
+            turn,
+            metis_core::events::EventKind::ToolCall {
+                call_id: call_id.clone(),
+                tool: name.to_string(),
+                args,
+            },
+        );
+        let result = self.tools.execute(name, params).await;
+        self.record(
+            session,
+            turn,
+            metis_core::events::EventKind::ToolResult {
+                call_id,
+                tool: name.to_string(),
+                outcome: tool_outcome_from_result(name, &result),
+            },
+        );
+        result
+    }
+
+    /// Build an outbound reply and record it - for the early returns that
+    /// skip the main path. A delegated run's answer is recorded by the
+    /// delegate tool instead, so it is not doubled here.
+    fn reply_recorded(
+        &self,
+        delegated: bool,
+        session: &str,
+        turn: &str,
+        channel: &str,
+        chat_id: &str,
+        text: &str,
+    ) -> OutboundMessage {
+        let out = self.outbound_message(channel, chat_id, text);
+        if !delegated {
+            self.record(
+                session,
+                turn,
+                metis_core::events::EventKind::AgentReply {
+                    text: out.content.clone(),
+                },
+            );
+        }
+        out
+    }
+
+    /// Everything a reply's stated facts may be checked against.
+    ///
+    /// With an event log this is the REAL tool output recorded for the turn -
+    /// including tools run by agents this one delegated to, which is how a
+    /// fact relayed from another agent is traced back to the tool that
+    /// produced it. If the turn ran no tool at all, the session's recent tool
+    /// output is used instead: a reply that restates earlier results is fine,
+    /// but one that restates a table no tool ever produced - what the desktop
+    /// agent did - is not, and previously went unchecked because nothing ran
+    /// that turn.
+    fn grounding_evidence(&self, session: &str, turn: &str, in_turn: &str) -> String {
+        use metis_core::events::EventKind;
+        let Some(log) = &self.events else {
+            return in_turn.to_string();
+        };
+        let events = log.read(session);
+        let evidence = |pred: &dyn Fn(&metis_core::events::Event) -> bool, limit: usize| {
+            events
+                .iter()
+                .rev()
+                .filter(|e| pred(e))
+                .filter_map(|e| match &e.event {
+                    EventKind::ToolResult { tool, outcome, .. } if tool != "delegate" => {
+                        Some(outcome.evidence_text())
+                    }
+                    _ => None,
+                })
+                .take(limit)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let this_turn = evidence(&|e| e.turn == turn, usize::MAX);
+        if !this_turn.trim().is_empty() {
+            return format!("{in_turn}\n{this_turn}");
+        }
+        if !in_turn.trim().is_empty() {
+            return in_turn.to_string();
+        }
+        evidence(&|_| true, 30)
+    }
+
     /// Record every turn to an event log - the harness's own account of
     /// what ran and what it returned, independent of what the agent says.
     pub fn with_event_log(mut self, log: Arc<metis_core::events::EventLog>) -> Self {
@@ -3154,19 +3336,34 @@ impl AgentLoop {
     /// 4. Save session, return response
     pub async fn process_message(&self, msg: &InboundMessage) -> Result<OutboundMessage> {
         let session_key = msg.session_key();
+        // A delegated run records into the delegator's session and turn, so
+        // the hand-off and the work it caused read as one conversation.
+        let delegated = msg.metadata.contains_key("event_session");
+        let event_session = msg
+            .metadata
+            .get("event_session")
+            .cloned()
+            .unwrap_or_else(|| session_key.clone());
         // One id per inbound message, grouping everything it caused.
-        let turn_id = {
+        let turn_id = if let Some(t) = msg.metadata.get("event_turn") {
+            t.clone()
+        } else {
             static TURN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = TURN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             format!("{:x}-{n:x}", chrono::Utc::now().timestamp_millis())
         };
-        self.record(
-            &session_key,
-            &turn_id,
-            metis_core::events::EventKind::UserMessage {
-                text: msg.content.clone(),
-            },
-        );
+        if !delegated {
+            self.record(
+                &event_session,
+                &turn_id,
+                metis_core::events::EventKind::UserMessage {
+                    text: msg.content.clone(),
+                },
+            );
+        }
+        if let Some(d) = &self.delegate_tool {
+            d.set_context(&event_session, &turn_id).await;
+        }
 
         // Set message tool context for this conversation. A scheduled run
         // has no live chat of its own; when the scheduler knows where the
@@ -3217,12 +3414,12 @@ impl AgentLoop {
                 "path".to_string(),
                 serde_json::Value::String(memory_path.to_string_lossy().to_string()),
             );
-            let content = self.tools.execute("read_file", params).await;
+            let content = self.exec_recorded(&event_session, &turn_id, "read_file", params).await;
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&history_safe(&content)));
-            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &content));
         }
 
         // Fast path for natural-language read-file requests with explicit path.
@@ -3230,7 +3427,7 @@ impl AgentLoop {
             if let Some(path) = extract_probable_file_path(&msg.content) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
-                let content = self.tools.execute("read_file", params).await;
+                let content = self.exec_recorded(&event_session, &turn_id, "read_file", params).await;
                 // Only short-circuit on success. This path bypasses the model
                 // entirely, so returning a failure here strands the request:
                 // asking to "read" a PDF hit read_file, which correctly
@@ -3242,7 +3439,7 @@ impl AgentLoop {
                         .add_message(&session_key, Message::user(&msg.content));
                     self.sessions
                         .add_message(&session_key, Message::assistant(&history_safe(&content)));
-                    return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+                    return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &content));
                 }
             }
         }
@@ -3256,12 +3453,12 @@ impl AgentLoop {
                 "command".to_string(),
                 serde_json::Value::String(msg.content.trim().to_string()),
             );
-            let content = self.tools.execute("exec", params).await;
+            let content = self.exec_recorded(&event_session, &turn_id, "exec", params).await;
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&history_safe(&content)));
-            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &content));
         }
 
         // Script-file mode for explicit "run this PowerShell script" requests.
@@ -3275,7 +3472,7 @@ impl AgentLoop {
                         .add_message(&session_key, Message::user(&msg.content));
                     self.sessions
                         .add_message(&session_key, Message::assistant(&err));
-                    return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &err));
+                    return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &err));
                 }
                 let exec_cmd = format!(
                     "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
@@ -3283,12 +3480,12 @@ impl AgentLoop {
                 );
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("command".to_string(), serde_json::Value::String(exec_cmd));
-                let content = self.tools.execute("exec", params).await;
+                let content = self.exec_recorded(&event_session, &turn_id, "exec", params).await;
                 self.sessions
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
                     .add_message(&session_key, Message::assistant(&history_safe(&content)));
-                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+                return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &content));
             }
         }
 
@@ -3361,7 +3558,7 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
                     .add_message(&session_key, Message::user(&msg.content));
                 self.sessions
                     .add_message(&session_key, Message::assistant(&err));
-                return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &err));
+                return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &err));
             }
 
             let exec_cmd = format!(
@@ -3370,12 +3567,12 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             );
             let mut params: HashMap<String, serde_json::Value> = HashMap::new();
             params.insert("command".to_string(), serde_json::Value::String(exec_cmd));
-            let content = self.tools.execute("exec", params).await;
+            let content = self.exec_recorded(&event_session, &turn_id, "exec", params).await;
             self.sessions
                 .add_message(&session_key, Message::user(&msg.content));
             self.sessions
                 .add_message(&session_key, Message::assistant(&history_safe(&content)));
-            return Ok(self.outbound_message(&msg.channel, &msg.chat_id, &content));
+            return Ok(self.reply_recorded(delegated, &event_session, &turn_id, &msg.channel, &msg.chat_id, &content));
         }
 
         // Per-turn token accounting (main loop + compaction call).
@@ -3634,6 +3831,20 @@ Run the next command in a follow-up message, or combine steps into one script."
                                     }
                                 }
                             }
+                            // Delegation is told which conversation it belongs to on
+                            // the call itself. Shared per-turn state would race when two
+                            // conversations run at once - a cron job during a chat -
+                            // and record one agent's work in the other's timeline.
+                            if tc.function.name == "delegate" {
+                                params.insert(
+                                    "__event_session".to_string(),
+                                    serde_json::Value::String(event_session.clone()),
+                                );
+                                params.insert(
+                                    "__event_turn".to_string(),
+                                    serde_json::Value::String(turn_id.clone()),
+                                );
+                            }
                             info!(
                                 tool = %tc.function.name,
                                 iteration = iteration,
@@ -3661,12 +3872,19 @@ Run the next command in a follow-up message, or combine steps into one script."
                         exec_tool_outputs.push(result.clone());
                     }
 
-                    grounding_corpus.push_str(&result);
-                    grounding_corpus.push('\n');
+                    // Another agent's answer is prose, not evidence; the tool output
+                    // behind it is read from the event log when the reply is checked.
+                    if tc.function.name != "delegate" {
+                        grounding_corpus.push_str(&result);
+                        grounding_corpus.push('\n');
+                    }
 
-                    // The call and what it really returned, typed.
+                    // The call and what it really returned, typed. A delegation is
+                    // recorded by the delegate tool itself as a hand-off and an
+                    // answer, so it is not duplicated here as a tool call.
+                    if tc.function.name != "delegate" {
                     self.record(
-                        &session_key,
+                        &event_session,
                         &turn_id,
                         metis_core::events::EventKind::ToolCall {
                             call_id: tc.id.clone(),
@@ -3678,7 +3896,7 @@ Run the next command in a follow-up message, or combine steps into one script."
                         },
                     );
                     self.record(
-                        &session_key,
+                        &event_session,
                         &turn_id,
                         metis_core::events::EventKind::ToolResult {
                             call_id: tc.id.clone(),
@@ -3686,6 +3904,7 @@ Run the next command in a follow-up message, or combine steps into one script."
                             outcome: tool_outcome_from_result(&tc.function.name, &result),
                         },
                     );
+                    }
 
                     // Record the step in the durable task ledger.
                     task_steps.push(TaskStep::from_tool_call(
@@ -3936,7 +4155,8 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 compact_exec,
             )
         };
-        content = flag_ungrounded_facts(content, &grounding_corpus, &msg.content);
+        let evidence = self.grounding_evidence(&event_session, &turn_id, &grounding_corpus);
+        content = flag_ungrounded_facts(content, &evidence, &msg.content);
 
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
         // but never executed a tool call, force a deterministic read_file response.
@@ -3944,7 +4164,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
             if let Some(path) = extract_probable_file_path(&content) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
-                let recovered = self.tools.execute("read_file", params).await;
+                let recovered = self.exec_recorded(&event_session, &turn_id, "read_file", params).await;
                 // Synthesize an answer from the file we just read, instead of
                 // dumping raw file contents with no reply.
                 content = match self
@@ -3960,7 +4180,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
             if let Some(command) = extract_probable_command_from_narration(&content) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("command".to_string(), serde_json::Value::String(command));
-                let recovered = self.tools.execute("exec", params).await;
+                let recovered = self.exec_recorded(&event_session, &turn_id, "exec", params).await;
                 // The model narrated a command instead of calling the tool. We
                 // ran it; now turn the result into an actual answer rather than
                 // leaving the user with just "✓ Ran … SUCCESS".
@@ -4005,7 +4225,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
             if let Some(cmd) = build_test_path_command(&paths) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("command".to_string(), serde_json::Value::String(cmd));
-                let recovered = self.tools.execute("exec", params).await;
+                let recovered = self.exec_recorded(&event_session, &turn_id, "exec", params).await;
                 let all_exist = !recovered.contains("EXISTS=False");
                 if all_exist && !paths.is_empty() {
                     hardened = "✅ Verification passed via actual path checks.\nThe operation appears completed on disk, even though this turn had no direct exec run.".to_string();
@@ -4116,13 +4336,15 @@ Call the tool now to actually do it (or, if this was only a question, just answe
 
         // Record what the person actually RECEIVED - after channel formatting
         // removed reasoning tags and the like - not the raw model text.
-        self.record(
-            &session_key,
-            &turn_id,
-            metis_core::events::EventKind::AgentReply {
-                text: outbound.content.clone(),
-            },
-        );
+        if !delegated {
+            self.record(
+                &event_session,
+                &turn_id,
+                metis_core::events::EventKind::AgentReply {
+                    text: outbound.content.clone(),
+                },
+            );
+        }
         if let Some(footer) = self.token_usage_footer(&turn_usage) {
             outbound.content.push_str(&footer);
         }
@@ -4153,6 +4375,9 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         };
 
         let session_key = format!("{origin_channel}:{origin_chat_id}");
+        // A system message (a background subagent's result, for instance) is
+        // its own turn in the origin conversation's record.
+        let sys_turn = format!("sys-{:x}", chrono::Utc::now().timestamp_millis());
 
         // Set tools context to the original channel/chat
         self.message_tool
@@ -4214,7 +4439,10 @@ Call the tool now to actually do it (or, if this was only a question, just answe
 
                 for tc in &tool_calls {
                     let result = match parse_tool_params(&tc.function.arguments) {
-                        Ok(params) => self.tools.execute(&tc.function.name, params).await,
+                        Ok(params) => {
+                            self.exec_recorded(&session_key, &sys_turn, &tc.function.name, params)
+                                .await
+                        }
                         Err(e) => format!("Tool argument error for `{}`: {e}", tc.function.name),
                     };
                     if tc.function.name == "exec" {
@@ -5281,6 +5509,220 @@ Write-Output "hello"
         assert!(!dir.path().join("events").exists());
     }
 
+
+    // ── Multi-agent: delegation recorded as one conversation ─────────────
+
+    fn bare_agent(provider: Arc<dyn LlmProvider>, ws: &std::path::Path) -> AgentLoop {
+        AgentLoop::new(
+            Arc::new(MessageBus::new(16)),
+            provider,
+            ws.to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        )
+    }
+
+    fn event_kinds(events: &[metis_core::events::Event]) -> Vec<String> {
+        use metis_core::events::EventKind::*;
+        events
+            .iter()
+            .map(|e| match &e.event {
+                UserMessage { .. } => format!("{}:user", e.agent),
+                ToolCall { tool, .. } => format!("{}:call:{tool}", e.agent),
+                ToolResult { tool, .. } => format!("{}:result:{tool}", e.agent),
+                AgentReply { .. } => format!("{}:reply", e.agent),
+                Delegation { to_agent, .. } => format!("{}:delegate->{to_agent}", e.agent),
+                DelegationResult { from_agent, .. } => format!("{}:answer<-{from_agent}", e.agent),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_delegation_is_recorded_as_one_conversation_across_agents() {
+        use metis_core::events::EventLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("invoice.txt");
+        std::fs::write(&file, "Invoice 4711 total 128450 EUR").unwrap();
+        let log = Arc::new(EventLog::new(dir.path().join("events")));
+
+        // The worker: reads the file, then answers with what it found.
+        let worker_model = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall::new(
+                    "w1",
+                    "read_file",
+                    serde_json::json!({"path": file.to_str().unwrap()}).to_string(),
+                )],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("The invoice total is 128450 EUR.".into()),
+                ..Default::default()
+            },
+        ]));
+        let worker = Arc::new(
+            bare_agent(worker_model, dir.path())
+                .with_event_log(log.clone())
+                .as_team_member("worker", "reads files", true),
+        );
+
+        // Main: hands the task over, then relays the answer.
+        let main_model = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall::new(
+                    "m1",
+                    "delegate",
+                    serde_json::json!({
+                        "agent": "worker",
+                        "task": format!("Read {} and give the total.", file.display())
+                    })
+                    .to_string(),
+                )],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("The worker found a total of 128450 EUR.".into()),
+                ..Default::default()
+            },
+        ]));
+        let main = bare_agent(main_model, dir.path())
+            .with_event_log(log.clone())
+            .with_roster(vec![crate::tools::delegate::RosterMember {
+                name: "worker".into(),
+                job: "reads files".into(),
+                model: "mock-worker".into(),
+                agent: worker,
+            }]);
+        assert_eq!(main.roster_names(), vec!["worker".to_string()]);
+
+        let reply = main.process_direct("what is the invoice total?").await.unwrap();
+
+        let sessions = log.sessions();
+        assert_eq!(sessions.len(), 1, "the whole exchange belongs to ONE session: {sessions:?}");
+        let events = EventLog::read_file(&sessions[0].1);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "main:user",
+                "main:delegate->worker",
+                "worker:call:read_file",
+                "worker:result:read_file",
+                "main:answer<-worker",
+                "main:reply",
+            ],
+        );
+        // One turn ties it all together.
+        assert!(events.iter().all(|e| e.turn == events[0].turn), "all events share the turn");
+
+        // The relayed figure traces back to the WORKER's tool output, so the
+        // fact check must not flag it even though main itself ran no tool.
+        assert!(reply.contains("128450"), "{reply}");
+        assert!(!reply.contains("Unverified"), "a grounded relayed fact was flagged: {reply}");
+    }
+
+    #[tokio::test]
+    async fn a_fact_no_agent_ever_saw_is_still_flagged_after_delegation() {
+        use metis_core::events::EventLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("invoice.txt");
+        std::fs::write(&file, "Invoice 4711 total 128450 EUR").unwrap();
+        let log = Arc::new(EventLog::new(dir.path().join("events")));
+
+        let worker = Arc::new(
+            bare_agent(
+                Arc::new(MockProvider::new(vec![
+                    LlmResponse {
+                        tool_calls: vec![ToolCall::new(
+                            "w1",
+                            "read_file",
+                            serde_json::json!({"path": file.to_str().unwrap()}).to_string(),
+                        )],
+                        ..Default::default()
+                    },
+                    LlmResponse {
+                        content: Some("Total 128450 EUR.".into()),
+                        ..Default::default()
+                    },
+                ])),
+                dir.path(),
+            )
+            .with_event_log(log.clone())
+            .as_team_member("worker", "reads files", true),
+        );
+        // Main relays the real total but ALSO invents a number.
+        let main = bare_agent(
+            Arc::new(MockProvider::new(vec![
+                LlmResponse {
+                    tool_calls: vec![ToolCall::new(
+                        "m1",
+                        "delegate",
+                        serde_json::json!({"agent": "worker", "task": "read it"}).to_string(),
+                    )],
+                    ..Default::default()
+                },
+                LlmResponse {
+                    content: Some("Total 128450 EUR, across 9 334 line items.".into()),
+                    ..Default::default()
+                },
+            ])),
+            dir.path(),
+        )
+        .with_event_log(log.clone())
+        .with_roster(vec![crate::tools::delegate::RosterMember {
+            name: "worker".into(),
+            job: "reads files".into(),
+            model: "mock".into(),
+            agent: worker,
+        }]);
+
+        let reply = main.process_direct("summarise the invoice").await.unwrap();
+        assert!(reply.contains("Unverified"), "invented figure not flagged: {reply}");
+        assert!(reply.contains("9 334"), "the invented value must be named: {reply}");
+        let flagged = reply.split("Unverified").nth(1).unwrap_or("");
+        assert!(!flagged.contains("128450"), "the real figure was wrongly flagged: {reply}");
+    }
+
+    #[tokio::test]
+    async fn a_team_member_cannot_reach_the_user_or_hand_off_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = bare_agent(Arc::new(MockProvider::simple("x")), dir.path())
+            .as_team_member("worker", "reads files", true);
+        let names = a.tools().tool_names();
+        for forbidden in ["message", "spawn", "delegate"] {
+            assert!(!names.contains(&forbidden.to_string()), "{forbidden} must be removed: {names:?}");
+        }
+        assert!(names.contains(&"read_file".to_string()), "normal tools stay");
+
+        // A text-only member gets no tools at all.
+        let t = bare_agent(Arc::new(MockProvider::simple("x")), dir.path())
+            .as_team_member("writer", "translates", false);
+        assert!(t.tools().tool_names().is_empty(), "{:?}", t.tools().tool_names());
+    }
+
+    #[tokio::test]
+    async fn delegating_to_an_unknown_agent_fails_with_the_valid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = Arc::new(
+            bare_agent(Arc::new(MockProvider::simple("x")), dir.path())
+                .as_team_member("worker", "reads files", true),
+        );
+        let main = bare_agent(Arc::new(MockProvider::simple("x")), dir.path()).with_roster(vec![
+            crate::tools::delegate::RosterMember {
+                name: "worker".into(),
+                job: "reads files".into(),
+                model: "m".into(),
+                agent: worker,
+            },
+        ]);
+        let mut params = HashMap::new();
+        params.insert("agent".to_string(), serde_json::json!("ghost"));
+        params.insert("task".to_string(), serde_json::json!("do it"));
+        let out = main.tools().execute("delegate", params).await;
+        assert!(out.contains("No agent named \"ghost\""), "{out}");
+        assert!(out.contains("worker"), "must list valid agents: {out}");
+    }
+
     #[tokio::test]
     async fn test_agent_tool_calling() {
         // First response: LLM requests read_file tool call
@@ -5751,6 +6193,17 @@ Write-Output "hello"
                      blf2O.nam is 18 179 568 bytes (2026-09-14).";
         let bad = ungrounded_facts(reply, REAL_LISTING, "");
         assert!(bad.is_empty(), "truthful reply wrongly flagged: {bad:?}");
+    }
+
+
+    #[test]
+    fn small_grouped_counts_are_checked_but_years_and_ports_are_not() {
+        let corpus = "blf2.nam 6813796";
+        let bad = ungrounded_facts("Appended +4 412 and +9 334 records.", corpus, "");
+        assert!(bad.iter().any(|b| b.contains("4 412")), "{bad:?}");
+        assert!(bad.iter().any(|b| b.contains("9 334")), "{bad:?}");
+        let quiet = ungrounded_facts("In 2026 the bridge listens on port 3001.", corpus, "");
+        assert!(quiet.is_empty(), "years/ports must not be flagged: {quiet:?}");
     }
 
     #[test]

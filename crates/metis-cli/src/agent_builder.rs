@@ -90,6 +90,10 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
 
     let memory_settings = build_memory_settings(config, &providers_map);
     let sharepoint = build_sharepoint_settings(config);
+    let events = Arc::new(metis_core::events::EventLog::new(
+        metis_core::events::EventLog::default_dir(),
+    ));
+    let roster = build_roster(config, events.clone());
     let sp_workspace = workspace.clone();
 
     Ok(AgentLoop::new(
@@ -111,10 +115,90 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     .with_memory(memory_settings)
     .with_sharepoint(sharepoint, sp_workspace)
     .with_builtin_skills(builtin_skills_dir())
-    .with_event_log(std::sync::Arc::new(metis_core::events::EventLog::new(
-        metis_core::events::EventLog::default_dir(),
-    )))
+    .with_event_log(events.clone())
+    // After the event log, so delegations are recorded into it.
+    .with_roster(roster)
     .with_direct_chat_context(defaults.chat_context_length))
+}
+
+/// Build every roster agent as its own AgentLoop with its own model.
+///
+/// An agent whose model has no configured provider is skipped with a warning
+/// rather than failing startup - `metis agents` shows it as NOT CONFIGURED,
+/// and the main agent simply does not see it as available. Each member
+/// keeps its histories under sessions/agents/ so a delegation never touches
+/// the user's own conversations.
+pub fn build_roster(
+    config: &Config,
+    events: Arc<metis_core::events::EventLog>,
+) -> Vec<metis_agent::tools::delegate::RosterMember> {
+    use metis_core::config::schema::MAIN_AGENT;
+
+    let defaults = &config.agents.defaults;
+    let workspace = helpers::expand_tilde(&defaults.workspace);
+    let providers_map = config.providers.to_map();
+    for problem in config.agents.roster_problems() {
+        tracing::warn!(%problem, "agent roster");
+    }
+
+    let mut members = Vec::new();
+    for spec in config.agents.all_agents() {
+        if spec.name == MAIN_AGENT || spec.model.trim().is_empty() || spec.description.trim().is_empty() {
+            continue;
+        }
+        let provider = match create_provider(&spec.model, &providers_map) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(agent = %spec.name, model = %spec.model, error = %e,
+                    "agent skipped: its model has no configured provider");
+                continue;
+            }
+        };
+        let sessions_dir = metis_core::utils::get_sessions_path().join("agents");
+        let sessions = match SessionManager::new(Some(sessions_dir)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(agent = %spec.name, error = %e, "agent skipped: no session store");
+                continue;
+            }
+        };
+        let exec_cfg = ExecToolConfig {
+            timeout: config.tools.exec.timeout,
+            shell: config.tools.exec.shell.clone(),
+            permission_mode: config.tools.exec.permission_mode.clone(),
+        };
+        let brave_key = (!config.tools.web.search.api_key.is_empty())
+            .then(|| config.tools.web.search.api_key.clone());
+        let agent = AgentLoop::new(
+            // Its own bus: a team member never publishes to the user's channels.
+            Arc::new(MessageBus::new(16)),
+            Arc::new(provider),
+            workspace.clone(),
+            Some(spec.model.clone()),
+            None,
+            None,
+            Some(defaults.max_tool_iterations as usize),
+            None,
+            brave_key,
+            Some(exec_cfg),
+            config.tools.restrict_to_workspace,
+            Some(sessions),
+            Some(spec.name.clone()),
+            None,
+        )
+        .with_builtin_skills(builtin_skills_dir())
+        .with_event_log(events.clone())
+        .as_team_member(&spec.name, &spec.description, spec.tools);
+
+        tracing::info!(agent = %spec.name, model = %spec.model, tools = spec.tools, "team member ready");
+        members.push(metis_agent::tools::delegate::RosterMember {
+            name: spec.name,
+            job: spec.description,
+            model: spec.model,
+            agent: Arc::new(agent),
+        });
+    }
+    members
 }
 
 /// Build SharePoint settings, falling back to the Graph app configured for

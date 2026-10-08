@@ -43,6 +43,8 @@ pub struct ContextBuilder {
     memory: MemoryStore,
     /// Skills loader for discovering and loading skill files.
     skills: SkillsLoader,
+    /// (name, job) when this is a team member rather than the primary agent.
+    role: Option<(String, String)>,
 }
 
 impl ContextBuilder {
@@ -57,7 +59,13 @@ impl ContextBuilder {
             model: String::new(),
             memory,
             skills,
+            role: None,
         }
+    }
+
+    /// Make this a team member with a specific job.
+    pub fn set_role(&mut self, name: &str, job: &str) {
+        self.role = Some((name.to_string(), job.to_string()));
     }
 
     /// Set the built-in skills directory in place.
@@ -95,6 +103,21 @@ impl ContextBuilder {
 
         // 1) Identity
         parts.push(self.build_identity());
+
+        // 1b) Team role - stated before anything else that could suggest the
+        // agent is talking to the user directly.
+        if let Some((name, job)) = &self.role {
+            parts.push(format!(
+                "## Your role\n\n\
+                 You are the `{name}` agent in a team. Your job: {job}\n\n\
+                 The main agent gives you one task at a time. You do NOT talk to the user and \
+                 cannot see their conversation - everything you need is in the task. Do the task \
+                 with your tools, then reply with the RESULT itself: the facts, outputs, file \
+                 contents or text that were asked for. Do not narrate what you did, do not offer \
+                 further help, and never state a value you did not get from a tool. If you could \
+                 not do it, say exactly what failed."
+            ));
+        }
 
         // 2) Bootstrap files
         for filename in BOOTSTRAP_FILES {

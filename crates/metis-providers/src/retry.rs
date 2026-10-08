@@ -37,6 +37,26 @@ pub fn is_transient_status(code: u16) -> bool {
     matches!(code, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
+/// A 429 that will never clear by waiting.
+///
+/// Providers use 429 for two different things: "slow down" (retry) and
+/// "your account has no credit / quota" (permanent). Retrying the second
+/// spent about ninety seconds per call before reporting an error that was
+/// final from the first response.
+pub fn is_permanent_quota_error(body: &str) -> bool {
+    let b = body.to_lowercase();
+    b.contains("insufficient_quota")
+        || b.contains("no credits remaining")
+        || b.contains("exceeded your current quota")
+        || b.contains("credit balance is too low")
+        || b.contains("billing")
+}
+
+/// Whether a failed response should be retried, given its status and body.
+pub fn should_retry(code: u16, body: &str) -> bool {
+    is_transient_status(code) && !is_permanent_quota_error(body)
+}
+
 /// Delay before retry number `attempt` (1-based).
 ///
 /// A server-supplied Retry-After wins, capped so a hostile or broken value
@@ -81,6 +101,16 @@ mod tests {
         for code in [400, 401, 403, 404, 422] {
             assert!(!is_transient_status(code), "{code} must not be retried");
         }
+    }
+
+    #[test]
+    fn an_empty_account_is_not_retried() {
+        // Verbatim shape from a real OpenAI response.
+        let body = r#"{"error":{"message":"You have no credits remaining. Add credits to continue using the API","type":"insufficient_quota"}}"#;
+        assert!(!should_retry(429, body), "a quota 429 is permanent");
+        // An ordinary rate limit still is retried.
+        assert!(should_retry(429, r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error"}}"#));
+        assert!(should_retry(529, "overloaded"));
     }
 
     #[test]

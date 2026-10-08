@@ -414,7 +414,7 @@ impl LlmProvider for HttpProvider {
                     continue;
                 }
 
-                if crate::retry::is_transient_status(status.as_u16())
+                if crate::retry::should_retry(status.as_u16(), &error_text)
                     && transient_attempt < crate::retry::MAX_TRANSIENT_RETRIES
                 {
                     transient_attempt += 1;
