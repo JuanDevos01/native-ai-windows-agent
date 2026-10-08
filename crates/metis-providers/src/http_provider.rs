@@ -326,6 +326,8 @@ impl LlmProvider for HttpProvider {
         self.ensure_ollama_runtime(&resolved_model, config).await;
 
         let url = self.completions_url();
+        // Retries spent on transient failures (overload, rate limit, network).
+        let mut transient_attempt: u32 = 0;
 
         loop {
             let request_body = ChatCompletionRequest {
@@ -349,12 +351,44 @@ impl LlmProvider for HttpProvider {
             let response = match result {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // A timeout is as transient as a 503 and gets the full
+                    // budget. A refused connection usually means the server
+                    // is DOWN rather than busy - a stopped local Ollama, a
+                    // wrong port - so it gets one retry, not ninety seconds
+                    // of waiting before the user hears anything.
+                    let budget = if e.is_timeout() {
+                        crate::retry::MAX_TRANSIENT_RETRIES
+                    } else if e.is_connect() {
+                        1
+                    } else {
+                        0
+                    };
+                    if transient_attempt < budget {
+                        transient_attempt += 1;
+                        let wait = crate::retry::backoff_delay(transient_attempt, None);
+                        warn!(
+                            provider = self.spec.display_name,
+                            attempt = transient_attempt,
+                            wait_ms = wait.as_millis() as u64,
+                            error = %e,
+                            "LLM request failed; retrying"
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                     error!(provider = self.spec.display_name, error = %e, "HTTP request failed");
                     return LlmResponse::error(format!("Error calling LLM: {}", e));
                 }
             };
 
             let status = response.status();
+            // Read before the body consumes the response.
+            let retry_after = crate::retry::parse_retry_after(
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
             if !status.is_success() {
                 let error_text = response
                     .text()
@@ -380,10 +414,27 @@ impl LlmProvider for HttpProvider {
                     continue;
                 }
 
+                if crate::retry::is_transient_status(status.as_u16())
+                    && transient_attempt < crate::retry::MAX_TRANSIENT_RETRIES
+                {
+                    transient_attempt += 1;
+                    let wait = crate::retry::backoff_delay(transient_attempt, retry_after);
+                    warn!(
+                        provider = self.spec.display_name,
+                        status = %status,
+                        attempt = transient_attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        "transient provider error; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+
                 error!(
                     provider = self.spec.display_name,
                     status = %status,
                     body = %error_text,
+                    attempts = transient_attempt + 1,
                     "API error"
                 );
                 return LlmResponse::error(format!(
@@ -1265,6 +1316,60 @@ mod tests {
     }
 
     // ── create_provider ──
+
+
+    #[tokio::test]
+    async fn a_transient_overload_is_retried_until_it_succeeds() {
+        // MiniMax answers peak load with 529. The turn must survive it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(529).set_body_json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "temporarily busy"}
+            })))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "recovered"},
+                             "finish_reason": "stop"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some(&server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+        let r = provider
+            .chat(&[Message::user("hi")], None, "gpt-4o", &LlmRequestConfig::default())
+            .await;
+        assert_eq!(r.content.as_deref(), Some("recovered"), "{r:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3, "2 failures + 1 success");
+    }
+
+    #[tokio::test]
+    async fn a_permanent_client_error_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {"message": "invalid api key"}
+            })))
+            .mount(&server)
+            .await;
+
+        let spec = find_by_name("openai").unwrap();
+        let config = make_config("key", Some(&server.uri()));
+        let provider = HttpProvider::new(&config, spec, "gpt-4o");
+        let r = provider
+            .chat(&[Message::user("hi")], None, "gpt-4o", &LlmRequestConfig::default())
+            .await;
+        assert!(r.content.unwrap_or_default().contains("401"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "a 401 must not be retried");
+    }
 
     #[test]
     fn test_create_provider_success() {

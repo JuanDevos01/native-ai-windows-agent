@@ -127,13 +127,107 @@ impl HeartbeatConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentsConfig {
     pub defaults: AgentDefaults,
+    /// Additional named agents, each with its own model.
+    ///
+    /// ```json
+    /// "roster": {
+    ///   "planner": { "model": "claude-opus-5", "description": "plans and reviews" },
+    ///   "worker":  { "model": "ollama/qwen2.5-coder", "description": "local file work" }
+    /// }
+    /// ```
+    ///
+    /// The primary agent is always `main` and uses `defaults.model`.
+    #[serde(default)]
+    pub roster: std::collections::BTreeMap<String, RosterAgent>,
 }
 
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             defaults: AgentDefaults::default(),
+            roster: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+/// One named agent in the roster.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RosterAgent {
+    /// Model id, in the same form as `defaults.model` - a cloud model
+    /// (`claude-opus-5`, `minimax/MiniMax-M2.7`) or a local one
+    /// (`ollama/llama3.1`).
+    pub model: String,
+    /// What this agent is for. Shown in listings, and later offered to the
+    /// main agent so it can pick who to delegate to.
+    pub description: String,
+}
+
+/// An agent as the rest of the system sees it, main included.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSpec {
+    pub name: String,
+    pub model: String,
+    pub description: String,
+}
+
+/// The name of the primary agent. Reserved: a roster entry cannot use it.
+pub const MAIN_AGENT: &str = "main";
+
+impl AgentsConfig {
+    /// Every agent, `main` first, then the roster in name order.
+    pub fn all_agents(&self) -> Vec<AgentSpec> {
+        let mut out = vec![AgentSpec {
+            name: MAIN_AGENT.to_string(),
+            model: self.defaults.model.clone(),
+            description: "Primary agent: talks to you on every channel.".to_string(),
+        }];
+        for (name, a) in &self.roster {
+            if name == MAIN_AGENT {
+                continue; // reported by `roster_problems`, never silently merged
+            }
+            out.push(AgentSpec {
+                name: name.clone(),
+                model: a.model.clone(),
+                description: a.description.clone(),
+            });
+        }
+        out
+    }
+
+    /// Look an agent up by name.
+    pub fn agent(&self, name: &str) -> Option<AgentSpec> {
+        self.all_agents().into_iter().find(|a| a.name == name)
+    }
+
+    /// Configuration mistakes in the roster, as human-readable lines.
+    ///
+    /// Returned rather than silently tolerated: a misnamed agent that quietly
+    /// does nothing is exactly the kind of failure this harness keeps hiding.
+    pub fn roster_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, a) in &self.roster {
+            if name == MAIN_AGENT {
+                out.push(format!(
+                    "roster entry \"{MAIN_AGENT}\" is reserved for the primary agent; set \
+                     agents.defaults.model instead"
+                ));
+                continue;
+            }
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            {
+                out.push(format!(
+                    "agent name \"{name}\" must be lowercase letters, digits, '-' or '_'"
+                ));
+            }
+            if a.model.trim().is_empty() {
+                out.push(format!("agent \"{name}\" has no model"));
+            }
+        }
+        out
     }
 }
 
@@ -1106,5 +1200,59 @@ mod tests {
         assert_eq!(config.agents.defaults.model, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(config.agents.defaults.max_tokens, 8192);
         assert_eq!(config.gateway.port, 18790);
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    fn cfg(json: &str) -> AgentsConfig {
+        serde_json::from_str(json).expect("valid agents json")
+    }
+
+    #[test]
+    fn an_existing_config_without_a_roster_still_loads() {
+        // Every config.json written before this existed has no roster.
+        let c = cfg(r#"{"defaults": {"model": "minimax/MiniMax-M2.7"}}"#);
+        assert!(c.roster.is_empty());
+        let all = c.all_agents();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "main");
+        assert_eq!(all[0].model, "minimax/MiniMax-M2.7");
+    }
+
+    #[test]
+    fn roster_agents_each_carry_their_own_model() {
+        let c = cfg(r#"{
+            "defaults": {"model": "minimax/MiniMax-M2.7"},
+            "roster": {
+                "worker":  {"model": "ollama/qwen2.5-coder", "description": "local file work"},
+                "planner": {"model": "claude-opus-5", "description": "plans"}
+            }
+        }"#);
+        let names: Vec<String> = c.all_agents().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["main", "planner", "worker"], "main first, then by name");
+        assert_eq!(c.agent("worker").unwrap().model, "ollama/qwen2.5-coder");
+        assert_eq!(c.agent("planner").unwrap().model, "claude-opus-5");
+        assert!(c.roster_problems().is_empty());
+    }
+
+    #[test]
+    fn mistakes_are_reported_not_swallowed() {
+        let c = cfg(r#"{
+            "defaults": {"model": "x"},
+            "roster": {
+                "main":    {"model": "y"},
+                "Big Bad": {"model": "z"},
+                "empty":   {"model": "  "}
+            }
+        }"#);
+        let problems = c.roster_problems().join("\n");
+        assert!(problems.contains("reserved"), "{problems}");
+        assert!(problems.contains("lowercase"), "{problems}");
+        assert!(problems.contains("has no model"), "{problems}");
+        // A roster "main" must never override the real main agent.
+        assert_eq!(c.agent("main").unwrap().model, "x");
     }
 }

@@ -13,6 +13,7 @@ pub mod anthropic;
 pub mod discovery;
 pub mod http_provider;
 pub mod registry;
+pub mod retry;
 pub mod traits;
 pub mod transcription;
 

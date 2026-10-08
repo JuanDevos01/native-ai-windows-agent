@@ -111,6 +111,9 @@ pub fn build_agent_loop(config: &Config) -> Result<AgentLoop> {
     .with_memory(memory_settings)
     .with_sharepoint(sharepoint, sp_workspace)
     .with_builtin_skills(builtin_skills_dir())
+    .with_event_log(std::sync::Arc::new(metis_core::events::EventLog::new(
+        metis_core::events::EventLog::default_dir(),
+    )))
     .with_direct_chat_context(defaults.chat_context_length))
 }
 

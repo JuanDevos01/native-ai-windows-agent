@@ -19,6 +19,7 @@ mod gateway;
 mod cron_cmd;
 mod channels_cmd;
 mod heartbeat_cmd;
+mod inspect_cmd;
 mod model_cmd;
 mod serve;
 mod desktop;
@@ -128,6 +129,20 @@ enum Commands {
         logs: bool,
     },
 
+    /// List agents, their models, and whether each model is reachable
+    Agents,
+
+    /// Show what REALLY happened in a session: messages, tool calls, the
+    /// results they actually returned, and replies. Omit SESSION to list them.
+    Events {
+        /// Session key or fragment, e.g. `telegram:8582973375` or `desktop`
+        session: Option<String>,
+
+        /// How many of the most recent turns to show
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+    },
+
     /// Open the native desktop GUI (mission control + chat)
     Desktop {
         /// Enable debug logging
@@ -214,6 +229,8 @@ async fn run_async(cli: Cli) -> Result<()> {
             api_key,
             logs,
         } => serve::run(host, port, api_key, logs).await,
+        Commands::Agents => inspect_cmd::agents(),
+        Commands::Events { session, turns } => inspect_cmd::events(session, turns),
         Commands::Desktop { .. } => unreachable!("desktop is handled in sync main()"),
     }
 }
@@ -235,8 +252,14 @@ async fn run_agent(
         Some(msg) => {
             // Single-shot mode
             info!(session = %session_id, "processing single message");
+            // Honour --session. Single-shot mode used to call process_direct,
+            // which always used "cli:direct", so -s was accepted and ignored
+            // and every one-off command shared - and polluted - one history.
+            let (channel, chat_id) = session_id
+                .split_once(':')
+                .unwrap_or(("cli", session_id.as_str()));
             let response = agent_loop
-                .process_direct(&msg)
+                .process_direct_session(channel, chat_id, &msg)
                 .await
                 .context("agent processing failed")?;
             helpers::print_response(&response, render_markdown);

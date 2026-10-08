@@ -274,7 +274,10 @@ pub async fn run() -> Result<()> {
         .with_direct_chat_context(defaults.chat_context_length)
         // The gateway is the one process that routes outbound messages to
         // channels, so it is the only one where the message tool may send.
-        .with_channel_delivery(),
+        .with_channel_delivery()
+        .with_event_log(Arc::new(metis_core::events::EventLog::new(
+            metis_core::events::EventLog::default_dir(),
+        ))),
     );
 
     // 8. Create cron service

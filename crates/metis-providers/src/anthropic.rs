@@ -315,22 +315,59 @@ impl LlmProvider for AnthropicProvider {
 
         debug!(model = model, endpoint = %self.endpoint(), "anthropic request");
 
-        let resp = self
-            .http
-            .post(self.endpoint())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await;
+        // Same transient-failure policy as the OpenAI-compatible provider:
+        // Anthropic signals overload with 529 and rate limits with 429.
+        let mut attempt: u32 = 0;
+        let (status, body_text) = loop {
+            let resp = self
+                .http
+                .post(self.endpoint())
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .header("content-type", "application/json")
+                .json(&request)
+                .send()
+                .await;
 
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => return LlmResponse::error(format!("Anthropic request failed: {e}")),
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    let budget = if e.is_timeout() {
+                        crate::retry::MAX_TRANSIENT_RETRIES
+                    } else if e.is_connect() {
+                        1
+                    } else {
+                        0
+                    };
+                    if attempt < budget {
+                        attempt += 1;
+                        let wait = crate::retry::backoff_delay(attempt, None);
+                        warn!(attempt, error = %e, "anthropic request failed; retrying");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    return LlmResponse::error(format!("Anthropic request failed: {e}"));
+                }
+            };
+            let status = resp.status();
+            let retry_after = crate::retry::parse_retry_after(
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let body_text = resp.text().await.unwrap_or_default();
+            if !status.is_success()
+                && crate::retry::is_transient_status(status.as_u16())
+                && attempt < crate::retry::MAX_TRANSIENT_RETRIES
+            {
+                attempt += 1;
+                let wait = crate::retry::backoff_delay(attempt, retry_after);
+                warn!(status = %status, attempt, "transient anthropic error; retrying");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            break (status, body_text);
         };
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
             warn!(status = %status, "anthropic API error");
@@ -528,6 +565,33 @@ mod tests {
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert!(body.get("temperature").is_none());
         assert!(body.get("thinking").is_none(), "adaptive is the default; do not configure it");
+    }
+
+
+    #[tokio::test]
+    async fn an_overloaded_response_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(529).set_body_json(json!({
+                "type": "error", "error": {"type": "overloaded_error", "message": "busy"}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": "back"}],
+                "stop_reason": "end_turn"
+            })))
+            .mount(&server)
+            .await;
+
+        let r = make_provider(&server.uri())
+            .chat(&[Message::user("hi")], None, "claude-opus-5", &LlmRequestConfig::default())
+            .await;
+        assert_eq!(r.content.as_deref(), Some("back"));
     }
 
     #[tokio::test]

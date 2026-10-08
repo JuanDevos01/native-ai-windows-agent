@@ -1501,7 +1501,23 @@ fn enforce_truthful_status_reply(
         return content;
     }
 
-    let mut parts = vec!["❌ **Not OK** — verification or execution failed.".to_string()];
+    // Name the actual cause. A model-service outage used to be reported as
+    // "verification or execution failed", which reads as "your task failed"
+    // even when every tool had already succeeded and the only thing that
+    // broke was the provider answering one last time.
+    let headline = if llm_err && !hard_fail {
+        if exec_outputs.is_empty() {
+            "❌ **The model service did not respond** (it was overloaded or unreachable, even \
+             after retrying). Nothing was done on your side — try again in a few minutes."
+        } else {
+            "⚠ **The model service failed while writing the answer** (overloaded or \
+             unreachable, even after retrying). The commands below DID run — their real \
+             results are shown; only the summary is missing."
+        }
+    } else {
+        "❌ **Not OK** — verification or execution failed."
+    };
+    let mut parts = vec![headline.to_string()];
     if llm_err {
         parts.push(content.clone());
     } else if content_claims_false_ok(&content) {
@@ -1891,6 +1907,86 @@ fn try_recover_invoke_xml_tool_call(content: &str) -> Option<metis_core::types::
     }
     let args_str = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
     Some(metis_core::types::ToolCall::new("recovered-1", name, args_str))
+}
+
+// ─────────────────────────────────────────────
+// Typed tool outcomes (event log)
+// ─────────────────────────────────────────────
+
+/// Split an exec report into its typed parts.
+///
+/// The exec tool emits a header block (COMMAND / EXIT_CODE / STATUS) and
+/// then `--- STDOUT ---` / `--- STDERR ---` sections. Parsing it here, once,
+/// means the event log records real fields instead of the text, and nothing
+/// later has to re-parse text that a model could also have written.
+fn exec_outcome_from_report(result: &str) -> metis_core::events::ToolOutcome {
+    use metis_core::events::{clip_output, ExecStatus, ToolOutcome};
+
+    if exec_result_needs_approval(result) {
+        // Stopped by the safety check: nothing ran.
+        let (stdout, truncated) = clip_output(result);
+        return ToolOutcome::Exec {
+            command: String::new(),
+            exit_code: None,
+            status: ExecStatus::NotRun,
+            stdout,
+            stderr: String::new(),
+            truncated,
+        };
+    }
+
+    let mut command = String::new();
+    let mut status_word = String::new();
+    for line in result.lines() {
+        if let Some(v) = line.strip_prefix("COMMAND: ") {
+            command = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("STATUS: ") {
+            status_word = v.trim().to_uppercase();
+        }
+    }
+    let exit_code = parse_exec_exit_code(result);
+    let status = if status_word == "TIMEOUT" {
+        ExecStatus::Timeout
+    } else if exec_report_failed(result) {
+        ExecStatus::Failed
+    } else {
+        ExecStatus::Success
+    };
+
+    let body = result
+        .split("<<<END_EXEC_RESULT>>>")
+        .nth(1)
+        .unwrap_or("");
+    let (raw_out, raw_err) = match body.split_once("--- STDERR ---") {
+        Some((o, e)) => (o, e),
+        None => (body, ""),
+    };
+    let raw_out = raw_out.replacen("--- STDOUT ---", "", 1);
+    let (stdout, t1) = clip_output(raw_out.trim_matches('\n'));
+    let (stderr, t2) = clip_output(raw_err.trim_matches('\n'));
+    ToolOutcome::Exec {
+        command,
+        exit_code,
+        status,
+        stdout,
+        stderr,
+        truncated: t1 || t2,
+    }
+}
+
+/// Classify any tool's raw result into a typed outcome, using the same
+/// failure rules the loop already applies elsewhere.
+pub(crate) fn tool_outcome_from_result(tool: &str, result: &str) -> metis_core::events::ToolOutcome {
+    use metis_core::events::{clip_output, ToolOutcome};
+    if tool == "exec" {
+        return exec_outcome_from_report(result);
+    }
+    if non_exec_tool_failed(result) {
+        let (error, _) = clip_output(result);
+        return ToolOutcome::Failed { error };
+    }
+    let (output, truncated) = clip_output(result);
+    ToolOutcome::Ok { output, truncated }
 }
 
 // ─────────────────────────────────────────────
@@ -2383,6 +2479,11 @@ pub struct AgentLoop {
     message_tool: Arc<MessageTool>,
     /// Vision tool, kept so each turn can hand it the user's real question.
     vision_tool: Arc<crate::tools::vision::VisionTool>,
+    /// Where this agent records what really happened. `None` in tests and
+    /// anywhere a caller has not opted in.
+    events: Option<Arc<metis_core::events::EventLog>>,
+    /// This agent's name in the registry; `main` for the primary agent.
+    agent_id: String,
     /// Spawn tool reference (for set_context).
     spawn_tool: Arc<SpawnTool>,
     /// Subagent manager (also held by SpawnTool; kept for direct access).
@@ -2517,6 +2618,8 @@ impl AgentLoop {
             sessions,
             message_tool,
             vision_tool,
+            events: None,
+            agent_id: "main".to_string(),
             spawn_tool,
             subagent_manager,
             outbound,
@@ -2540,6 +2643,30 @@ impl AgentLoop {
     ///
     /// Not attaching (or `enabled: false`) leaves memory off entirely — the
     /// agent then behaves exactly as before this feature existed.
+    /// Record every turn to an event log - the harness's own account of
+    /// what ran and what it returned, independent of what the agent says.
+    pub fn with_event_log(mut self, log: Arc<metis_core::events::EventLog>) -> Self {
+        self.events = Some(log);
+        self
+    }
+
+    /// Name this agent in the event log and registry. Defaults to `main`.
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = id.into();
+        self
+    }
+
+    /// Append an event if logging is on. A failed write is logged, never
+    /// fatal: losing the record must not also lose the user's reply.
+    fn record(&self, session: &str, turn: &str, event: metis_core::events::EventKind) {
+        if let Some(log) = &self.events {
+            let ev = metis_core::events::Event::new(session, turn, &self.agent_id, event);
+            if let Err(e) = log.append(&ev) {
+                warn!(error = %e, "failed to write event log");
+            }
+        }
+    }
+
     /// Let the `message` tool actually deliver, by publishing to the bus.
     ///
     /// Call this ONLY where something consumes outbound messages and routes
@@ -3027,6 +3154,19 @@ impl AgentLoop {
     /// 4. Save session, return response
     pub async fn process_message(&self, msg: &InboundMessage) -> Result<OutboundMessage> {
         let session_key = msg.session_key();
+        // One id per inbound message, grouping everything it caused.
+        let turn_id = {
+            static TURN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = TURN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("{:x}-{n:x}", chrono::Utc::now().timestamp_millis())
+        };
+        self.record(
+            &session_key,
+            &turn_id,
+            metis_core::events::EventKind::UserMessage {
+                text: msg.content.clone(),
+            },
+        );
 
         // Set message tool context for this conversation. A scheduled run
         // has no live chat of its own; when the scheduler knows where the
@@ -3524,6 +3664,29 @@ Run the next command in a follow-up message, or combine steps into one script."
                     grounding_corpus.push_str(&result);
                     grounding_corpus.push('\n');
 
+                    // The call and what it really returned, typed.
+                    self.record(
+                        &session_key,
+                        &turn_id,
+                        metis_core::events::EventKind::ToolCall {
+                            call_id: tc.id.clone(),
+                            tool: tc.function.name.clone(),
+                            args: serde_json::from_str(&tc.function.arguments)
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::String(tc.function.arguments.clone())
+                                }),
+                        },
+                    );
+                    self.record(
+                        &session_key,
+                        &turn_id,
+                        metis_core::events::EventKind::ToolResult {
+                            call_id: tc.id.clone(),
+                            tool: tc.function.name.clone(),
+                            outcome: tool_outcome_from_result(&tc.function.name, &result),
+                        },
+                    );
+
                     // Record the step in the durable task ledger.
                     task_steps.push(TaskStep::from_tool_call(
                         &tc.function.name,
@@ -3950,6 +4113,16 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         // Token footer goes on the wire only — session history stays clean so
         // the model never sees (or pays for) old usage footers.
         let mut outbound = self.outbound_message(&msg.channel, &msg.chat_id, &content);
+
+        // Record what the person actually RECEIVED - after channel formatting
+        // removed reasoning tags and the like - not the raw model text.
+        self.record(
+            &session_key,
+            &turn_id,
+            metis_core::events::EventKind::AgentReply {
+                text: outbound.content.clone(),
+            },
+        );
         if let Some(footer) = self.token_usage_footer(&turn_usage) {
             outbound.content.push_str(&footer);
         }
@@ -4967,6 +5140,145 @@ Write-Output "hello"
         assert!(!recovered.contains("EXISTS=False"));
         let recovered2 = "PATH=C:\\a EXISTS=True\nPATH=C:\\b EXISTS=False\n";
         assert!(recovered2.contains("EXISTS=False"));
+    }
+
+
+    // ── Event log: the harness's own record of a turn ────────────────────
+
+    #[tokio::test]
+    async fn a_turn_with_a_tool_call_is_recorded_as_typed_events() {
+        use metis_core::events::{EventKind, EventLog, ToolOutcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let test_file = dir.path().join("note.txt");
+        std::fs::write(&test_file, "the real contents").unwrap();
+        let log_dir = dir.path().join("events");
+        let log = Arc::new(EventLog::new(&log_dir));
+
+        let responses = vec![
+            LlmResponse {
+                content: None,
+                tool_calls: vec![ToolCall::new(
+                    "call_1",
+                    "read_file",
+                    serde_json::json!({"path": test_file.to_str().unwrap()}).to_string(),
+                )],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("It says: the real contents".into()),
+                ..Default::default()
+            },
+        ];
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(32)),
+            Arc::new(MockProvider::new(responses)),
+            dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        )
+        .with_event_log(log.clone());
+
+        agent.process_direct("what is in note.txt?").await.unwrap();
+
+        let sessions = log.sessions();
+        assert_eq!(sessions.len(), 1, "one session file expected");
+        let events = EventLog::read_file(&sessions[0].1);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match &e.event {
+                EventKind::UserMessage { .. } => "user",
+                EventKind::ToolCall { .. } => "call",
+                EventKind::ToolResult { .. } => "result",
+                EventKind::AgentReply { .. } => "reply",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["user", "call", "result", "reply"], "{kinds:?}");
+
+        // Everything from one message shares a turn id, attributed to main.
+        assert!(events.iter().all(|e| e.turn == events[0].turn));
+        assert!(events.iter().all(|e| e.agent == "main"));
+
+        // The result is the REAL file content, typed as a success.
+        match &events[2].event {
+            EventKind::ToolResult { tool, outcome, call_id } => {
+                assert_eq!(tool, "read_file");
+                assert_eq!(call_id, "call_1");
+                assert!(outcome.succeeded());
+                assert!(matches!(outcome, ToolOutcome::Ok { .. }));
+                assert!(outcome.evidence_text().contains("the real contents"));
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_reports_become_typed_fields() {
+        use metis_core::events::{ExecStatus, ToolOutcome};
+        let report = "<<<EXEC_RESULT>>>\nCOMMAND: Get-Process python\nWORKING_DIR: C:\\w\n\
+                      SHELL_BACKEND: powershell\nEXIT_CODE: 0\nSTATUS: SUCCESS\n\
+                      <<<END_EXEC_RESULT>>>\n--- STDOUT ---\n12968 python\n--- STDERR ---\nwarn x\n";
+        match tool_outcome_from_result("exec", report) {
+            ToolOutcome::Exec { command, exit_code, status, stdout, stderr, .. } => {
+                assert_eq!(command, "Get-Process python");
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(status, ExecStatus::Success);
+                assert_eq!(stdout.trim(), "12968 python");
+                assert_eq!(stderr.trim(), "warn x");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_exec_is_typed_failed_with_its_exit_code() {
+        use metis_core::events::{ExecStatus, ToolOutcome};
+        let report = "<<<EXEC_RESULT>>>\nCOMMAND: python x.py\nEXIT_CODE: 1\nSTATUS: FAILED\n\
+                      <<<END_EXEC_RESULT>>>\n--- STDERR ---\nModuleNotFoundError\n";
+        let o = tool_outcome_from_result("exec", report);
+        assert!(!o.succeeded());
+        match o {
+            ToolOutcome::Exec { exit_code, status, .. } => {
+                assert_eq!(exit_code, Some(1));
+                assert_eq!(status, ExecStatus::Failed);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_stopped_by_the_safety_check_is_typed_not_run() {
+        use metis_core::events::{ExecStatus, ToolOutcome};
+        let blocked = "Permission required: this looks destructive. Command not executed.\n\
+                       Approval token: abc123";
+        match tool_outcome_from_result("exec", blocked) {
+            ToolOutcome::Exec { status, exit_code, .. } => {
+                assert_eq!(status, ExecStatus::NotRun, "must not read as having run");
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failing_non_exec_tool_is_typed_failed() {
+        use metis_core::events::ToolOutcome;
+        let o = tool_outcome_from_result("read_file", "Error executing read_file: File not found: x");
+        assert!(matches!(o, ToolOutcome::Failed { .. }), "{o:?}");
+    }
+
+    #[tokio::test]
+    async fn without_opting_in_nothing_is_written() {
+        // Event logging must stay opt-in: tests and embedders get no files.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)),
+            Arc::new(MockProvider::simple("hi")),
+            dir.path().to_path_buf(),
+            None, None, None, Some(3), None, None, None, false, None, None, None,
+        );
+        agent.process_direct("hello").await.unwrap();
+        assert!(!dir.path().join("events").exists());
     }
 
     #[tokio::test]

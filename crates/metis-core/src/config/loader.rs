@@ -306,9 +306,20 @@ fn apply_provider_env(provider: &mut super::schema::ProviderConfig, name: &str) 
 
 #[cfg(test)]
 mod tests {
+    /// load_config applies environment overrides, and some tests here set
+    /// those variables process-wide. Tests run in parallel, so without a
+    /// shared lock one test's METIS_* variable leaked into another's load -
+    /// the BOM test intermittently read model "test-model" instead of its
+    /// own. Every test in this module takes the lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     #[test]
     fn config_with_utf8_bom_still_loads() {
+        let _env = env_guard();
         // PowerShell 5.1's `Set-Content -Encoding utf8` prepends EF BB BF.
         // Without stripping it the whole config is discarded and Metis
         // starts with default settings and no API keys.
@@ -339,6 +350,7 @@ mod tests {
 
     #[test]
     fn test_load_missing_file() {
+        let _env = env_guard();
         let config = load_config_from_path(Path::new("/nonexistent/path/config.json"));
         // Should return defaults
         assert_eq!(config.agents.defaults.max_tokens, 8192);
@@ -347,6 +359,7 @@ mod tests {
 
     #[test]
     fn test_load_valid_json() {
+        let _env = env_guard();
         let file = write_temp_json(r#"{
             "agents": {
                 "defaults": {
@@ -365,6 +378,7 @@ mod tests {
 
     #[test]
     fn test_load_invalid_json_returns_defaults() {
+        let _env = env_guard();
         let file = write_temp_json("not valid json {{{");
         let config = load_config_from_path(file.path());
         assert_eq!(config.agents.defaults.max_tokens, 8192);
@@ -372,6 +386,7 @@ mod tests {
 
     #[test]
     fn test_load_empty_json() {
+        let _env = env_guard();
         let file = write_temp_json("{}");
         let config = load_config_from_path(file.path());
         assert_eq!(config.agents.defaults.model, "anthropic/claude-sonnet-4-20250514");
@@ -379,6 +394,7 @@ mod tests {
 
     #[test]
     fn test_save_and_reload() {
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
@@ -395,6 +411,7 @@ mod tests {
 
     #[test]
     fn test_migrate_restrict_to_workspace() {
+        let _env = env_guard();
         let file = write_temp_json(r#"{
             "tools": {
                 "exec": {
@@ -411,6 +428,7 @@ mod tests {
 
     #[test]
     fn test_migrate_no_overwrite() {
+        let _env = env_guard();
         let file = write_temp_json(r#"{
             "tools": {
                 "restrictToWorkspace": false,
@@ -427,6 +445,7 @@ mod tests {
 
     #[test]
     fn test_migrate_oxibot_workspace_to_metis() {
+        let _env = env_guard();
         let file = write_temp_json(r#"{
             "agents": {
                 "defaults": {
@@ -441,6 +460,7 @@ mod tests {
 
     #[test]
     fn test_env_override_model() {
+        let _env = env_guard();
         // Set env var, apply overrides
         std::env::set_var("metis_agentS__DEFAULTS__MODEL", "test-model");
         let config = apply_env_overrides(Config::default());
@@ -450,6 +470,7 @@ mod tests {
 
     #[test]
     fn test_env_override_provider_key() {
+        let _env = env_guard();
         std::env::set_var("metis_providers__ANTHROPIC__API_KEY", "sk-env-key");
         let config = apply_env_overrides(Config::default());
         assert_eq!(config.providers.anthropic.api_key, "sk-env-key");
@@ -458,6 +479,7 @@ mod tests {
 
     #[test]
     fn test_env_override_gateway_port() {
+        let _env = env_guard();
         std::env::set_var("METIS_GATEWAY__PORT", "9999");
         let config = apply_env_overrides(Config::default());
         assert_eq!(config.gateway.port, 9999);
@@ -466,6 +488,7 @@ mod tests {
 
     #[test]
     fn test_saved_json_uses_camel_case() {
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
@@ -480,6 +503,7 @@ mod tests {
 
     #[test]
     fn test_full_config_with_providers() {
+        let _env = env_guard();
         let file = write_temp_json(r#"{
             "providers": {
                 "anthropic": { "apiKey": "sk-ant-123" },
