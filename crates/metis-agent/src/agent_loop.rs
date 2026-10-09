@@ -1120,8 +1120,22 @@ fn response_is_plan_without_tools(content: &str) -> bool {
         || lower.contains("i am going to")
         || lower.contains("i need to check")
         || lower.contains("i need to run")
-        || lower.contains("starting both");
+        || lower.contains("starting both")
+        || announces_action_now(&lower);
     intends_to_act && content.len() > 60
+}
+
+/// "Running chunk 1 + verification now." - a present-tense announcement of
+/// work that, with no tool call attached, did not happen.
+fn announces_action_now(lower: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b(running|executing|launching|starting|kicking off|firing|calling)\b[^.\n]{0,80}\bnow\b",
+        )
+        .unwrap()
+    })
+    .is_match(lower)
 }
 
 /// True when the user asked for something to be DONE, rather than asking a
@@ -1748,7 +1762,14 @@ fn looks_like_unexecuted_exec_narration(content: &str) -> bool {
 /// both the documented and the free-hand shape here.
 fn looks_like_fake_tool_call_syntax(content: &str) -> bool {
     let lower = content.to_lowercase();
-    lower.contains("[tool_call]")
+    // Command output written by the model itself. Only the exec tool produces
+    // these markers, so in the model's own text they are always forged - and
+    // stripping them after the turn labels the lie without getting the work
+    // done. Catching them here sends the model back to call the tool.
+    lower.contains("<<<exec_result>>>")
+        || lower.contains("<<<end_exec_result>>>")
+        || lower.contains("--- stdout ---")
+        || lower.contains("[tool_call]")
         || lower.contains("<minimax:tool_call>")
         || lower.contains("<invoke name=")
         || (lower.contains("tool =>") && lower.contains("args =>"))
@@ -2162,11 +2183,77 @@ fn flag_ungrounded_facts(content: String, corpus: &str, user_msg: &str) -> Strin
 /// carries the real results, so history keeps only the prose.
 fn history_safe(content: &str) -> String {
     let stripped = strip_all_exec_reports_from_text(content);
-    if stripped.trim().is_empty() {
+    let base = if stripped.trim().is_empty() {
         content.to_string()
     } else {
         stripped
+    };
+    withhold_unverified_lines(&base)
+}
+
+/// Marker the fact check prefixes its warning with.
+const UNVERIFIED_MARKER: &str = "⚠ Unverified — not found in any tool output from this turn: ";
+/// Marker the forgery check uses when it removes fake command output.
+const FORGERY_MARKER: &str = "formatted as command output, but no command was run";
+
+/// Remove from a reply, before it is stored as history, every line carrying
+/// a value the fact check could not trace to any tool output.
+///
+/// The user still sees the reply with its warning. The MODEL must not: an
+/// invented table kept in history is reread every turn and copied forward as
+/// if it were established - which is how one fabricated "blf2.nam 3 284 028 B"
+/// survived a month of corrections. Withholding just the unsupported lines
+/// keeps the rest of the reply's content.
+fn withhold_unverified_lines(content: &str) -> String {
+    let Some(pos) = content.find(UNVERIFIED_MARKER) else {
+        return content.to_string();
+    };
+    let list_text = &content[pos + UNVERIFIED_MARKER.len()..];
+    let list_text = list_text.split(". Treat").next().unwrap_or(list_text);
+    let bad: Vec<String> = list_text
+        .split(", ")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if bad.is_empty() {
+        return content.to_string();
     }
+    let mut removed = 0usize;
+    let kept: Vec<&str> = content[..pos]
+        .lines()
+        .filter(|line| {
+            let hit = bad.iter().any(|b| line.contains(b.as_str()));
+            if hit {
+                removed += 1;
+            }
+            !hit
+        })
+        .collect();
+    // The note must NOT name the values: listing them here would put the very
+    // numbers being withheld straight back into the model's history.
+    format!(
+        "{}\n\n[{removed} line(s) withheld from this history: they stated values that no tool \
+         output confirmed. Do not reconstruct them - check with a tool instead.]",
+        kept.join("\n").trim_end()
+    )
+}
+
+/// Has this conversation been flagged so often that the model is now copying
+/// its own unreliable answers? Counted over the session's recent replies.
+fn session_contaminated(log: &metis_core::events::EventLog, session: &str) -> bool {
+    use metis_core::events::EventKind;
+    let flagged = log
+        .read(session)
+        .iter()
+        .rev()
+        .filter_map(|e| match &e.event {
+            EventKind::AgentReply { text } => Some(text.clone()),
+            _ => None,
+        })
+        .take(8)
+        .filter(|t| t.contains(UNVERIFIED_MARKER) || t.contains(FORGERY_MARKER))
+        .count();
+    flagged >= 2
 }
 
 /// Marker that opens the internal tool ledger stored in session history.
@@ -4158,6 +4245,25 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         let evidence = self.grounding_evidence(&event_session, &turn_id, &grounding_corpus);
         content = flag_ungrounded_facts(content, &evidence, &msg.content);
 
+        // If this reply was flagged and so were others recently, the history
+        // is now feeding the model its own unreliable answers. Say so - a
+        // fresh conversation is the fix, and no amount of apologising in this
+        // one changes that.
+        if !delegated
+            && (content.contains(UNVERIFIED_MARKER) || content.contains(FORGERY_MARKER))
+        {
+            if let Some(log) = &self.events {
+                if session_contaminated(log, &event_session) {
+                    content.push_str(
+                        "\n\n⚠ This conversation has produced several unverified or forged \
+                         results in a row, and the model is now copying them from its own \
+                         history. Start a NEW conversation for this task - the work on disk is \
+                         unaffected, and `metis events` shows what really ran.",
+                    );
+                }
+            }
+        }
+
         // Recovery guard: if the model narrated a file-read command (e.g. "Verifying: Get-Content ...")
         // but never executed a tool call, force a deterministic read_file response.
         if exec_tool_outputs.is_empty() && looks_like_unexecuted_read_narration(&content) {
@@ -5509,6 +5615,65 @@ Write-Output "hello"
         assert!(!dir.path().join("events").exists());
     }
 
+
+
+    // ── Regression: "Running chunk 1 now" + a forged Done block, ten turns running ──
+
+    #[test]
+    fn forged_exec_output_is_recognised_as_a_fake_tool_call() {
+        let reply = "Running chunk 1 + verification now.\n\n<<<EXEC_RESULT>>>\nCOMMAND: python step3.py\n\
+                     EXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>\n--- STDOUT ---\nDone";
+        assert!(looks_like_fake_tool_call_syntax(reply));
+    }
+
+    #[test]
+    fn announcing_work_now_without_a_tool_call_is_a_promise_not_kept() {
+        assert!(response_is_plan_without_tools(
+            "Fine. If the script is on disk I should just call it. Running chunk 1 + verification now."
+        ));
+        assert!(response_is_plan_without_tools(
+            "The script is ready and the inputs are verified, so I am executing it now against the extract folder."
+        ));
+        // Past tense is a report, not a promise.
+        assert!(!response_is_plan_without_tools(
+            "The script ran earlier today and appended 12 records; the log is at step3.log on disk."
+        ));
+    }
+
+    #[test]
+    fn invented_values_are_withheld_from_the_models_history() {
+        let reply = "Here is the state:\n\
+                     blf2.nam   3 284 328 B   74 654 records\n\
+                     blf2O.nam  78 100 B      1 775 records\n\
+                     The script itself is on disk.\n\n\
+                     ⚠ Unverified — not found in any tool output from this turn: 3 284 328, 74 654, 78 100, 1 775. Treat these values as unconfirmed.";
+        let kept = history_safe(reply);
+        assert!(!kept.contains("3 284 328"), "invented size must not be fed back: {kept}");
+        assert!(!kept.contains("1 775"), "{kept}");
+        assert!(kept.contains("The script itself is on disk."), "the rest stays: {kept}");
+        assert!(kept.contains("withheld"), "the model must be told why: {kept}");
+    }
+
+    #[test]
+    fn a_reply_with_nothing_flagged_is_stored_unchanged() {
+        let reply = "blf2.nam is 6813796 bytes.";
+        assert_eq!(history_safe(reply), reply);
+    }
+
+    #[test]
+    fn repeated_flags_mark_the_session_as_contaminated() {
+        use metis_core::events::{Event, EventKind, EventLog};
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::new(dir.path());
+        let s = "desktop:x";
+        let flagged = format!("x\n\n{UNVERIFIED_MARKER}1 234 567. Treat these values as unconfirmed.");
+        log.append(&Event::new(s, "t1", "main", EventKind::AgentReply { text: "fine".into() })).unwrap();
+        assert!(!session_contaminated(&log, s), "one clean reply is not contamination");
+        log.append(&Event::new(s, "t2", "main", EventKind::AgentReply { text: flagged.clone() })).unwrap();
+        assert!(!session_contaminated(&log, s), "a single flag is not yet a pattern");
+        log.append(&Event::new(s, "t3", "main", EventKind::AgentReply { text: flagged })).unwrap();
+        assert!(session_contaminated(&log, s), "two flagged replies is a pattern");
+    }
 
     // ── Multi-agent: delegation recorded as one conversation ─────────────
 
