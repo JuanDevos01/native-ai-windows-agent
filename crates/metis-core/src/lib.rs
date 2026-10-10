@@ -5,6 +5,7 @@ pub mod approvals;
 pub mod config;
 pub mod events;
 pub mod heartbeat;
+pub mod live_answers;
 pub mod memory_db;
 pub mod session;
 pub mod utils;

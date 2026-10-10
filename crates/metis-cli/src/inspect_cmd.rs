@@ -251,6 +251,9 @@ fn print_session(stem: &str, all: &[Event], turns: usize) {
                         println!("{}", p.dimmed());
                     }
                 }
+                EventKind::Thinking { text } => {
+                    println!("  {ts}  {:<8} {} {}", who, "thinks:".dimmed(), first_line(text, 100).dimmed());
+                }
                 EventKind::AgentReply { text } => {
                     println!("  {ts}  {:<8} {} {}", who, "reply:".bold(), first_line(text, 100));
                 }

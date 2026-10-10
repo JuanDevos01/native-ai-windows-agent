@@ -282,6 +282,12 @@ pub async fn run() -> Result<()> {
         .with_roster(crate::agent_builder::build_roster(&config, gateway_events.clone())),
     );
 
+    // Destructive changes are put to the person in their Telegram chat;
+    // scheduled jobs and other channels are refused.
+    agent_loop
+        .approvals()
+        .set_handler(Arc::new(crate::approval_handlers::GatewayApprovalHandler::new(bus.clone())));
+
     // 8. Create cron service
     let cron_service = Arc::new(CronService::new(bus.clone(), None));
     {

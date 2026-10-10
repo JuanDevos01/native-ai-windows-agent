@@ -11,6 +11,7 @@
 //! - `Metis desktop` — native GUI mission control + chat
 
 mod agent_builder;
+mod approval_handlers;
 mod helpers;
 mod onboard;
 mod repl;
@@ -247,6 +248,15 @@ async fn run_agent(
 ) -> Result<()> {
     let config = load_config(None);
     let agent_loop = build_agent_loop(&config)?;
+    // Destructive changes are put to the person at the console - but only
+    // when there IS a console. Without one, leaving the handler unset makes
+    // the refusal say that nobody could be asked, instead of claiming the
+    // person said no.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        agent_loop
+            .approvals()
+            .set_handler(std::sync::Arc::new(approval_handlers::TerminalApprovalHandler));
+    }
 
     match message {
         Some(msg) => {

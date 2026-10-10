@@ -12,6 +12,7 @@ pub mod memory_index;
 pub mod skills;
 pub mod subagent;
 pub mod agent_loop;
+pub mod approval;
 
 pub use agent_loop::{AgentLoop, ExecToolConfig, MemorySettings, OutboundFormatting, THINKING_LOG_TARGET};
 pub use context::ContextBuilder;

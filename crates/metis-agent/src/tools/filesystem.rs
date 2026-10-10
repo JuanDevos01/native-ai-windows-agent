@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::base::{require_string, Tool};
+use super::base::{optional_string, require_string, Tool};
 
 // ─────────────────────────────────────────────
 // Shared path helper
@@ -190,11 +190,21 @@ fn binary_format_hint(path: &std::path::Path, bytes: &[u8]) -> Option<String> {
 /// Creates or overwrites a file with the given content.
 pub struct WriteFileTool {
     allowed_dir: Option<PathBuf>,
+    /// Asked before an EXISTING file is replaced.
+    approvals: std::sync::Arc<crate::approval::ApprovalBroker>,
 }
 
 impl WriteFileTool {
     pub fn new(allowed_dir: Option<PathBuf>) -> Self {
-        Self { allowed_dir }
+        Self {
+            allowed_dir,
+            approvals: std::sync::Arc::new(crate::approval::ApprovalBroker::new()),
+        }
+    }
+
+    pub fn with_approvals(mut self, broker: std::sync::Arc<crate::approval::ApprovalBroker>) -> Self {
+        self.approvals = broker;
+        self
     }
 }
 
@@ -240,8 +250,32 @@ impl Tool for WriteFileTool {
         }
 
         let bytes = content.as_bytes().len();
+        let session = optional_string(&params, "__event_session").unwrap_or_default();
+        let existed = path.is_file();
+
+        // Replacing a file the agent did not create in this session destroys
+        // someone's data, so a person decides. Creating a new file does not.
+        if existed && !self.approvals.is_own_file(&session, &path).await {
+            let req = crate::approval::ApprovalRequest {
+                session: session.clone(),
+                kind: crate::approval::ChangeKind::Overwrite,
+                title: format!("Replace an existing file with {bytes} bytes of new content"),
+                changes: vec![format!(
+                    "{} - would be REPLACED entirely",
+                    crate::approval::describe_file(&path)
+                )],
+                detail: content.chars().take(600).collect(),
+            };
+            if let crate::approval::Verdict::Refused(msg) = self.approvals.decide(req).await {
+                return Ok(msg);
+            }
+        }
+
         std::fs::write(&path, &content)
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+        if !existed {
+            self.approvals.note_own_file(&session, &path).await;
+        }
         Ok(format!("Successfully wrote {bytes} bytes to {}", path.display()))
     }
 }
@@ -1341,6 +1375,60 @@ mod tests {
     fn a_plain_filter_still_means_contains() {
         assert!(file_name_matches("Trojan.VB.nam-0679", ".nam"));
         assert!(file_name_matches("my_invoice.pdf", "invoice"));
+    }
+
+
+    // ── write_file asks before replacing someone else's file ──
+
+    struct Answer(crate::approval::ApprovalDecision);
+    #[async_trait]
+    impl crate::approval::ApprovalHandler for Answer {
+        async fn ask(&self, _r: crate::approval::ApprovalRequest) -> crate::approval::ApprovalDecision {
+            self.0
+        }
+    }
+
+    fn writer(answer: Option<crate::approval::ApprovalDecision>) -> WriteFileTool {
+        let b = std::sync::Arc::new(crate::approval::ApprovalBroker::new());
+        if let Some(a) = answer {
+            b.set_handler(std::sync::Arc::new(Answer(a)));
+        }
+        WriteFileTool::new(None).with_approvals(b)
+    }
+
+    #[tokio::test]
+    async fn replacing_an_existing_file_needs_a_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("important.nam");
+        std::fs::write(&f, "precious").unwrap();
+
+        let out = writer(Some(crate::approval::ApprovalDecision::Deny))
+            .execute(make_params(&[("path", f.to_str().unwrap()), ("content", "new")]))
+            .await
+            .unwrap();
+        assert!(out.contains("DENIED"), "{out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "precious", "must be untouched");
+
+        writer(Some(crate::approval::ApprovalDecision::AllowOnce))
+            .execute(make_params(&[("path", f.to_str().unwrap()), ("content", "new")]))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn the_agent_may_rewrite_a_file_it_created_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("step3.py");
+        // Nobody to ask: anything needing approval would be refused.
+        let w = writer(None);
+        let mut p = make_params(&[("path", f.to_str().unwrap()), ("content", "v1")]);
+        p.insert("__event_session".into(), json!("desktop:1"));
+        w.execute(p.clone()).await.unwrap();
+        p.insert("content".into(), json!("v2"));
+        let out = w.execute(p).await.unwrap();
+        assert!(out.contains("Successfully wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2");
     }
 
     // ── SearchFilesTool ──

@@ -105,6 +105,10 @@ pub enum EventKind {
     },
     /// The text sent back to the person.
     AgentReply { text: String },
+    /// What the model reasoned before acting, for one model call. Shown for
+    /// troubleshooting: when an agent does something odd, its stated
+    /// reasoning is usually where the misunderstanding is visible.
+    Thinking { text: String },
     /// One agent handed a task to another.
     Delegation { to_agent: String, task: String },
     /// The delegated agent's answer, returned to the delegator.

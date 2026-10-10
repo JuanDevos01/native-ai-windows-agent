@@ -35,9 +35,15 @@ enum NavPanel {
     CronJobs,
 }
 
+#[derive(Default)]
 struct ChatLine {
     role: &'static str,
     text: String,
+    /// What the model reasoned during this turn (all agents), for
+    /// troubleshooting. Shown collapsed under the reply.
+    thinking: Option<String>,
+    /// One line per tool call / hand-off, from the event log.
+    steps: Vec<String>,
 }
 
 /// Result of a background model-discovery sweep across configured providers.
@@ -100,6 +106,10 @@ pub struct MetisDesktopApp {
     approvals_last_load: f64,
     /// In-flight email diagnostic (connection test / test send).
     email_diag_rx: Option<oneshot::Receiver<Result<String, String>>>,
+    /// Destructive-change requests from the agent, waiting for the person.
+    tool_approval_rx: tokio::sync::mpsc::UnboundedReceiver<super::approval_ui::ApprovalAsk>,
+    /// The request currently on screen.
+    tool_approval: Option<super::approval_ui::ApprovalAsk>,
 }
 
 
@@ -117,6 +127,7 @@ impl MetisDesktopApp {
         agent: Arc<AgentLoop>,
         sessions: Arc<SessionManager>,
         runtime: Runtime,
+        tool_approval_rx: tokio::sync::mpsc::UnboundedReceiver<super::approval_ui::ApprovalAsk>,
     ) -> Self {
         let active = format!(
             "desktop:{}",
@@ -134,6 +145,8 @@ impl MetisDesktopApp {
             approval_status: String::new(),
             approvals_last_load: 0.0,
             email_diag_rx: None,
+            tool_approval_rx,
+            tool_approval: None,
             config,
             agent,
             sessions,
@@ -278,13 +291,23 @@ impl MetisDesktopApp {
 
     fn load_session_history(&mut self) {
         self.chat_lines.clear();
+        // The event log records what the person actually received, the
+        // model's reasoning, and every step - drawn from it, the chat shows
+        // the real reply (including the "what actually happened" summary)
+        // rather than the trimmed copy kept as model history.
+        let log = metis_core::events::EventLog::new(metis_core::events::EventLog::default_dir());
+        let events = log.read(&self.active_session);
+        if !events.is_empty() {
+            self.chat_lines = chat_from_events(&events);
+            return;
+        }
         // Disk-fresh read: the agent writes sessions through its own manager
         // instance, so a cached read here would show stale (often empty)
         // history and blank the chat right after a reply arrives.
         for msg in self.sessions.get_history_fresh(&self.active_session, 200) {
             if let Some((role, text)) = message_display(&msg) {
                 if !text.trim().is_empty() {
-                    self.chat_lines.push(ChatLine { role, text });
+                    self.chat_lines.push(ChatLine { role, text, ..Default::default() });
                 }
             }
         }
@@ -324,6 +347,7 @@ impl MetisDesktopApp {
         self.chat_lines.push(ChatLine {
             role: "You",
             text: text.clone(),
+            ..Default::default()
         });
         self.input.clear();
         self.status_line = "Thinking…".into();
@@ -366,6 +390,7 @@ impl MetisDesktopApp {
                     self.chat_lines.push(ChatLine {
                         role: "Agent",
                         text,
+                        ..Default::default()
                     });
                     self.status_line = footer.unwrap_or_default();
                 }
@@ -610,6 +635,28 @@ impl MetisDesktopApp {
 
 impl eframe::App for MetisDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A waiting approval comes first: the agent is blocked on it.
+        if self.tool_approval.is_none() {
+            if let Ok(ask) = self.tool_approval_rx.try_recv() {
+                self.tool_approval = Some(ask);
+            }
+        }
+        if let Some((req, _)) = &self.tool_approval {
+            if let Some(decision) = super::approval_ui::draw_approval_window(ctx, req) {
+                if let Some((_, reply)) = self.tool_approval.take() {
+                    let _ = reply.send(decision);
+                }
+                self.status_line = match decision {
+                    metis_agent::approval::ApprovalDecision::Deny => "Denied - nothing was changed".into(),
+                    _ => "Approved - continuing".into(),
+                };
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else if self.pending.is_some() {
+            // Keep polling so a request raised mid-turn appears promptly.
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+
         self.poll_pending(ctx);
         self.poll_model_discovery(ctx);
         self.poll_model_test(ctx);
@@ -903,7 +950,7 @@ impl MetisDesktopApp {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for line in &self.chat_lines {
+                for (i, line) in self.chat_lines.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let color = if line.role == "You" {
                             egui::Color32::DARK_GRAY
@@ -913,6 +960,22 @@ impl MetisDesktopApp {
                         ui.label(egui::RichText::new(format!("{}:", line.role)).strong().color(color));
                     });
                     ui.label(&line.text);
+                    if !line.steps.is_empty() {
+                        egui::CollapsingHeader::new(format!("🔧 Steps ({})", line.steps.len()))
+                            .id_salt(("steps", i))
+                            .show(ui, |ui| {
+                                for step in &line.steps {
+                                    ui.label(egui::RichText::new(step).monospace().small());
+                                }
+                            });
+                    }
+                    if let Some(thinking) = &line.thinking {
+                        egui::CollapsingHeader::new("🧠 Thinking")
+                            .id_salt(("thinking", i))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(thinking).small().weak());
+                            });
+                    }
                     ui.add_space(12.0);
                 }
             });
@@ -1707,9 +1770,78 @@ fn message_display(msg: &Message) -> Option<(&'static str, String)> {
                 None
             }
         }
-        Message::System { content } => Some(("System", content.clone())),
+        // System entries are internal bookkeeping for the model (the tool
+        // log, role notes). Showing them put "[Internal tool log ...]" on the
+        // person's screen as if it were part of the conversation.
+        Message::System { .. } => None,
         Message::Tool { .. } => None,
     }
+}
+
+/// Build the chat view from a session's event log: the person's messages,
+/// each reply as it was delivered, and - collapsed under it - the model's
+/// reasoning and the steps the turn really took.
+fn chat_from_events(events: &[metis_core::events::Event]) -> Vec<ChatLine> {
+    use metis_core::events::{EventKind, ExecStatus, ToolOutcome};
+    let mut lines: Vec<ChatLine> = Vec::new();
+    let mut thinking: Vec<String> = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
+    let mut current_turn = String::new();
+    let short = |s: &str, n: usize| {
+        let one = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        if one.chars().count() > n {
+            format!("{}…", one.chars().take(n).collect::<String>())
+        } else {
+            one.to_string()
+        }
+    };
+    for e in events {
+        if e.turn != current_turn {
+            thinking.clear();
+            steps.clear();
+            current_turn = e.turn.clone();
+        }
+        let who = if e.agent == "main" { String::new() } else { format!("[{}] ", e.agent) };
+        match &e.event {
+            EventKind::UserMessage { text } => lines.push(ChatLine {
+                role: "You",
+                text: text.clone(),
+                ..Default::default()
+            }),
+            EventKind::Thinking { text } => thinking.push(format!("{who}{}", text.trim())),
+            EventKind::ToolCall { tool, args, .. } => {
+                steps.push(format!("{who}→ {tool} {}", short(&args.to_string(), 110)))
+            }
+            EventKind::ToolResult { tool, outcome, .. } => {
+                let mark = match outcome {
+                    ToolOutcome::Exec { status: ExecStatus::Success, exit_code, .. } => {
+                        format!("✓ exit {}", exit_code.unwrap_or(0))
+                    }
+                    ToolOutcome::Exec { status: ExecStatus::NotRun, .. } => "⋯ NOT RUN".into(),
+                    ToolOutcome::Exec { status: ExecStatus::Timeout, .. } => "✗ timed out".into(),
+                    ToolOutcome::Exec { status: ExecStatus::Failed, exit_code, .. } => {
+                        format!("✗ failed (exit {})", exit_code.map(|c| c.to_string()).unwrap_or("?".into()))
+                    }
+                    ToolOutcome::Ok { .. } => "✓".into(),
+                    ToolOutcome::Failed { error } => format!("✗ {}", short(error, 90)),
+                };
+                steps.push(format!("{who}← {tool} {mark}"));
+            }
+            EventKind::Delegation { to_agent, task } => {
+                steps.push(format!("⇢ handed to {to_agent}: {}", short(task, 100)))
+            }
+            EventKind::DelegationResult { from_agent, text } => {
+                steps.push(format!("⇠ {from_agent} answered: {}", short(text, 100)))
+            }
+            EventKind::AgentReply { text } => lines.push(ChatLine {
+                role: "Agent",
+                text: text.clone(),
+                thinking: (!thinking.is_empty()).then(|| thinking.join("\n\n")),
+                steps: std::mem::take(&mut steps),
+            }),
+        }
+    }
+    lines
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1751,6 +1883,13 @@ pub fn run(logs: bool) -> Result<()> {
     let agent = Arc::new(build_agent_loop(&metis_config)?);
     let sessions = Arc::new(SessionManager::new(None)?);
 
+    // Destructive changes are put to the person in a dialog, not approved by
+    // the agent itself.
+    let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .approvals()
+        .set_handler(Arc::new(super::approval_ui::DesktopApprovalHandler::new(approval_tx)));
+
     let title = desktop_config.agent_title.clone();
     let width = desktop_config.window.width;
     let height = desktop_config.window.height;
@@ -1763,6 +1902,7 @@ pub fn run(logs: bool) -> Result<()> {
         agent,
         sessions,
         runtime,
+        approval_rx,
     ))));
 
     let attempt = |renderer: eframe::Renderer| -> std::result::Result<(), eframe::Error> {
@@ -1778,13 +1918,13 @@ pub fn run(logs: bool) -> Result<()> {
             },
             Box::new(move |cc| {
                 setup_theme(&cc.egui_ctx);
-                let (config, agent, sessions, runtime) = parts
+                let (config, agent, sessions, runtime, approval_rx) = parts
                     .lock()
                     .expect("desktop state mutex poisoned")
                     .take()
                     .expect("desktop app state was already consumed");
                 Ok(Box::new(MetisDesktopApp::new(
-                    config, agent, sessions, runtime,
+                    config, agent, sessions, runtime, approval_rx,
                 )))
             }),
         )

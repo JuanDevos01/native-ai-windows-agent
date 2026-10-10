@@ -280,6 +280,13 @@ impl TelegramChannel {
             "telegram inbound message"
         );
 
+        // An agent blocked mid-turn on an approval question is waiting for
+        // exactly this message. Hand it over directly: queued, it would sit
+        // behind the turn that is waiting for it.
+        if metis_core::live_answers::try_answer(&format!("telegram:{chat_id}"), &content) {
+            return;
+        }
+
         // Start typing indicator; it is explicitly stopped when outbound send completes.
         self.start_typing(message.chat.id.0, bot).await;
 

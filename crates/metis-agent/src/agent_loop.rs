@@ -1943,8 +1943,8 @@ fn try_recover_invoke_xml_tool_call(content: &str) -> Option<metis_core::types::
 fn exec_outcome_from_report(result: &str) -> metis_core::events::ToolOutcome {
     use metis_core::events::{clip_output, ExecStatus, ToolOutcome};
 
-    if exec_result_needs_approval(result) {
-        // Stopped by the safety check: nothing ran.
+    if exec_result_needs_approval(result) || result.starts_with("NOT RUN:") {
+        // Stopped by the safety check or by the person: nothing ran.
         let (stdout, truncated) = clip_output(result);
         return ToolOutcome::Exec {
             command: String::new(),
@@ -2172,6 +2172,187 @@ fn flag_ungrounded_facts(content: String, corpus: &str, user_msg: &str) -> Strin
         content.trim_end(),
         bad.join(", ")
     )
+}
+
+/// Did the person ask for something to be CHANGED, rather than shown?
+///
+/// "List the files" is satisfied by listing them; "append the new hashes"
+/// is not satisfied by listing anything. Only the second makes a completion
+/// claim after a read-only turn a false one.
+fn user_requests_change(msg: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(append|add|write|create|update|fix|edit|change|modify|delete|remove|build|rebuild|install|move|rename|copy|merge|run|execute|start|stop|restart|deploy|commit|push|generate|convert|import|export|save|send|schedule|upload|download|scan|process|extract|replace|set up|setup|configure|implement|apply|insert)\b",
+        )
+        .unwrap()
+    })
+    .is_match(msg)
+}
+
+/// The model's reasoning for one call: the provider's separate reasoning
+/// field when it has one, otherwise the text inside <think> tags (how
+/// MiniMax and similar models deliver it).
+fn model_reasoning(response: &LlmResponse) -> Option<String> {
+    if let Some(rc) = response.reasoning_content.as_deref() {
+        if !rc.trim().is_empty() {
+            return Some(rc.trim().chars().take(8000).collect());
+        }
+    }
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:redacted_)?think(?:ing)?>(.*?)</(?:redacted_)?think(?:ing)?>").unwrap()
+    });
+    let text = response.content.as_deref()?;
+    let joined: Vec<String> = re
+        .captures_iter(text)
+        .filter_map(|c| c.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined.join("\n\n").chars().take(8000).collect())
+    }
+}
+
+/// Tools whose successful call changes something outside the conversation.
+fn tool_changes_things(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "exec" | "message" | "save_skill" | "delegate"
+            | "sharepoint_download" | "spawn"
+    )
+}
+
+/// Does a reply claim the task is finished?
+fn claims_completion(text: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(task (is )?(now )?(complete|completed|done|finished)|all done|completed successfully|finished successfully|successfully (completed|appended|updated|written|saved|created|merged)|has been (completed|appended|updated|written|saved|merged)|have been (appended|updated|written|saved|merged))\b|^\s*(done|completed)[.!]?\s*$|✅\s*(done|complete)",
+        )
+        .unwrap()
+    });
+    re.is_match(&strip_reasoning_tags(text))
+}
+
+/// A short, factual account of what this turn did, built from the event log
+/// - never from what the agent says about itself.
+///
+/// It exists because a reply can say anything ("Task completed.") while the
+/// record says what happened (three folders listed, nothing changed). The
+/// person sees both, side by side, under every reply where a tool ran.
+fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<String> {
+    use metis_core::events::{EventKind, ExecStatus, ToolOutcome};
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Tally {
+        reads: usize,
+        lists: usize,
+        searches: usize,
+        web: usize,
+        images: usize,
+        cmd_ok: usize,
+        cmd_failed: usize,
+        cmd_not_run: usize,
+        wrote: Vec<String>,
+        edited: Vec<String>,
+        failed_tools: usize,
+        sent: usize,
+        handed: Vec<String>,
+        other: usize,
+    }
+    let name_of = |args: &serde_json::Value| {
+        args.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+
+    let turn_events: Vec<&metis_core::events::Event> = events.iter().filter(|e| e.turn == turn).collect();
+    let mut calls: std::collections::HashMap<&str, &serde_json::Value> = Default::default();
+    for e in &turn_events {
+        if let EventKind::ToolCall { call_id, args, .. } = &e.event {
+            calls.insert(call_id.as_str(), args);
+        }
+    }
+    let mut by_agent: BTreeMap<String, Tally> = BTreeMap::new();
+    let mut any = false;
+    for e in &turn_events {
+        match &e.event {
+            EventKind::ToolResult { call_id, tool, outcome } => {
+                any = true;
+                let t = by_agent.entry(e.agent.clone()).or_default();
+                let ok = outcome.succeeded();
+                let args = calls.get(call_id.as_str()).copied();
+                match (tool.as_str(), outcome) {
+                    ("exec", ToolOutcome::Exec { status, .. }) => match status {
+                        ExecStatus::Success => t.cmd_ok += 1,
+                        ExecStatus::NotRun => t.cmd_not_run += 1,
+                        _ => t.cmd_failed += 1,
+                    },
+                    (_, _) if !ok => t.failed_tools += 1,
+                    ("read_file" | "read_pdf", _) => t.reads += 1,
+                    ("list_dir", _) => t.lists += 1,
+                    ("search_files" | "web_search" | "sharepoint_search", _) => t.searches += 1,
+                    ("web_fetch" | "browser", _) => t.web += 1,
+                    ("analyze_image", _) => t.images += 1,
+                    ("write_file", _) => t.wrote.push(args.map(name_of).unwrap_or_default()),
+                    ("edit_file", _) => t.edited.push(args.map(name_of).unwrap_or_default()),
+                    ("message", _) => t.sent += 1,
+                    _ => t.other += 1,
+                }
+            }
+            EventKind::Delegation { to_agent, .. } => {
+                any = true;
+                by_agent.entry(e.agent.clone()).or_default().handed.push(to_agent.clone());
+            }
+            _ => {}
+        }
+    }
+    if !any {
+        return None;
+    }
+
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    let mut lines = Vec::new();
+    let mut changed = false;
+    for (agent, t) in &by_agent {
+        let mut parts: Vec<String> = Vec::new();
+        if t.reads > 0 { parts.push(format!("read {}", plural(t.reads, "file", "files"))); }
+        if t.lists > 0 { parts.push(format!("listed {}", plural(t.lists, "folder", "folders"))); }
+        if t.searches > 0 { parts.push(format!("ran {}", plural(t.searches, "search", "searches"))); }
+        if t.web > 0 { parts.push(format!("opened {}", plural(t.web, "web page", "web pages"))); }
+        if t.images > 0 { parts.push(format!("looked at {}", plural(t.images, "image", "images"))); }
+        let cmds = t.cmd_ok + t.cmd_failed + t.cmd_not_run;
+        if cmds > 0 {
+            let mut detail = Vec::new();
+            if t.cmd_ok > 0 { detail.push(format!("{} ran", t.cmd_ok)); }
+            if t.cmd_failed > 0 { detail.push(format!("{} FAILED", t.cmd_failed)); }
+            if t.cmd_not_run > 0 { detail.push(format!("{} NOT RUN", t.cmd_not_run)); }
+            parts.push(format!("{}: {}", plural(cmds, "command", "commands"), detail.join(", ")));
+            if t.cmd_ok > 0 { changed = true; }
+        }
+        if !t.wrote.is_empty() { parts.push(format!("wrote {}", t.wrote.join(", "))); changed = true; }
+        if !t.edited.is_empty() { parts.push(format!("edited {}", t.edited.join(", "))); changed = true; }
+        if t.sent > 0 { parts.push(format!("sent {}", plural(t.sent, "message", "messages"))); changed = true; }
+        if !t.handed.is_empty() { parts.push(format!("handed work to {}", t.handed.join(", "))); }
+        if t.failed_tools > 0 { parts.push(format!("{} FAILED", plural(t.failed_tools, "other step", "other steps"))); }
+        if t.other > 0 { parts.push(format!("used {}", plural(t.other, "other tool", "other tools"))); }
+        if !parts.is_empty() {
+            lines.push(format!("• {agent}: {}", parts.join(" · ")));
+        }
+    }
+    if !changed {
+        lines.push("• nothing was changed - no file was written or edited and no command ran".to_string());
+    }
+    Some(format!(
+        "\n\n──────────\nWhat actually happened (recorded by Metis, not written by the agent):\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// The version of a reply that is safe to keep in session history.
@@ -2581,6 +2762,8 @@ pub struct AgentLoop {
     agent_id: String,
     /// Hand-off to other agents, when this agent has a roster.
     delegate_tool: Option<Arc<crate::tools::delegate::DelegateTool>>,
+    /// Where destructive changes are put to a person.
+    approvals: Arc<crate::approval::ApprovalBroker>,
     /// Spawn tool reference (for set_context).
     spawn_tool: Arc<SpawnTool>,
     /// Subagent manager (also held by SpawnTool; kept for direct access).
@@ -2644,17 +2827,25 @@ impl AgentLoop {
         };
 
         tools.register(Arc::new(ReadFileTool::new(allowed_dir.clone())));
-        tools.register(Arc::new(WriteFileTool::new(allowed_dir.clone())));
+        // One approval broker per agent: exec and write_file share it, so an
+        // "allow for this session" answer covers both.
+        let approvals = Arc::new(crate::approval::ApprovalBroker::new());
+        tools.register(Arc::new(
+            WriteFileTool::new(allowed_dir.clone()).with_approvals(approvals.clone()),
+        ));
         tools.register(Arc::new(EditFileTool::new(allowed_dir.clone())));
         tools.register(Arc::new(ListDirTool::new(allowed_dir.clone())));
         tools.register(Arc::new(SearchFilesTool::new(allowed_dir)));
-        tools.register(Arc::new(ExecTool::new(
-            workspace.clone(),
-            Some(exec_config.timeout),
-            Some(exec_config.shell.clone()),
-            Some(exec_config.permission_mode.clone()),
-            restrict_to_workspace,
-        )));
+        tools.register(Arc::new(
+            ExecTool::new(
+                workspace.clone(),
+                Some(exec_config.timeout),
+                Some(exec_config.shell.clone()),
+                Some(exec_config.permission_mode.clone()),
+                restrict_to_workspace,
+            )
+            .with_approvals(approvals.clone()),
+        ));
         if brave_api_key.is_some() {
             tools.register(Arc::new(WebSearchTool::new(brave_api_key.clone())));
         } else {
@@ -2718,6 +2909,7 @@ impl AgentLoop {
             events: None,
             agent_id: "main".to_string(),
             delegate_tool: None,
+            approvals,
             spawn_tool,
             subagent_manager,
             outbound,
@@ -2761,10 +2953,20 @@ impl AgentLoop {
         self
     }
 
+    /// The approval broker - connect a handler to it so a person can be asked.
+    pub fn approvals(&self) -> Arc<crate::approval::ApprovalBroker> {
+        self.approvals.clone()
+    }
+
     /// Give this agent other agents to hand work to.
     pub fn with_roster(mut self, members: Vec<crate::tools::delegate::RosterMember>) -> Self {
         if members.is_empty() {
             return self;
+        }
+        // A team member asks the same person, and an "allow for this
+        // session" answer covers the whole team.
+        for m in &members {
+            m.agent.approvals().forward_to(self.approvals.clone());
         }
         let tool = Arc::new(crate::tools::delegate::DelegateTool::new(
             &self.agent_id,
@@ -2816,8 +3018,14 @@ impl AgentLoop {
         session: &str,
         turn: &str,
         name: &str,
-        params: HashMap<String, serde_json::Value>,
+        mut params: HashMap<String, serde_json::Value>,
     ) -> String {
+        if matches!(name, "exec" | "write_file") {
+            params.insert(
+                "__event_session".to_string(),
+                serde_json::Value::String(session.to_string()),
+            );
+        }
         static AUTO_CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let call_id = format!(
             "auto-{}",
@@ -3493,8 +3701,15 @@ impl AgentLoop {
         // text-keyword guess hijack it — send it to the model instead.
         let has_media = !msg.media.is_empty();
 
+        // These shortcuts exist for models that cannot call tools themselves.
+        // For a model that CAN, they only ever guess - and guess badly: the
+        // word "--output" inside a command made `is_read_file_request` fire,
+        // so "run this script" was answered by printing the script, without
+        // the model ever being asked. A tool-capable model decides for itself.
+        let keyword_shortcuts = !self.provider.supports_tools(&self.model).await;
+
         // Fast path for explicit requests to output the long-term memory file.
-        if !has_media && is_memory_file_request(&msg.content) {
+        if keyword_shortcuts && !has_media && is_memory_file_request(&msg.content) {
             let mut params: HashMap<String, serde_json::Value> = HashMap::new();
             let memory_path = self._workspace.join("memory").join("MEMORY.md");
             params.insert(
@@ -3510,7 +3725,7 @@ impl AgentLoop {
         }
 
         // Fast path for natural-language read-file requests with explicit path.
-        if !has_media && is_read_file_request(&msg.content) {
+        if keyword_shortcuts && !has_media && is_read_file_request(&msg.content) {
             if let Some(path) = extract_probable_file_path(&msg.content) {
                 let mut params: HashMap<String, serde_json::Value> = HashMap::new();
                 params.insert("path".to_string(), serde_json::Value::String(path));
@@ -3534,7 +3749,7 @@ impl AgentLoop {
         // Fast path for direct shell commands.
         // This ensures command-style messages produce deterministic exec output
         // (including EXIT_CODE), instead of relying on LLM tool selection.
-        if !has_media && looks_like_direct_shell_command(&msg.content) {
+        if keyword_shortcuts && !has_media && looks_like_direct_shell_command(&msg.content) {
             let mut params: HashMap<String, serde_json::Value> = HashMap::new();
             params.insert(
                 "command".to_string(),
@@ -3578,7 +3793,7 @@ impl AgentLoop {
 
         // Deterministic Windows fast path: install whisper.cpp + model via one script execution.
         // This avoids narration-only "installed ✅" replies for this common workflow.
-        if !has_media && cfg!(target_os = "windows") && is_whisper_cpp_install_request(&msg.content) {
+        if keyword_shortcuts && !has_media && cfg!(target_os = "windows") && is_whisper_cpp_install_request(&msg.content) {
             let script = r#"$ErrorActionPreference = "Stop"
 $root = "C:\whisper-cpp"
 $bin = Join-Path $root "bin"
@@ -3762,6 +3977,9 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let mut exec_tool_outputs: Vec<String> = Vec::new();
         // Durable record of every action taken this turn (the "checking" log).
         let mut task_steps: Vec<TaskStep> = Vec::new();
+        // Did any tool in this turn change something (write, edit, a command
+        // that ran, a message sent, a hand-off)? Reads and listings do not.
+        let mut changed_something = false;
         // Full text of every tool result this turn - the evidence a reply's
         // stated facts are checked against before it is sent.
         let mut grounding_corpus = String::new();
@@ -3778,6 +3996,8 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // Bounds the single retry when the model claims it already answered
         // but there is nothing it could have been referring to.
         let mut meta_answer_retries = 0usize;
+        // Bounds the correction for "Task completed" after a read-only turn.
+        let mut completion_nudges = 0usize;
 
         // For any non-trivial request, post a visible "goal" line up-front so the user can see
         // what the agent set out to do (helps when work takes a while). Marked intermediate so
@@ -3823,6 +4043,13 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             turn_usage.record(response.usage.as_ref());
 
             self.log_llm_thinking_json(&msg.channel, &msg.chat_id, &session_key, iteration, &response);
+            if let Some(thought) = model_reasoning(&response) {
+                self.record(
+                    &event_session,
+                    &turn_id,
+                    metis_core::events::EventKind::Thinking { text: thought },
+                );
+            }
 
             // Some models (MiniMax-M2.7 observed live) intermittently write a
             // tool call as text instead of invoking it for real — sometimes
@@ -3922,6 +4149,14 @@ Run the next command in a follow-up message, or combine steps into one script."
                             // the call itself. Shared per-turn state would race when two
                             // conversations run at once - a cron job during a chat -
                             // and record one agent's work in the other's timeline.
+                            // Approvals are remembered per conversation, so the write
+                            // tools need to know which one they are acting in.
+                            if matches!(tc.function.name.as_str(), "exec" | "write_file") {
+                                params.insert(
+                                    "__event_session".to_string(),
+                                    serde_json::Value::String(event_session.clone()),
+                                );
+                            }
                             if tc.function.name == "delegate" {
                                 params.insert(
                                     "__event_session".to_string(),
@@ -3991,6 +4226,12 @@ Run the next command in a follow-up message, or combine steps into one script."
                             outcome: tool_outcome_from_result(&tc.function.name, &result),
                         },
                     );
+                    }
+
+                    if tool_changes_things(&tc.function.name)
+                        && tool_outcome_from_result(&tc.function.name, &result).succeeded()
+                    {
+                        changed_something = true;
                     }
 
                     // Record the step in the durable task ledger.
@@ -4158,6 +4399,39 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                     )));
                     continue;
                 }
+                // "Task completed." after a turn that only read and listed
+                // files is the claim the person can least afford to believe.
+                // Send it back once, saying what actually ran.
+                if user_requests_change(&msg.content)
+                    && !changed_something
+                    && completion_nudges == 0
+                    && iteration < 6
+                    && response.content.as_deref().is_some_and(claims_completion)
+                {
+                    completion_nudges += 1;
+                    let ran = if task_steps.is_empty() {
+                        "no tool at all".to_string()
+                    } else {
+                        task_steps
+                            .iter()
+                            .map(|t| t.label.clone())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    };
+                    ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    messages.push(Message::user(format!(
+                        "[Metis automatic check - the user did NOT send this. Do not apologise or \
+                         reply to it as if they had.]\n\
+                         Your reply says the task is complete, but nothing in this turn changed \
+                         anything. What ran: {ran}. Reading and listing files does not do the \
+                         task. Do the work now with your tools - and read the code you are about \
+                         to run first, rather than guessing what it does. If something genuinely \
+                         blocks you, say exactly what. Never report work as done that did not \
+                         happen."
+                    )));
+                    continue;
+                }
+
                 // No tool calls and nothing pending → final answer. If a
                 // nudge fired earlier and this reply is just an
                 // acknowledgement ("I already answered that"), keep the
@@ -4439,6 +4713,17 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         // Token footer goes on the wire only — session history stays clean so
         // the model never sees (or pays for) old usage footers.
         let mut outbound = self.outbound_message(&msg.channel, &msg.chat_id, &content);
+
+        // The factual account of the turn goes on the wire and into the event
+        // log, never into session history - so the model cannot learn to
+        // write one itself.
+        if !delegated {
+            if let Some(log) = &self.events {
+                if let Some(summary) = actions_summary(&log.read(&event_session), &turn_id) {
+                    outbound.content.push_str(&summary);
+                }
+            }
+        }
 
         // Record what the person actually RECEIVED - after channel formatting
         // removed reasoning tags and the like - not the raw model text.
@@ -5617,6 +5902,147 @@ Write-Output "hello"
 
 
 
+
+    // ── "Task completed." after a turn that changed nothing ──────────────
+
+
+    #[test]
+    fn reasoning_is_taken_from_think_tags_or_the_reasoning_field() {
+        let r = LlmResponse {
+            content: Some("<think>The user wants the log; I should read it first.</think>Here it is.".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_reasoning(&r).as_deref(),
+            Some("The user wants the log; I should read it first.")
+        );
+        let r = LlmResponse {
+            content: Some("plain answer".into()),
+            reasoning_content: Some("separate field reasoning".into()),
+            ..Default::default()
+        };
+        assert_eq!(model_reasoning(&r).as_deref(), Some("separate field reasoning"));
+        assert!(model_reasoning(&LlmResponse { content: Some("no thoughts".into()), ..Default::default() }).is_none());
+    }
+
+
+    #[tokio::test]
+    async fn a_tool_capable_model_is_never_bypassed_by_a_keyword_shortcut() {
+        // "--output" used to trip the read-file shortcut, so "run this script"
+        // printed the script instead of reaching the model.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scan.py");
+        std::fs::write(&script, "print('hi')").unwrap();
+        let provider = Arc::new(MockProvider::simple("I will run it; it needs approval first."));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(5), None, None, None, false, None, None, None,
+        );
+        let reply = agent
+            .process_direct(&format!(
+                "Run this exact command and tell me the result: python \"{}\" --output out.nam",
+                script.display()
+            ))
+            .await
+            .unwrap();
+        assert!(reply.contains("needs approval"), "the model must answer: {reply}");
+        assert!(!reply.contains("print('hi')"), "the script must not be dumped: {reply}");
+    }
+
+    #[test]
+    fn only_requests_for_a_change_make_a_read_only_turn_incomplete() {
+        assert!(user_requests_change("append the new hashes to blf2.nam"));
+        assert!(user_requests_change("you build a blf builder, now run it on extract"));
+        assert!(!user_requests_change("list stuff"));
+        assert!(!user_requests_change("how many .nam files are there?"));
+        assert!(!user_requests_change("show me the log"));
+    }
+
+    #[test]
+    fn completion_claims_are_recognised() {
+        for t in ["Task completed.", "Done.", "All done!", "The records have been appended.",
+                  "✅ Done", "<think>x</think>\n\nTask is complete."] {
+            assert!(claims_completion(t), "{t}");
+        }
+        for t in ["I listed the folders; next I will run the script.",
+                  "It is not done yet: the script timed out.", "What should I name the file?"] {
+            assert!(!claims_completion(t), "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task_completed_after_only_listing_is_sent_back() {
+        // Verbatim shape of the failing turn: listings, then "Task completed."
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall::new(
+                    "c1",
+                    "list_dir",
+                    serde_json::json!({"path": dir.path().to_str().unwrap()}).to_string(),
+                )],
+                ..Default::default()
+            },
+            LlmResponse { content: Some("Task completed.".into()), ..Default::default() },
+            LlmResponse {
+                content: Some("I have not done it yet: the builder script needs a source folder.".into()),
+                ..Default::default()
+            },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("append the new hashes to the builder").await.unwrap();
+        assert!(!reply.contains("Task completed"), "the false claim must not reach the user: {reply}");
+        assert!(reply.contains("not done it yet"), "{reply}");
+    }
+
+    #[test]
+    fn the_summary_says_plainly_when_nothing_was_changed() {
+        use metis_core::events::{Event, EventKind, ToolOutcome};
+        let call = |id: &str, tool: &str| Event::new("s", "t", "main", EventKind::ToolCall {
+            call_id: id.into(), tool: tool.into(), args: serde_json::json!({"path": "C:\\x\\y"}) });
+        let ok = |id: &str, tool: &str| Event::new("s", "t", "main", EventKind::ToolResult {
+            call_id: id.into(), tool: tool.into(), outcome: ToolOutcome::Ok { output: "x".into(), truncated: false } });
+        let evs = vec![call("1", "read_file"), ok("1", "read_file"),
+                       call("2", "list_dir"), ok("2", "list_dir"),
+                       call("3", "list_dir"), ok("3", "list_dir")];
+        let s = actions_summary(&evs, "t").unwrap();
+        assert!(s.contains("read 1 file"), "{s}");
+        assert!(s.contains("listed 2 folders"), "{s}");
+        assert!(s.contains("nothing was changed"), "{s}");
+        assert!(s.contains("not written by the agent"), "{s}");
+    }
+
+    #[test]
+    fn the_summary_names_changes_and_failures() {
+        use metis_core::events::{Event, EventKind, ExecStatus, ToolOutcome};
+        let ev = |k| Event::new("s", "t", "main", k);
+        let evs = vec![
+            ev(EventKind::ToolCall { call_id: "1".into(), tool: "write_file".into(),
+                args: serde_json::json!({"path": "C:\\w\\step3_noext.py"}) }),
+            ev(EventKind::ToolResult { call_id: "1".into(), tool: "write_file".into(),
+                outcome: ToolOutcome::Ok { output: "ok".into(), truncated: false } }),
+            ev(EventKind::ToolResult { call_id: "2".into(), tool: "exec".into(),
+                outcome: ToolOutcome::Exec { command: "python x".into(), exit_code: None,
+                    status: ExecStatus::Timeout, stdout: String::new(), stderr: String::new(), truncated: false } }),
+            ev(EventKind::ToolResult { call_id: "3".into(), tool: "exec".into(),
+                outcome: ToolOutcome::Exec { command: "rm x".into(), exit_code: None,
+                    status: ExecStatus::NotRun, stdout: String::new(), stderr: String::new(), truncated: false } }),
+        ];
+        let s = actions_summary(&evs, "t").unwrap();
+        assert!(s.contains("wrote step3_noext.py"), "{s}");
+        assert!(s.contains("1 FAILED"), "a timeout is a failure: {s}");
+        assert!(s.contains("1 NOT RUN"), "{s}");
+        assert!(!s.contains("nothing was changed"), "{s}");
+    }
+
+    #[test]
+    fn a_turn_without_tools_gets_no_summary() {
+        assert!(actions_summary(&[], "t").is_none());
+    }
+
     // ── Regression: "Running chunk 1 now" + a forged Done block, ten turns running ──
 
     #[test]
@@ -5695,6 +6121,7 @@ Write-Output "hello"
                 ToolCall { tool, .. } => format!("{}:call:{tool}", e.agent),
                 ToolResult { tool, .. } => format!("{}:result:{tool}", e.agent),
                 AgentReply { .. } => format!("{}:reply", e.agent),
+                Thinking { .. } => format!("{}:thinking", e.agent),
                 Delegation { to_agent, .. } => format!("{}:delegate->{to_agent}", e.agent),
                 DelegationResult { from_agent, .. } => format!("{}:answer<-{from_agent}", e.agent),
             })
