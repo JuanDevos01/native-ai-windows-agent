@@ -48,18 +48,45 @@ pub trait Tool: Send + Sync {
 // Param helpers
 // ─────────────────────────────────────────────
 
+/// Other names models use for the same parameter. An edit_file call sent with
+/// `file_path` instead of `path` failed with "Missing required parameter", the
+/// model then reported the edit as made, and the person found the file
+/// unchanged hours later. The intent of such a call is not in doubt.
+fn param_aliases(key: &str) -> &'static [&'static str] {
+    match key {
+        "path" => &["file_path", "filepath", "file", "filename", "file_name"],
+        "old_text" => &["old_str", "old_string", "search", "find", "old"],
+        "new_text" => &["new_str", "new_string", "replace", "replacement", "new"],
+        "content" => &["contents", "text", "data", "file_text"],
+        "command" => &["cmd"],
+        _ => &[],
+    }
+}
+
+fn lookup_str<'a>(params: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(|v| v.as_str()).or_else(|| {
+        param_aliases(key)
+            .iter()
+            .find_map(|alias| params.get(*alias).and_then(|v| v.as_str()))
+    })
+}
+
 /// Extract a required `String` param, returning a user-friendly error.
 pub fn require_string(params: &HashMap<String, Value>, key: &str) -> anyhow::Result<String> {
-    params
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("Missing required parameter: {key}"))
+    lookup_str(params, key).map(|s| s.to_string()).ok_or_else(|| {
+        let mut given: Vec<&str> = params.keys().map(String::as_str).collect();
+        given.sort_unstable();
+        anyhow::anyhow!(
+            "Missing required parameter: {key} (you sent: {}). Nothing was done - call the tool \
+             again with `{key}`.",
+            if given.is_empty() { "no parameters".to_string() } else { given.join(", ") }
+        )
+    })
 }
 
 /// Extract an optional `String` param.
 pub fn optional_string(params: &HashMap<String, Value>, key: &str) -> Option<String> {
-    params.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    lookup_str(params, key).map(|s| s.to_string())
 }
 
 /// Extract an optional integer param.
@@ -99,6 +126,20 @@ pub fn sanitize_tool_calls_for_history(mut calls: Vec<metis_core::types::ToolCal
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn common_parameter_aliases_are_accepted() {
+        let mut p = HashMap::new();
+        p.insert("file_path".to_string(), json!("C:\\a.py"));
+        p.insert("old_str".to_string(), json!("x"));
+        assert_eq!(require_string(&p, "path").unwrap(), "C:\\a.py");
+        assert_eq!(require_string(&p, "old_text").unwrap(), "x");
+        // The real name wins over an alias.
+        p.insert("path".to_string(), json!("C:\\b.py"));
+        assert_eq!(require_string(&p, "path").unwrap(), "C:\\b.py");
+        let err = require_string(&p, "new_text").unwrap_err().to_string();
+        assert!(err.contains("you sent: file_path, old_str, path"), "{err}");
+    }
 
     #[test]
     fn parse_tool_params_empty_is_ok() {

@@ -511,6 +511,17 @@ pub fn strip_reasoning_tags(text: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// What the person would actually see of a reply: reasoning removed,
+/// including a `<think>` block that was cut off and never closed.
+fn visible_reply_text(text: &str) -> String {
+    let closed = strip_reasoning_tags(text);
+    static OPEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    OPEN.get_or_init(|| Regex::new(r"(?is)<(?:redacted_)?think(?:ing)?>.*$").unwrap())
+        .replace(&closed, "")
+        .trim()
+        .to_string()
+}
+
 /// Remove ``` ... ``` blocks (non-greedy). Used for chat-app outbound messages.
 /// Multi-line code blocks are silently removed (not replaced with a placeholder message).
 /// Short single-line inline blocks are kept as-is.
@@ -1353,7 +1364,14 @@ fn summarize_result_for_memory(tool_name: &str, result: &str) -> Option<String> 
     if condensed.is_empty() {
         return None;
     }
-    Some(truncate_chars(condensed, memory_budget_for(tool_name)))
+    let budget = memory_budget_for(tool_name);
+    let mut kept = truncate_chars(condensed, budget);
+    if tool_name == "read_file" && condensed.chars().count() > budget {
+        // The model once "remembered" a 13 KB script from these 250
+        // characters and invented the encryption key it never kept.
+        kept.push_str(" [ONLY THE START WAS KEPT - read the file again before using anything else from it]");
+    }
+    Some(kept)
 }
 
 impl TaskStep {
@@ -2183,7 +2201,7 @@ fn user_requests_change(msg: &str) -> bool {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(append|add|write|create|update|fix|edit|change|modify|delete|remove|build|rebuild|install|move|rename|copy|merge|run|execute|start|stop|restart|deploy|commit|push|generate|convert|import|export|save|send|schedule|upload|download|scan|process|extract|replace|set up|setup|configure|implement|apply|insert)\b",
+            r"(?i)\b(append|add|write|create|update|fix|edit|change|modify|delete|remove|build|rebuild|install|move|rename|copy|merge|run|re-?run|execute|roll ?back|revert|restore|undo|truncate|redo|patch|do it|again|start|stop|restart|deploy|commit|push|generate|convert|import|export|save|send|schedule|upload|download|scan|process|extract|replace|set up|setup|configure|implement|apply|insert)\b",
         )
         .unwrap()
     })
@@ -2217,6 +2235,73 @@ fn model_reasoning(response: &LlmResponse) -> Option<String> {
     }
 }
 
+/// A write_file / edit_file call that failed this turn.
+#[derive(Debug, Clone, PartialEq)]
+struct FailedChange {
+    tool: String,
+    /// The file it was meant to change.
+    target: String,
+    /// What the change would have put there; a later success with the same
+    /// target and text is the same change, redone.
+    payload: String,
+    error: String,
+}
+
+/// Keep `failed` in step with one tool call: record a failed write/edit, and
+/// clear it once the same change succeeds. Two different edits to one file
+/// are told apart by the text they insert, so fixing edit 2 does not excuse
+/// edit 1.
+fn track_failed_change(
+    failed: &mut Vec<FailedChange>,
+    tool: &str,
+    arguments: &str,
+    result: &str,
+    ok: bool,
+) {
+    if !matches!(tool, "write_file" | "edit_file") {
+        return;
+    }
+    let params = crate::tools::base::parse_tool_params(arguments).unwrap_or_default();
+    let target = crate::tools::base::optional_string(&params, "path").unwrap_or_else(|| "(no path given)".into());
+    let payload_key = if tool == "edit_file" { "new_text" } else { "content" };
+    let payload = crate::tools::base::optional_string(&params, payload_key).unwrap_or_default();
+    let same = |f: &FailedChange| {
+        f.tool == tool
+            && (f.target.eq_ignore_ascii_case(&target) || f.target == "(no path given)")
+            && (f.payload == payload || f.payload.is_empty() || tool == "write_file")
+    };
+    if ok {
+        failed.retain(|f| !same(f));
+    } else {
+        failed.retain(|f| !same(f));
+        failed.push(FailedChange {
+            tool: tool.to_string(),
+            target,
+            payload,
+            error: truncate_chars(result.lines().next().unwrap_or("failed").trim(), 160),
+        });
+    }
+}
+
+/// Does the reply stop to ask the person for a go-ahead ("Say \"do all 4
+/// edits\"", "Shall I proceed?", "Want me to apply it?")? Only the end of the
+/// reply counts: that is where a reply hands the turn back.
+fn asks_permission_to_proceed(text: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(\b(say|type|reply( with)?)\s+(\*\*|_)?["“'`]|\bshall i\b|\bshould i (go ahead|proceed|start|apply|make|do|continue|implement|fix|edit)\b|\b(do you )?want me to (go ahead|proceed|start|apply|make|do|continue|implement|fix|edit|run)\b|\bwould you like me to\b|\bready (to (proceed|start|go)|when you are)\b|\b(give me|i need) (the |your )?(go-?ahead|green light|ok|okay|confirmation)\b|\b(let me know|tell me) (if|when|whether) (you want|i should|to (proceed|go ahead|start))\b|\bconfirm (and|to|so) (i|i'll)\b|\bwaiting for your (go|ok|confirmation|approval)\b)"#,
+        )
+        .unwrap()
+    });
+    let cleaned = strip_reasoning_tags(text);
+    let tail: String = {
+        let chars: Vec<char> = cleaned.trim_end().chars().collect();
+        chars[chars.len().saturating_sub(400)..].iter().collect()
+    };
+    re.is_match(&tail)
+}
+
 /// Tools whose successful call changes something outside the conversation.
 fn tool_changes_things(name: &str) -> bool {
     matches!(
@@ -2236,6 +2321,62 @@ fn claims_completion(text: &str) -> bool {
         .unwrap()
     });
     re.is_match(&strip_reasoning_tags(text))
+}
+
+/// Does a reply say work was done, run, read or checked IN THIS TURN?
+///
+/// Wider than `claims_completion`: "✅ Rollback done", "What just ran, with
+/// real output", "Re-verified (proof)", "I re-read the file". A reply like
+/// that, from a turn in which no tool ran at all, is false by construction -
+/// the agent copied an earlier turn's output, or invented it. Negated phrases
+/// ("I have not verified it") are honest and do not count.
+fn claims_work(text: &str) -> bool {
+    static NEG: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let neg = NEG.get_or_init(|| {
+        Regex::new(r"(?i)\b(not|never|cannot|can't|didn't|haven't|hasn't|wasn't)\s+(yet\s+|been\s+|actually\s+)?[\w-]+").unwrap()
+    });
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(what (just )?ran|just ran|re-?ran|with real output|real output|re-?verified|verified (just now|now|again)|(?:i|we) (?:have |just |also |then )?(ran|checked|re-?checked|re-?read|reviewed|inspected|looked at|verified|appended|truncated|patched|wrote|edited|executed|confirmed|rolled back|restored|tested|fixed|re-?ran)|(?:i|we)(?: have|'ve) read|(rollback|roll-back|append|truncat\w*|patch|fix|restore|update|verification|re-?run)\w* (is )?(now )?(done|complete|completed|confirmed|finished|successful)|rolled back|has been (rolled back|restored|truncated|patched|fixed|verified)|here('s| is) (the )?proof)\b|✅|^\W*(\d+\.\s*)?(re-?(read|ran|checked|verified)|verified)\b",
+        )
+        .unwrap()
+    });
+    let cleaned = strip_reasoning_tags(text);
+    let cleaned = neg.replace_all(&cleaned, " ");
+    cleaned.lines().any(|l| re.is_match(l)) || claims_completion(text)
+}
+
+/// A short reply that answers the agent's own offer ("1", "go", "yes, do it").
+/// It carries the person's request for a change as much as "append the hashes".
+fn is_go_ahead(msg: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let t = msg.trim();
+    t.chars().count() <= 40
+        && RE
+            .get_or_init(|| {
+                Regex::new(r"(?i)^\s*([1-9]|[a-d]|y|yes|ok|okay|go|go ahead|do it|proceed|confirm|sure|please do|yes please)\b").unwrap()
+            })
+            .is_match(t)
+}
+
+/// Neutralise lines in which the model imitates Metis's own record. Only
+/// Metis writes "What actually happened"; the model once wrote that heading
+/// itself above an invented account.
+fn unforge_record_heading(text: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?im)^([#>*\s]*)what actually happened\b(\s*\(recorded by metis[^)]*\))?").unwrap())
+        .replace_all(text, "${1}The agent's own account")
+        .into_owned()
+}
+
+/// The record for a turn in which no tool ran, shown only when the reply
+/// claims work anyway.
+fn no_tools_summary() -> String {
+    "\n\n──────────\nWhat actually happened (recorded by Metis, not written by the agent):\n\
+     • NO tool ran in this turn - nothing was read, run, checked or changed.\n\
+     • Anything above described as done, run, read or verified in this turn did NOT happen in this turn."
+        .to_string()
 }
 
 /// A short, factual account of what this turn did, built from the event log
@@ -2261,12 +2402,16 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
         wrote: Vec<String>,
         edited: Vec<String>,
         failed_tools: usize,
+        /// "edit_file gui.py: Missing required parameter: path"
+        failed_changes: Vec<String>,
         sent: usize,
         handed: Vec<String>,
         other: usize,
     }
     let name_of = |args: &serde_json::Value| {
-        args.get("path")
+        ["path", "file_path", "filepath", "file", "filename"]
+            .iter()
+            .find_map(|k| args.get(*k))
             .and_then(|p| p.as_str())
             .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_string())
             .unwrap_or_else(|| "?".to_string())
@@ -2294,6 +2439,11 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
                         ExecStatus::NotRun => t.cmd_not_run += 1,
                         _ => t.cmd_failed += 1,
                     },
+                    ("write_file" | "edit_file", ToolOutcome::Failed { error }) => t.failed_changes.push(format!(
+                        "{tool} {}: {}",
+                        args.map(name_of).unwrap_or_default(),
+                        truncate_chars(error.lines().next().unwrap_or("failed").trim(), 120)
+                    )),
                     (_, _) if !ok => t.failed_tools += 1,
                     ("read_file" | "read_pdf", _) => t.reads += 1,
                     ("list_dir", _) => t.lists += 1,
@@ -2341,6 +2491,9 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
         if t.sent > 0 { parts.push(format!("sent {}", plural(t.sent, "message", "messages"))); changed = true; }
         if !t.handed.is_empty() { parts.push(format!("handed work to {}", t.handed.join(", "))); }
         if t.failed_tools > 0 { parts.push(format!("{} FAILED", plural(t.failed_tools, "other step", "other steps"))); }
+        for f in &t.failed_changes {
+            parts.push(format!("FAILED, file NOT changed: {f}"));
+        }
         if t.other > 0 { parts.push(format!("used {}", plural(t.other, "other tool", "other tools"))); }
         if !parts.is_empty() {
             lines.push(format!("• {agent}: {}", parts.join(" · ")));
@@ -3998,6 +4151,17 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         let mut meta_answer_retries = 0usize;
         // Bounds the correction for "Task completed" after a read-only turn.
         let mut completion_nudges = 0usize;
+        let mut no_tool_claim_nudges = 0usize;
+        // write_file / edit_file calls that failed and have not since been
+        // redone successfully. While any remain, the reply is not accepted:
+        // a failed edit followed by "I added the button" is the lie the
+        // person can least detect.
+        let mut failed_changes: Vec<FailedChange> = Vec::new();
+        let mut failed_change_nudges = 0usize;
+        // Bounds the "you asked permission for work you were asked to do" nudge.
+        let mut permission_nudges = 0usize;
+        // Bounds the retry for a response that was only reasoning.
+        let mut empty_reply_retries = 0usize;
 
         // For any non-trivial request, post a visible "goal" line up-front so the user can see
         // what the agent set out to do (helps when work takes a while). Marked intermediate so
@@ -4228,11 +4392,17 @@ Run the next command in a follow-up message, or combine steps into one script."
                     );
                     }
 
-                    if tool_changes_things(&tc.function.name)
-                        && tool_outcome_from_result(&tc.function.name, &result).succeeded()
-                    {
+                    let call_ok = tool_outcome_from_result(&tc.function.name, &result).succeeded();
+                    if tool_changes_things(&tc.function.name) && call_ok {
                         changed_something = true;
                     }
+                    track_failed_change(
+                        &mut failed_changes,
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &result,
+                        call_ok,
+                    );
 
                     // Record the step in the durable task ledger.
                     task_steps.push(TaskStep::from_tool_call(
@@ -4258,6 +4428,27 @@ Run the next command in a follow-up message, or combine steps into one script."
                 }
             } else {
                 let content_text = response.content.as_deref().unwrap_or("");
+
+                // Nothing the person can read: the model spent its whole
+                // output on reasoning (often cut off mid-sentence at the
+                // output limit) and wrote no answer and called no tool. Sent
+                // on, that was an empty reply carrying only a warning.
+                if visible_reply_text(content_text).is_empty() && empty_reply_retries < 2 {
+                    empty_reply_retries += 1;
+                    if !content_text.trim().is_empty() {
+                        ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    }
+                    messages.push(Message::user(
+                        "[Metis automatic check - the user did NOT send this. Do not apologise or \
+                         reply to it as if they had.]\n\
+                         Your last response was only internal reasoning - the user saw nothing. \
+                         Do not reason at length again. Either call the tool you need now, or \
+                         write your answer to the user directly: what you did, what you found, \
+                         and what you are going to do next."
+                            .to_string(),
+                    ));
+                    continue;
+                }
                 let remaining_exec_budget = exec_calls_executed < max_exec_calls;
 
                 // Universal persistence signal: a tool call FAILED and we still have budget.
@@ -4399,10 +4590,85 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                     )));
                     continue;
                 }
+                // A change that failed and was never redone. Not limited to
+                // early iterations or to the LAST step like the check above:
+                // the edit that failed on step 2 of 6 is just as unmade.
+                if supports_tools && !failed_changes.is_empty() && failed_change_nudges < 2 {
+                    failed_change_nudges += 1;
+                    let list = failed_changes
+                        .iter()
+                        .map(|f| format!("  ✗ {} {} - {}", f.tool, f.target, f.error))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    messages.push(Message::user(format!(
+                        "[Metis automatic check - the user did NOT send this. Do not apologise or \
+                         reply to it as if they had.]\n\
+                         These changes FAILED and are NOT in the files:\n{list}\n\
+                         Make them now: fix the cause (edit_file needs `path`, `old_text`, \
+                         `new_text`; re-read the file first if old_text did not match) and call \
+                         the tool again. Do not ask the user for permission to retry. If one truly \
+                         cannot be made, say so plainly and never describe it as done."
+                    )));
+                    continue;
+                }
+                // "Say 'go' and I'll start": the person asked for the change
+                // already. Asking again for each edit made them type "go"
+                // over and over. Destructive steps are put to the person by
+                // Metis itself, so the model never needs to ask first.
+                if supports_tools
+                    && permission_nudges == 0
+                    && iteration < 8
+                    && (user_requests_change(&msg.content)
+                        || user_message_requests_action(&msg.content)
+                        || is_go_ahead(&msg.content))
+                    && asks_permission_to_proceed(content_text)
+                {
+                    permission_nudges += 1;
+                    if pre_nudge_answer.is_none() && !content_text.trim().is_empty() {
+                        pre_nudge_answer = Some(content_text.to_string());
+                    }
+                    ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    messages.push(Message::user(
+                        "[Metis automatic check - the user did NOT send this. Do not apologise or \
+                         reply to it as if they had.]\n\
+                         The user already asked for this work - do not ask them to confirm it. \
+                         Make ALL the changes now, in this turn, with your tools; Metis itself \
+                         asks the user before anything that overwrites or deletes data, so you \
+                         never need to ask first. Afterwards, report what you changed, based only \
+                         on tool results. Ask a question only if a genuine choice that only the \
+                         user can make blocks you - then ask that one question."
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                // "✅ Rollback done - what just ran, with real output" from a
+                // turn in which NO tool ran. The model copied an earlier
+                // turn's output or made it up; either way it did not happen
+                // now. Send it back once.
+                if task_steps.is_empty()
+                    && no_tool_claim_nudges == 0
+                    && iteration < 6
+                    && response.content.as_deref().is_some_and(claims_work)
+                {
+                    no_tool_claim_nudges += 1;
+                    ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
+                    messages.push(Message::user(
+                        "[Metis automatic check - the user did NOT send this. Do not apologise or \
+                         reply to it as if they had.]\n\
+                         No tool has run in this turn, yet your reply describes work done, run, \
+                         read or verified now. That did not happen. Output from earlier turns is \
+                         not the current state of anything - files may have changed since. Do the \
+                         work now with your tools (read the code before you rely on it; check \
+                         the result afterwards), or say plainly that you have not done it."
+                            .to_string(),
+                    ));
+                    continue;
+                }
                 // "Task completed." after a turn that only read and listed
                 // files is the claim the person can least afford to believe.
                 // Send it back once, saying what actually ran.
-                if user_requests_change(&msg.content)
+                if (user_requests_change(&msg.content) || is_go_ahead(&msg.content))
                     && !changed_something
                     && completion_nudges == 0
                     && iteration < 6
@@ -4516,6 +4782,17 @@ Call the tool now to actually do it (or, if this was only a question, just answe
                 compact_exec,
             )
         };
+        // Still nothing readable after the retries: say so plainly, rather
+        // than delivering an empty reply (or one holding only a warning).
+        if visible_reply_text(&content).is_empty() {
+            content = if task_steps.is_empty() {
+                "(No answer: the model returned only its reasoning - nothing was run, checked or \
+                 changed in this turn. Open \"Thinking\" to see where it got to, or ask again.)"
+                    .to_string()
+            } else {
+                build_task_summary(&msg.content, &task_steps, compact_exec)
+            };
+        }
         let evidence = self.grounding_evidence(&event_session, &turn_id, &grounding_corpus);
         content = flag_ungrounded_facts(content, &evidence, &msg.content);
 
@@ -4622,6 +4899,7 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         content = enforce_truthful_status_reply(content, &exec_tool_outputs, compact_exec);
         // Internal bookkeeping must never surface in the user's reply.
         content = strip_tool_ledger_blocks(&content);
+        content = unforge_record_heading(&content);
 
         // Save conversation to session. In direct chat mode the user message
         // is stored exactly as it was sent (recall block included): the next
@@ -4719,8 +4997,12 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         // write one itself.
         if !delegated {
             if let Some(log) = &self.events {
-                if let Some(summary) = actions_summary(&log.read(&event_session), &turn_id) {
-                    outbound.content.push_str(&summary);
+                match actions_summary(&log.read(&event_session), &turn_id) {
+                    Some(summary) => outbound.content.push_str(&summary),
+                    // Nothing ran. Say so whenever the reply claims otherwise -
+                    // this is exactly the turn where a claim is least true.
+                    None if claims_work(&content) => outbound.content.push_str(&no_tools_summary()),
+                    None => {}
                 }
             }
         }
@@ -4890,6 +5172,30 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         text: &str,
     ) -> Result<String> {
         let msg = InboundMessage::new(channel, "scheduler", chat_id, text);
+        let response = self.process_message(&msg).await?;
+        Ok(response.content)
+    }
+
+    /// Like [`process_direct_session`], with image files attached. Only images
+    /// belong in `image_paths` (they are sent to the model as image parts);
+    /// other files should be referenced in `text` so the agent reads them
+    /// with its file tools.
+    pub async fn process_direct_session_with_media(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        text: &str,
+        image_paths: &[String],
+    ) -> Result<String> {
+        let mut msg = InboundMessage::new(channel, "scheduler", chat_id, text);
+        for path in image_paths {
+            msg.media.push(metis_core::types::MediaAttachment {
+                path: path.clone(),
+                mime_type: "application/octet-stream".into(),
+                filename: None,
+                size: None,
+            });
+        }
         let response = self.process_message(&msg).await?;
         Ok(response.content)
     }
@@ -6038,6 +6344,83 @@ Write-Output "hello"
         assert!(!s.contains("nothing was changed"), "{s}");
     }
 
+
+    #[test]
+    fn work_claims_from_the_transcript_are_recognised() {
+        for t in [
+            "# ✅ Rollback done — all 4 .nam files back to clean pre-append state",
+            "# 🔁 Re-verified — `blf2.nam` actually did change (proof)",
+            "What just ran, with real output:\n```\ntruncating blf2.nam ...\n```",
+            "2. Re-read the file to confirm the change actually took effect.",
+            "I reviewed the code and the key is correct.",
+            "# ❌ Verified — `blf2.nam` is corrupt",
+            "Task completed.",
+        ] {
+            assert!(claims_work(t), "{t}");
+        }
+        for t in [
+            "I have not verified it yet - shall I run the check?",
+            "Shall I read the script first, or run it?",
+            "I did not roll back the file. Should I?",
+            "Which file should I roll back?",
+            "The script reads every file under extract and hashes the first MB.",
+        ] {
+            assert!(!claims_work(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn a_short_answer_to_an_offer_is_a_go_ahead() {
+        for t in ["1", "A", "yes", "go ahead", "ok to fix", "please do it now"] {
+            assert!(is_go_ahead(t) || user_requests_change(t), "{t}");
+        }
+        assert!(user_requests_change("before append. can you please roll back blf2.nam"));
+        assert!(user_requests_change("can you do it again for blf2.nam"));
+        assert!(!is_go_ahead("how does the scanner decide which bucket a file belongs to?"));
+    }
+
+    #[test]
+    fn the_model_cannot_write_metis_record_heading() {
+        let t = "# What actually happened\n\n**1. mtime 17:40** - records were replaced";
+        let out = unforge_record_heading(t);
+        assert!(!out.to_lowercase().contains("what actually happened"), "{out}");
+        assert!(out.contains("The agent's own account"), "{out}");
+    }
+
+    #[test]
+    fn a_partly_kept_file_says_so() {
+        let body = "SIG_KEY = bytes([50,63,49])\n".repeat(40);
+        let kept = summarize_result_for_memory("read_file", &body).unwrap();
+        assert!(kept.contains("read the file again"), "{kept}");
+        let short = summarize_result_for_memory("read_file", "x = 1").unwrap();
+        assert!(!short.contains("read the file again"), "{short}");
+    }
+
+    #[tokio::test]
+    async fn rollback_done_without_any_tool_is_sent_back() {
+        // Verbatim shape of turn "1": no tool call, then "✅ Rollback done".
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                content: Some("# ✅ Rollback done — what just ran, with real output:\n  after : 6,813,796 bytes".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                // (No "Shall I run it?" here: after a go-ahead that is sent back
+                // too - see a_reply_asking_to_say_go_is_sent_back_to_do_the_work.)
+                content: Some("I have not rolled it back yet; _rollback_nams.py has not run.".into()),
+                ..Default::default()
+            },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("1").await.unwrap();
+        assert!(!reply.contains("Rollback done"), "the false claim must not reach the user: {reply}");
+        assert!(reply.contains("not rolled it back yet"), "{reply}");
+    }
+
     #[test]
     fn a_turn_without_tools_gets_no_summary() {
         assert!(actions_summary(&[], "t").is_none());
@@ -6915,6 +7298,125 @@ Write-Output "hello"
         assert!(p.starts_with("mystery_tool"), "{p}");
     }
 
+    // ── Regression: "I added the button" after the edit failed ──────────
+
+    #[test]
+    fn a_failed_edit_stays_failed_until_that_same_edit_succeeds() {
+        let mut failed = Vec::new();
+        let edit1 = r#"{"path":"C:\\g.py","old_text":"a","new_text":"import glob"}"#;
+        let edit2 = r#"{"path":"C:\\g.py","old_text":"b","new_text":".upper()"}"#;
+        track_failed_change(&mut failed, "edit_file", edit1, "Error: old_text not found", false);
+        // A different edit to the same file succeeding does not excuse edit 1.
+        track_failed_change(&mut failed, "edit_file", edit2, "Successfully edited", true);
+        assert_eq!(failed.len(), 1);
+        // Reads are irrelevant.
+        track_failed_change(&mut failed, "read_file", edit1, "x", true);
+        assert_eq!(failed.len(), 1);
+        // Redone (corrected old_text, same new text, alias param name) → cleared.
+        let redo = r#"{"file_path":"c:\\G.py","old_str":"a2","new_text":"import glob"}"#;
+        track_failed_change(&mut failed, "edit_file", redo, "Successfully edited", true);
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    fn asking_for_a_go_ahead_is_recognised() {
+        for t in [
+            "## Plan\n1. edit\n2. edit\n\n**Say \"do all 4 edits\"** and I start with edit 1.",
+            "I found the bug. Shall I proceed?",
+            "Want me to apply the fix?",
+            "Would you like me to make these changes?",
+            "Reply 'go' to continue.",
+        ] {
+            assert!(asks_permission_to_proceed(t), "{t}");
+        }
+        for t in [
+            "I changed `load_db()` to upper-case the key. The file now reads `self.db[sig.upper()] = rec`.",
+            "Edited gui.py. It's fine to say it's done now because the re-read shows the line.",
+            "Done: added the button and re-read the file to confirm.",
+        ] {
+            assert!(!asks_permission_to_proceed(t), "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_edit_is_retried_instead_of_reported_as_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.py");
+        std::fs::write(&file, "self.db[sig] = rec\n").unwrap();
+        let p = file.to_str().unwrap();
+        let bad = ToolCall::new(
+            "c1",
+            "edit_file",
+            serde_json::json!({"path": p, "old_text": "self.db[SIG] = rec", "new_text": "self.db[sig.upper()] = rec"}).to_string(),
+        );
+        let good = ToolCall::new(
+            "c2",
+            "edit_file",
+            serde_json::json!({"path": p, "old_text": "self.db[sig] = rec", "new_text": "self.db[sig.upper()] = rec"}).to_string(),
+        );
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse { tool_calls: vec![bad], ..Default::default() },
+            LlmResponse { content: Some("I added .upper() to load_db().".into()), ..Default::default() },
+            LlmResponse { tool_calls: vec![good], ..Default::default() },
+            LlmResponse { content: Some("Edited gui.py: the key is now upper-cased.".into()), ..Default::default() },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(32)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("fix the lowercase bug in gui.py").await.unwrap();
+        assert!(reply.contains("Edited gui.py"), "{reply}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "self.db[sig.upper()] = rec\n");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_is_only_reasoning_is_never_delivered_empty() {
+        // Verbatim shape: 8 KB of <think> cut off mid-sentence, no answer,
+        // and the reply that reached the person was only an "Unverified" note.
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse { content: Some("<think>The user is right. Let me list 702720 and".into()), ..Default::default() },
+            LlmResponse { content: Some("The samples folder has 6 files; my filter only looked one level deep.".into()), ..Default::default() },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("why 1000 files? there are 6").await.unwrap();
+        assert!(reply.contains("6 files"), "{reply}");
+        assert!(!reply.contains("Unverified"), "{reply}");
+        assert_eq!(visible_reply_text("<think>a</think>\n<think>cut off"), "");
+        assert_eq!(visible_reply_text("<think>a</think>Answer"), "Answer");
+    }
+
+    #[tokio::test]
+    async fn a_reply_asking_to_say_go_is_sent_back_to_do_the_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.py");
+        std::fs::write(&file, "self.db[sig] = rec\n").unwrap();
+        let p = file.to_str().unwrap();
+        let edit = ToolCall::new(
+            "c1",
+            "edit_file",
+            serde_json::json!({"file_path": p, "old_str": "self.db[sig] = rec", "new_str": "self.db[sig.upper()] = rec"}).to_string(),
+        );
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse {
+                content: Some("Plan:\n1. upper-case the key in load_db()\n\n**Say \"do it\"** and I start.".into()),
+                ..Default::default()
+            },
+            LlmResponse { tool_calls: vec![edit], ..Default::default() },
+            LlmResponse { content: Some("Edited gui.py: the key is now upper-cased.".into()), ..Default::default() },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(32)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("fix the lowercase bug in gui.py").await.unwrap();
+        assert!(!reply.contains("Say \"do it\""), "{reply}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "self.db[sig.upper()] = rec\n");
+    }
+
     #[test]
     fn a_failed_call_keeps_its_error_and_claims_no_output() {
         let step = TaskStep::from_tool_call(
@@ -6937,7 +7439,9 @@ Write-Output "hello"
         let step = TaskStep::from_tool_call("read_file", r#"{"path":"big.txt"}"#, &huge);
         let o = step.outcome.expect("should remember something");
         // read_file is re-runnable, so it gets the small budget.
-        assert!(o.chars().count() <= 251, "not capped: {} chars", o.chars().count());
+        // (Plus the fixed note saying the rest was not kept.)
+        assert!(o.chars().count() <= 251 + 100, "not capped: {} chars", o.chars().count());
+        assert!(o.contains("read the file again"), "{o}");
 
         let step = TaskStep::from_tool_call("analyze_image", r#"{"path":"a.jpg"}"#, &huge);
         let o = step.outcome.unwrap();

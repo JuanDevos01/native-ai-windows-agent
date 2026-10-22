@@ -44,6 +44,11 @@ struct ChatLine {
     thinking: Option<String>,
     /// One line per tool call / hand-off, from the event log.
     steps: Vec<String>,
+    /// Metis's own account of the turn (the "What actually happened" lines),
+    /// split off the reply so it can be shown apart from the agent's words.
+    record: Option<Vec<String>>,
+    /// What the person asked for in this turn.
+    asked: Option<String>,
 }
 
 /// Result of a background model-discovery sweep across configured providers.
@@ -68,6 +73,15 @@ pub struct MetisDesktopApp {
     active_session: String,
     chat_lines: Vec<ChatLine>,
     input: String,
+    /// Files queued for the next message (picked with "+" or dropped on the window).
+    attachments: Vec<std::path::PathBuf>,
+    /// Steps of the turn in progress, read live from the event log.
+    live_steps: Vec<String>,
+    /// The model's latest reasoning in the turn in progress.
+    live_thinking: Option<String>,
+    live_last_load: f64,
+    /// Ctrl+V edge detection for image-only clipboards (see `paste_shortcut`).
+    paste_key_down: bool,
     pending: Option<PendingReply>,
     status_line: String,
     cron_jobs: Vec<CronJob>,
@@ -113,6 +127,60 @@ pub struct MetisDesktopApp {
 }
 
 
+const MAX_ATTACHMENTS: usize = 10;
+/// Text files up to this size are pasted into the message so even a
+/// tool-less model can read them; larger ones are passed by path.
+const INLINE_TEXT_MAX_BYTES: u64 = 24 * 1024;
+
+/// Write a clipboard image to `<data>/media/paste-<time>.png`.
+fn save_clipboard_png(image: &arboard::ImageData) -> Result<std::path::PathBuf> {
+    let dir = get_data_path().join("media");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("paste-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")));
+    let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+    let mut enc = png::Encoder::new(file, image.width as u32, image.height as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&image.bytes)?;
+    Ok(path)
+}
+
+fn is_image_file(p: &std::path::Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+    )
+}
+
+/// Build the message text for a turn with attachments. Returns the text and
+/// the image paths (those travel as image parts; everything else is described
+/// in the text so the agent opens it with its file tools).
+fn compose_with_attachments(typed: &str, files: &[std::path::PathBuf]) -> (String, Vec<String>) {
+    let mut text = if typed.is_empty() && !files.is_empty() {
+        "Please look at the attached file(s).".to_string()
+    } else {
+        typed.to_string()
+    };
+    let mut images = Vec::new();
+    for p in files {
+        let path = p.display().to_string();
+        if is_image_file(p) {
+            text.push_str(&format!("\n\n[image: {path}]"));
+            images.push(path);
+            continue;
+        }
+        let small = std::fs::metadata(p).map(|m| m.len() <= INLINE_TEXT_MAX_BYTES).unwrap_or(false);
+        let inline = if small { std::fs::read_to_string(p).ok() } else { None };
+        match inline {
+            Some(body) if !body.contains('\0') => {
+                text.push_str(&format!("\n\n[file: {path}]\n```\n{body}\n```"));
+            }
+            _ => text.push_str(&format!("\n\n[file: {path}] (open it with your file tools)")),
+        }
+    }
+    (text, images)
+}
+
 /// True when `pwsh` (PowerShell 7+) is on PATH.
 fn which_pwsh() -> bool {
     let exe = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
@@ -156,6 +224,11 @@ impl MetisDesktopApp {
             active_session: active,
             chat_lines: Vec::new(),
             input: String::new(),
+            attachments: Vec::new(),
+            live_steps: Vec::new(),
+            live_thinking: None,
+            live_last_load: 0.0,
+            paste_key_down: false,
             pending: None,
             status_line: String::new(),
             cron_jobs: load_cron_jobs(),
@@ -320,8 +393,88 @@ impl MetisDesktopApp {
         );
         self.chat_lines.clear();
         self.input.clear();
+        self.attachments.clear();
         self.nav = NavPanel::Chat;
         self.status_line = "New session".into();
+    }
+
+    /// Queue files for the next message. Folders and duplicates are skipped.
+    fn add_attachments(&mut self, paths: impl IntoIterator<Item = std::path::PathBuf>) {
+        let mut skipped = 0;
+        for p in paths {
+            if !p.is_file() || self.attachments.contains(&p) || self.attachments.len() >= MAX_ATTACHMENTS {
+                skipped += 1;
+                continue;
+            }
+            self.attachments.push(p);
+        }
+        if skipped > 0 {
+            self.status_line = format!(
+                "Skipped {skipped} item(s): only new files are attached (max {MAX_ATTACHMENTS})"
+            );
+        }
+    }
+
+    /// Refresh the live view of the turn in progress from the event log.
+    fn poll_live_progress(&mut self, now: f64) {
+        let Some(pending) = &self.pending else {
+            self.live_steps.clear();
+            self.live_thinking = None;
+            return;
+        };
+        if now - self.live_last_load < 0.7 || pending.session_key != self.active_session {
+            return;
+        }
+        self.live_last_load = now;
+        let log = metis_core::events::EventLog::new(metis_core::events::EventLog::default_dir());
+        let (steps, thinking) = live_turn(&log.read(&pending.session_key));
+        self.live_steps = steps;
+        self.live_thinking = thinking;
+    }
+
+    /// True on the frame Ctrl+V goes down. egui reports Ctrl+V only when the
+    /// clipboard holds text, so with just a screenshot there it never sees
+    /// the key at all; read the key state directly instead.
+    fn paste_shortcut(&mut self, ctx: &egui::Context) -> bool {
+        let (command, focused) = ctx.input(|i| (i.modifiers.command, i.focused));
+        #[cfg(windows)]
+        let v_down = unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56) as u16 & 0x8000 != 0
+        };
+        #[cfg(not(windows))]
+        let v_down = ctx.input(|i| i.key_down(egui::Key::V));
+        let down = command && focused && v_down;
+        let pressed = down && !self.paste_key_down;
+        self.paste_key_down = down;
+        pressed
+    }
+
+    /// Save the clipboard image as a PNG under the media folder and attach
+    /// it. `explicit`: the button was used, so say so when there is no image.
+    fn paste_image_from_clipboard(&mut self, explicit: bool) {
+        let image = arboard::Clipboard::new().and_then(|mut c| c.get_image());
+        let image = match image {
+            Ok(img) => img,
+            Err(_) => {
+                if explicit {
+                    self.status_line = "The clipboard has no image to paste".into();
+                }
+                return;
+            }
+        };
+        match save_clipboard_png(&image) {
+            Ok(path) => {
+                self.add_attachments([path]);
+                self.status_line = "Screenshot attached".into();
+            }
+            Err(e) => self.status_line = format!("Could not paste the image: {e}"),
+        }
+    }
+
+    fn pick_attachments(&mut self) {
+        if let Some(files) = rfd::FileDialog::new().set_title("Attach files").pick_files() {
+            self.add_attachments(files);
+        }
     }
 
     fn select_session(&mut self, key: &str) {
@@ -340,13 +493,24 @@ impl MetisDesktopApp {
     }
 
     fn send_message(&mut self) {
-        let text = self.input.trim().to_string();
-        if text.is_empty() || self.pending.is_some() {
+        let typed = self.input.trim().to_string();
+        if (typed.is_empty() && self.attachments.is_empty()) || self.pending.is_some() {
             return;
         }
+        let files = std::mem::take(&mut self.attachments);
+        let (text, images) = compose_with_attachments(&typed, &files);
+        let shown = if files.is_empty() {
+            typed
+        } else {
+            let names: Vec<String> = files
+                .iter()
+                .map(|p| format!("📎 {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
+                .collect();
+            format!("{typed}\n{}", names.join("  ")).trim().to_string()
+        };
         self.chat_lines.push(ChatLine {
             role: "You",
-            text: text.clone(),
+            text: shown,
             ..Default::default()
         });
         self.input.clear();
@@ -360,7 +524,7 @@ impl MetisDesktopApp {
         self.runtime.spawn(async move {
             let (channel, chat_id) = split_session_key(&session_key);
             let result = agent
-                .process_direct_session(&channel, &chat_id, &text)
+                .process_direct_session_with_media(&channel, &chat_id, &text, &images)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
@@ -663,6 +827,17 @@ impl eframe::App for MetisDesktopApp {
         self.poll_email_diag(ctx);
 
         let now = ctx.input(|i| i.time);
+        self.poll_live_progress(now);
+
+        // Paste a screenshot: Ctrl+V with an image on the clipboard.
+        if self.nav == NavPanel::Chat && self.paste_shortcut(ctx) {
+            let pasted_text = ctx.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(t) if !t.trim().is_empty()))
+            });
+            if !pasted_text {
+                self.paste_image_from_clipboard(false);
+            }
+        }
         if now - self.last_refresh > 5.0 {
             self.refresh_sessions();
             self.cron_jobs = load_cron_jobs();
@@ -671,11 +846,55 @@ impl eframe::App for MetisDesktopApp {
             self.refresh_approvals();
         }
 
+        // Files dropped anywhere on the window become attachments.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if !dropped.is_empty() {
+            self.nav = NavPanel::Chat;
+            self.add_attachments(dropped);
+        }
+        let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
+
         egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
             ui.add_space(8.0);
+            if !self.attachments.is_empty() {
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(12.0);
+                    for (i, p) in self.attachments.iter().enumerate() {
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui
+                            .small_button(format!("📎 {}  ✕", truncate(&name, 28)))
+                            .on_hover_text(p.display().to_string())
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                    }
+                });
+                if let Some(i) = remove {
+                    self.attachments.remove(i);
+                }
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                let w = ui.available_width() - 270.0;
+                if ui
+                    .add_enabled(self.pending.is_none(), egui::Button::new("＋"))
+                    .on_hover_text("Attach files (or drag & drop them onto the window)")
+                    .clicked()
+                {
+                    self.pick_attachments();
+                }
+                if ui
+                    .add_enabled(self.pending.is_none(), egui::Button::new("📋"))
+                    .on_hover_text("Paste a screenshot from the clipboard (or press Ctrl+V)")
+                    .clicked()
+                {
+                    self.paste_image_from_clipboard(true);
+                }
+                let w = ui.available_width() - 300.0;
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .hint_text("Start with a goal…")
@@ -721,7 +940,8 @@ impl eframe::App for MetisDesktopApp {
 
                 let send = ui
                     .add_enabled(
-                        self.pending.is_none() && !self.input.trim().is_empty(),
+                        self.pending.is_none()
+                            && (!self.input.trim().is_empty() || !self.attachments.is_empty()),
                         egui::Button::new("Send"),
                     )
                     .clicked();
@@ -911,6 +1131,22 @@ impl eframe::App for MetisDesktopApp {
                     "Files the agent creates appear in your workspace directory.",
                 ),
             });
+
+        if hovering_files {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop files to attach",
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -958,25 +1194,80 @@ impl MetisDesktopApp {
                             ACCENT
                         };
                         ui.label(egui::RichText::new(format!("{}:", line.role)).strong().color(color));
+                        if ui
+                            .small_button("📋 Copy")
+                            .on_hover_text("Copy this message")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(line.text.clone());
+                        }
                     });
-                    ui.label(&line.text);
+                    ui.add(egui::Label::new(&line.text).selectable(true));
+                    if line.role == "Agent" && (line.asked.is_some() || line.record.is_some()) {
+                        draw_conclusion(ui, line);
+                    }
                     if !line.steps.is_empty() {
                         egui::CollapsingHeader::new(format!("🔧 Steps ({})", line.steps.len()))
                             .id_salt(("steps", i))
                             .show(ui, |ui| {
                                 for step in &line.steps {
-                                    ui.label(egui::RichText::new(step).monospace().small());
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(step).monospace().color(READABLE_TEXT),
+                                        )
+                                        .selectable(true),
+                                    );
                                 }
                             });
                     }
                     if let Some(thinking) = &line.thinking {
                         egui::CollapsingHeader::new("🧠 Thinking")
                             .id_salt(("thinking", i))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(thinking).small().weak());
-                            });
+                            .show(ui, |ui| draw_thinking(ui, thinking));
                     }
                     ui.add_space(12.0);
+                }
+                if self.pending.is_some() {
+                    self.draw_live_progress(ui);
+                }
+            });
+    }
+
+    /// While the agent works: what it was asked, each step as it happens,
+    /// and the reasoning behind the latest one.
+    fn draw_live_progress(&self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(238, 244, 252))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 210, 235)))
+            .rounding(6.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("⏳ Working…").strong().color(ACCENT));
+                if let Some(asked) = self.chat_lines.iter().rev().find(|l| l.role == "You") {
+                    ui.label(
+                        egui::RichText::new(format!("Asked: {}", first_line(&asked.text, 160)))
+                            .color(READABLE_TEXT),
+                    );
+                }
+                if self.live_steps.is_empty() {
+                    ui.label(egui::RichText::new("Thinking - no tool has run yet.").color(READABLE_TEXT));
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("Steps so far ({}):", self.live_steps.len()))
+                            .color(READABLE_TEXT),
+                    );
+                    let skip = self.live_steps.len().saturating_sub(8);
+                    for step in &self.live_steps[skip..] {
+                        ui.label(egui::RichText::new(step).monospace().color(READABLE_TEXT));
+                    }
+                }
+                if let Some(t) = &self.live_thinking {
+                    let chars: Vec<char> = t.chars().collect();
+                    let tail: String = chars[chars.len().saturating_sub(400)..].iter().collect();
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Latest reasoning:").small().color(READABLE_TEXT));
+                    draw_thinking(ui, &format!("…{}", tail.trim()));
                 }
             });
     }
@@ -1778,70 +2069,194 @@ fn message_display(msg: &Message) -> Option<(&'static str, String)> {
     }
 }
 
+/// Body text colour for secondary panels - dark enough to read, unlike
+/// egui's "weak" grey.
+const READABLE_TEXT: egui::Color32 = egui::Color32::from_rgb(40, 44, 52);
+
+/// The model's reasoning: full-size dark text on a tinted panel, selectable.
+fn draw_thinking(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(255, 250, 232))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 220, 170)))
+        .rounding(4.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).size(14.0).color(READABLE_TEXT))
+                    .selectable(true),
+            );
+        });
+}
+
+/// Under each reply: what was asked and what really happened, from Metis's
+/// record rather than the agent's own account.
+fn draw_conclusion(ui: &mut egui::Ui, line: &ChatLine) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(236, 247, 238))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 220, 188)))
+        .rounding(6.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("📌 Conclusion - checked by Metis")
+                    .strong()
+                    .color(egui::Color32::from_rgb(30, 110, 50)),
+            )
+            .on_hover_text("Built from the tools that really ran, not from the agent's reply.");
+            if let Some(asked) = &line.asked {
+                ui.label(egui::RichText::new(format!("Asked: {asked}")).color(READABLE_TEXT));
+            }
+            match &line.record {
+                Some(lines) => {
+                    for l in lines {
+                        let failed = l.contains("FAILED") || l.contains("NOT RUN") || l.contains("did NOT");
+                        let color = if failed { egui::Color32::from_rgb(180, 40, 40) } else { READABLE_TEXT };
+                        ui.label(egui::RichText::new(format!("• {l}")).color(color));
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "• No tool ran - nothing was read, run or changed. The reply is the model's own words.",
+                        )
+                        .color(READABLE_TEXT),
+                    );
+                }
+            }
+            if line.text.contains("⚠ Unverified") {
+                ui.label(
+                    egui::RichText::new("• Some numbers in the reply were not found in any tool output (see ⚠ above).")
+                        .color(egui::Color32::from_rgb(180, 40, 40)),
+                );
+            }
+        });
+}
+
+/// First non-blank line of `s`, cut to `n` characters.
+fn first_line(s: &str, n: usize) -> String {
+    let one = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    truncate(one, n)
+}
+
+/// One line for a step of a turn (tool call, its result, a hand-off), or
+/// None for events that are not steps.
+fn event_step(e: &metis_core::events::Event) -> Option<String> {
+    use metis_core::events::{EventKind, ExecStatus, ToolOutcome};
+    let who = if e.agent == "main" { String::new() } else { format!("[{}] ", e.agent) };
+    Some(match &e.event {
+        EventKind::ToolCall { tool, args, .. } => {
+            format!("{who}→ {tool} {}", first_line(&args.to_string(), 110))
+        }
+        EventKind::ToolResult { tool, outcome, .. } => {
+            let mark = match outcome {
+                ToolOutcome::Exec { status: ExecStatus::Success, exit_code, .. } => {
+                    format!("✓ exit {}", exit_code.unwrap_or(0))
+                }
+                ToolOutcome::Exec { status: ExecStatus::NotRun, .. } => "⋯ NOT RUN".into(),
+                ToolOutcome::Exec { status: ExecStatus::Timeout, .. } => "✗ timed out".into(),
+                ToolOutcome::Exec { status: ExecStatus::Failed, exit_code, .. } => {
+                    format!("✗ failed (exit {})", exit_code.map(|c| c.to_string()).unwrap_or("?".into()))
+                }
+                ToolOutcome::Ok { .. } => "✓".into(),
+                ToolOutcome::Failed { error } => format!("✗ {}", first_line(error, 90)),
+            };
+            format!("{who}← {tool} {mark}")
+        }
+        EventKind::Delegation { to_agent, task } => {
+            format!("⇢ handed to {to_agent}: {}", first_line(task, 100))
+        }
+        EventKind::DelegationResult { from_agent, text } => {
+            format!("⇠ {from_agent} answered: {}", first_line(text, 100))
+        }
+        _ => return None,
+    })
+}
+
+/// Split Metis's own record ("What actually happened (recorded by Metis…)")
+/// off a delivered reply: (the agent's words, the record's lines).
+fn split_record(text: &str) -> (String, Option<Vec<String>>) {
+    const HEAD: &str = "What actually happened (recorded by Metis";
+    let Some(at) = text.find(HEAD) else {
+        return (text.to_string(), None);
+    };
+    let body = text[..at].trim_end().trim_end_matches('─').trim_end().to_string();
+    let lines = text[at..]
+        .lines()
+        .skip(1)
+        .map(|l| l.trim().trim_start_matches('•').trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    (body, Some(lines))
+}
+
 /// Build the chat view from a session's event log: the person's messages,
 /// each reply as it was delivered, and - collapsed under it - the model's
 /// reasoning and the steps the turn really took.
 fn chat_from_events(events: &[metis_core::events::Event]) -> Vec<ChatLine> {
-    use metis_core::events::{EventKind, ExecStatus, ToolOutcome};
+    use metis_core::events::EventKind;
     let mut lines: Vec<ChatLine> = Vec::new();
     let mut thinking: Vec<String> = Vec::new();
     let mut steps: Vec<String> = Vec::new();
+    let mut asked: Option<String> = None;
     let mut current_turn = String::new();
-    let short = |s: &str, n: usize| {
-        let one = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        if one.chars().count() > n {
-            format!("{}…", one.chars().take(n).collect::<String>())
-        } else {
-            one.to_string()
-        }
-    };
     for e in events {
         if e.turn != current_turn {
             thinking.clear();
             steps.clear();
             current_turn = e.turn.clone();
         }
+        if let Some(step) = event_step(e) {
+            steps.push(step);
+            continue;
+        }
         let who = if e.agent == "main" { String::new() } else { format!("[{}] ", e.agent) };
         match &e.event {
-            EventKind::UserMessage { text } => lines.push(ChatLine {
-                role: "You",
-                text: text.clone(),
-                ..Default::default()
-            }),
+            EventKind::UserMessage { text } => {
+                asked = Some(first_line(text, 160));
+                lines.push(ChatLine {
+                    role: "You",
+                    text: text.clone(),
+                    ..Default::default()
+                })
+            }
             EventKind::Thinking { text } => thinking.push(format!("{who}{}", text.trim())),
-            EventKind::ToolCall { tool, args, .. } => {
-                steps.push(format!("{who}→ {tool} {}", short(&args.to_string(), 110)))
+            EventKind::AgentReply { text } => {
+                let (body, record) = split_record(text);
+                lines.push(ChatLine {
+                    role: "Agent",
+                    text: body,
+                    thinking: (!thinking.is_empty()).then(|| thinking.join("
+
+")),
+                    steps: std::mem::take(&mut steps),
+                    record,
+                    asked: asked.take(),
+                })
             }
-            EventKind::ToolResult { tool, outcome, .. } => {
-                let mark = match outcome {
-                    ToolOutcome::Exec { status: ExecStatus::Success, exit_code, .. } => {
-                        format!("✓ exit {}", exit_code.unwrap_or(0))
-                    }
-                    ToolOutcome::Exec { status: ExecStatus::NotRun, .. } => "⋯ NOT RUN".into(),
-                    ToolOutcome::Exec { status: ExecStatus::Timeout, .. } => "✗ timed out".into(),
-                    ToolOutcome::Exec { status: ExecStatus::Failed, exit_code, .. } => {
-                        format!("✗ failed (exit {})", exit_code.map(|c| c.to_string()).unwrap_or("?".into()))
-                    }
-                    ToolOutcome::Ok { .. } => "✓".into(),
-                    ToolOutcome::Failed { error } => format!("✗ {}", short(error, 90)),
-                };
-                steps.push(format!("{who}← {tool} {mark}"));
-            }
-            EventKind::Delegation { to_agent, task } => {
-                steps.push(format!("⇢ handed to {to_agent}: {}", short(task, 100)))
-            }
-            EventKind::DelegationResult { from_agent, text } => {
-                steps.push(format!("⇠ {from_agent} answered: {}", short(text, 100)))
-            }
-            EventKind::AgentReply { text } => lines.push(ChatLine {
-                role: "Agent",
-                text: text.clone(),
-                thinking: (!thinking.is_empty()).then(|| thinking.join("\n\n")),
-                steps: std::mem::take(&mut steps),
-            }),
+            _ => {}
         }
     }
     lines
+}
+
+/// The turn still in progress: its steps and the latest reasoning, i.e.
+/// everything after the last message the person sent.
+fn live_turn(events: &[metis_core::events::Event]) -> (Vec<String>, Option<String>) {
+    use metis_core::events::EventKind;
+    let start = events
+        .iter()
+        .rposition(|e| matches!(e.event, EventKind::UserMessage { .. }))
+        .map(|i| i + 1)
+        .unwrap_or(events.len());
+    let tail = &events[start..];
+    let steps = tail.iter().filter_map(event_step).collect();
+    let thinking = tail.iter().rev().find_map(|e| match &e.event {
+        EventKind::Thinking { text } => Some(text.trim().to_string()),
+        _ => None,
+    });
+    (steps, thinking)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1981,6 +2396,70 @@ fn desktop_error(e: eframe::Error, tried_fallback: bool) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(turn: &str, event: metis_core::events::EventKind) -> metis_core::events::Event {
+        metis_core::events::Event {
+            ts: chrono::Utc::now(),
+            session: "desktop:t".into(),
+            turn: turn.into(),
+            agent: "main".into(),
+            event,
+        }
+    }
+
+    #[test]
+    fn the_metis_record_is_split_from_the_reply_into_the_conclusion() {
+        use metis_core::events::{EventKind, ToolOutcome};
+        let reply = "Edited gui.py.\n\n──────────\nWhat actually happened (recorded by Metis, not written by the agent):\n\
+                     • main: read 1 file · edited gui.py\n• main: FAILED, file NOT changed: edit_file x.py: boom";
+        let events = vec![
+            ev("t1", EventKind::UserMessage { text: "fix the lowercase bug".into() }),
+            ev("t1", EventKind::Thinking { text: "look at load_db".into() }),
+            ev("t1", EventKind::ToolResult { call_id: "c".into(), tool: "read_file".into(), outcome: ToolOutcome::Ok { output: "x".into(), truncated: false } }),
+            ev("t1", EventKind::AgentReply { text: reply.into() }),
+        ];
+        let lines = chat_from_events(&events);
+        let agent = &lines[1];
+        assert_eq!(agent.text, "Edited gui.py.");
+        assert_eq!(agent.asked.as_deref(), Some("fix the lowercase bug"));
+        let record = agent.record.as_ref().unwrap();
+        assert_eq!(record[0], "main: read 1 file · edited gui.py");
+        assert!(record[1].contains("FAILED"));
+        assert_eq!(agent.steps, vec!["← read_file ✓".to_string()]);
+    }
+
+    #[test]
+    fn live_progress_shows_only_the_turn_in_progress() {
+        use metis_core::events::{EventKind, ToolOutcome};
+        let events = vec![
+            ev("t1", EventKind::UserMessage { text: "old".into() }),
+            ev("t1", EventKind::ToolResult { call_id: "a".into(), tool: "list_dir".into(), outcome: ToolOutcome::Ok { output: String::new(), truncated: false } }),
+            ev("t1", EventKind::AgentReply { text: "done".into() }),
+            ev("t2", EventKind::UserMessage { text: "new".into() }),
+            ev("t2", EventKind::Thinking { text: "first".into() }),
+            ev("t2", EventKind::ToolResult { call_id: "b".into(), tool: "read_file".into(), outcome: ToolOutcome::Failed { error: "no such file".into() } }),
+            ev("t2", EventKind::Thinking { text: "second".into() }),
+        ];
+        let (steps, thinking) = live_turn(&events);
+        assert_eq!(steps, vec!["← read_file ✗ no such file".to_string()]);
+        assert_eq!(thinking.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn attachments_split_into_images_and_inlined_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let txt = dir.path().join("notes.txt");
+        let img = dir.path().join("shot.PNG");
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&txt, "hello world").unwrap();
+        std::fs::write(&img, [1u8, 2, 3]).unwrap();
+        std::fs::write(&bin, [0u8, 159, 146]).unwrap();
+        let (text, images) = compose_with_attachments("", &[txt, img.clone(), bin]);
+        assert!(text.starts_with("Please look at the attached"));
+        assert!(text.contains("hello world"));
+        assert_eq!(images, vec![img.display().to_string()]);
+        assert!(text.contains("open it with your file tools"));
+    }
 
     #[test]
     fn setup_script_is_locatable_from_the_binary() {
