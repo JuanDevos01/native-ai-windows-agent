@@ -1529,7 +1529,11 @@ fn enforce_truthful_status_reply(
 ) -> String {
     let hard_fail = exec_turn_should_show_hard_failure(exec_outputs);
     let llm_err = content.contains("Error calling LLM:");
-    if !hard_fail && !llm_err && !content_claims_false_ok(&content) {
+    // A cheerful phrase is only a false claim when something actually failed.
+    // Checking it on its own replaced a correct, verified answer with "Not OK"
+    // because the text said something like "all good" - every command in that
+    // turn had succeeded, and the real answer was lost.
+    if !hard_fail && !llm_err {
         return content;
     }
 
@@ -1552,7 +1556,7 @@ fn enforce_truthful_status_reply(
     let mut parts = vec![headline.to_string()];
     if llm_err {
         parts.push(content.clone());
-    } else if content_claims_false_ok(&content) {
+    } else if hard_fail && content_claims_false_ok(&content) {
         parts.push("Earlier text incorrectly suggested success; see tool results below.".to_string());
     } else {
         let trimmed = strip_optimistic_running_claims(&content);
@@ -2404,6 +2408,8 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
         failed_tools: usize,
         /// "edit_file gui.py: Missing required parameter: path"
         failed_changes: Vec<String>,
+        /// Rejected writes that a later call in the same turn made good.
+        resent_changes: usize,
         sent: usize,
         handed: Vec<String>,
         other: usize,
@@ -2426,7 +2432,16 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
     }
     let mut by_agent: BTreeMap<String, Tally> = BTreeMap::new();
     let mut any = false;
-    for e in &turn_events {
+    let path_of = |args: Option<&serde_json::Value>| {
+        args.and_then(|a| {
+            ["path", "file_path", "filepath", "file", "filename"]
+                .iter()
+                .find_map(|k| a.get(*k))
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+        })
+    };
+    for (i, e) in turn_events.iter().enumerate() {
         match &e.event {
             EventKind::ToolResult { call_id, tool, outcome } => {
                 any = true;
@@ -2439,11 +2454,30 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
                         ExecStatus::NotRun => t.cmd_not_run += 1,
                         _ => t.cmd_failed += 1,
                     },
-                    ("write_file" | "edit_file", ToolOutcome::Failed { error }) => t.failed_changes.push(format!(
-                        "{tool} {}: {}",
-                        args.map(name_of).unwrap_or_default(),
-                        truncate_chars(error.lines().next().unwrap_or("failed").trim(), 120)
-                    )),
+                    ("write_file" | "edit_file", ToolOutcome::Failed { error }) => {
+                        // A call the agent got wrong and then resent is not a
+                        // failed change. Reporting it as one made a finished
+                        // job look as if it had failed. A rejected call with
+                        // no path can only be matched by tool.
+                        let path = path_of(args);
+                        let resent = turn_events[i + 1..].iter().any(|later| match &later.event {
+                            EventKind::ToolResult { call_id: c2, tool: t2, outcome: o2 } => {
+                                t2 == tool
+                                    && o2.succeeded()
+                                    && (path.is_none() || path_of(calls.get(c2.as_str()).copied()) == path)
+                            }
+                            _ => false,
+                        });
+                        if resent {
+                            t.resent_changes += 1;
+                        } else {
+                            t.failed_changes.push(format!(
+                                "{tool} {}: {}",
+                                args.map(name_of).unwrap_or_default(),
+                                truncate_chars(error.lines().next().unwrap_or("failed").trim(), 120)
+                            ));
+                        }
+                    }
                     (_, _) if !ok => t.failed_tools += 1,
                     ("read_file" | "read_pdf", _) => t.reads += 1,
                     ("list_dir", _) => t.lists += 1,
@@ -2493,6 +2527,9 @@ fn actions_summary(events: &[metis_core::events::Event], turn: &str) -> Option<S
         if t.failed_tools > 0 { parts.push(format!("{} FAILED", plural(t.failed_tools, "other step", "other steps"))); }
         for f in &t.failed_changes {
             parts.push(format!("FAILED, file NOT changed: {f}"));
+        }
+        if t.resent_changes > 0 {
+            parts.push(format!("{} and resent correctly", plural(t.resent_changes, "bad call rejected", "bad calls rejected")));
         }
         if t.other > 0 { parts.push(format!("used {}", plural(t.other, "other tool", "other tools"))); }
         if !parts.is_empty() {
@@ -6419,6 +6456,51 @@ Write-Output "hello"
         let reply = agent.process_direct("1").await.unwrap();
         assert!(!reply.contains("Rollback done"), "the false claim must not reach the user: {reply}");
         assert!(reply.contains("not rolled it back yet"), "{reply}");
+    }
+
+    #[test]
+    fn a_cheerful_reply_is_left_alone_when_nothing_failed() {
+        // Every command succeeded and the answer was correct; "all good" in
+        // it used to replace the whole reply with "Not OK".
+        let ok = "<<<EXEC_RESULT>>>\nEXIT_CODE: 0\nSTATUS: SUCCESS\n<<<END_EXEC_RESULT>>>".to_string();
+        let reply = "It did append: 3,892 records are on disk, so all good.".to_string();
+        let out = enforce_truthful_status_reply(reply.clone(), &[ok], true);
+        assert_eq!(out, reply);
+        // No command at all: nothing failed either.
+        let out = enforce_truthful_status_reply(reply.clone(), &[], true);
+        assert_eq!(out, reply);
+    }
+
+    #[test]
+    fn a_rejected_write_that_was_resent_is_not_a_failed_change() {
+        use metis_core::events::{Event, EventKind, ToolOutcome};
+        let ev = |k| Event::new("s", "t", "main", k);
+        let call = |id: &str, args: serde_json::Value| ev(EventKind::ToolCall {
+            call_id: id.into(), tool: "write_file".into(), args });
+        let bad = |id: &str| ev(EventKind::ToolResult { call_id: id.into(), tool: "write_file".into(),
+            outcome: ToolOutcome::Failed { error: "Missing required parameter: path".into() } });
+        let good = |id: &str| ev(EventKind::ToolResult { call_id: id.into(), tool: "write_file".into(),
+            outcome: ToolOutcome::Ok { output: "ok".into(), truncated: false } });
+
+        let evs = vec![
+            call("1", serde_json::json!({"content": "x"})), bad("1"),
+            call("2", serde_json::json!({"path": "C:\\w\\_reapply.py", "content": "x"})), good("2"),
+        ];
+        let s = actions_summary(&evs, "t").unwrap();
+        assert!(!s.contains("FAILED"), "{s}");
+        assert!(s.contains("wrote _reapply.py"), "{s}");
+        assert!(s.contains("1 bad call rejected and resent correctly"), "{s}");
+
+        // Never resent: still a failure.
+        let evs = vec![call("1", serde_json::json!({"content": "x"})), bad("1")];
+        assert!(actions_summary(&evs, "t").unwrap().contains("FAILED, file NOT changed"));
+
+        // A different file succeeding does not excuse this one.
+        let evs = vec![
+            call("1", serde_json::json!({"path": "C:\\w\\a.py"})), bad("1"),
+            call("2", serde_json::json!({"path": "C:\\w\\b.py"})), good("2"),
+        ];
+        assert!(actions_summary(&evs, "t").unwrap().contains("FAILED, file NOT changed: write_file a.py"));
     }
 
     #[test]

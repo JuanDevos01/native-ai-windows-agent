@@ -74,7 +74,12 @@ fn lookup_str<'a>(params: &'a HashMap<String, Value>, key: &str) -> Option<&'a s
 /// Extract a required `String` param, returning a user-friendly error.
 pub fn require_string(params: &HashMap<String, Value>, key: &str) -> anyhow::Result<String> {
     lookup_str(params, key).map(|s| s.to_string()).ok_or_else(|| {
-        let mut given: Vec<&str> = params.keys().map(String::as_str).collect();
+        // `__event_session` and the like are added by Metis, not by the model.
+        let mut given: Vec<&str> = params
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !k.starts_with("__"))
+            .collect();
         given.sort_unstable();
         anyhow::anyhow!(
             "Missing required parameter: {key} (you sent: {}). Nothing was done - call the tool \
@@ -139,6 +144,10 @@ mod tests {
         assert_eq!(require_string(&p, "path").unwrap(), "C:\\b.py");
         let err = require_string(&p, "new_text").unwrap_err().to_string();
         assert!(err.contains("you sent: file_path, old_str, path"), "{err}");
+        // What Metis injects is not something the model sent.
+        p.insert("__event_session".to_string(), json!("desktop:1"));
+        let err = require_string(&p, "new_text").unwrap_err().to_string();
+        assert!(!err.contains("__event_session"), "{err}");
     }
 
     #[test]
