@@ -513,6 +513,9 @@ pub fn strip_reasoning_tags(text: &str) -> String {
 
 /// What the person would actually see of a reply: reasoning removed,
 /// including a `<think>` block that was cut off and never closed.
+/// Output limit for the rest of a turn after the model was cut off mid-reasoning.
+const REASONING_CUTOFF_MAX_TOKENS: u32 = 32_768;
+
 fn visible_reply_text(text: &str) -> String {
     let closed = strip_reasoning_tags(text);
     static OPEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -4125,11 +4128,13 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
         // Direct chat gets its own request config: a response cap suited to
         // chat (not agent work), plus Ollama runtime options so the model is
         // loaded with a context window the conversation actually fits in.
-        let request_config = if supports_tools {
+        let mut request_config = if supports_tools {
             self.request_config.clone()
         } else {
             self.direct_chat_request_config()
         };
+        // Raised once if the model is cut off while still reasoning.
+        let configured_max_tokens = request_config.max_tokens;
 
         let user_text = msg.content.clone();
         let mut messages = if supports_tools {
@@ -4280,6 +4285,11 @@ Write-Host "CONFIG_UPDATED=$cfgPath"
             }
 
             if response.has_tool_calls() {
+                // Progress was made: a later reasoning-only response deserves
+                // its own retries. Counting them per turn left none for the
+                // end of a long task, where the answer is written - and the
+                // person got raw command output instead of a reply.
+                empty_reply_retries = 0;
                 // Add assistant message with tool calls (sanitize invalid JSON for next API round-trip)
                 let tool_calls = sanitize_tool_calls_for_history(response.tool_calls.clone());
                 // Publish any narration text the model sent alongside the tool calls.
@@ -4472,6 +4482,21 @@ Run the next command in a follow-up message, or combine steps into one script."
                 // on, that was an empty reply carrying only a warning.
                 if visible_reply_text(content_text).is_empty() && empty_reply_retries < 2 {
                     empty_reply_retries += 1;
+                    // Cut off at the output limit while still reasoning (seen
+                    // mid-word, at exactly 8192 tokens): asking again with the
+                    // same limit just repeats it. Give the rest of the turn
+                    // twice the room - once, and never past 32k.
+                    if supports_tools
+                        && response.finish_reason.as_deref() == Some("length")
+                        && request_config.max_tokens == configured_max_tokens
+                    {
+                        request_config.max_tokens =
+                            configured_max_tokens.saturating_mul(2).min(REASONING_CUTOFF_MAX_TOKENS);
+                        info!(
+                            max_tokens = request_config.max_tokens,
+                            "response was cut off while reasoning; raising the output limit"
+                        );
+                    }
                     if !content_text.trim().is_empty() {
                         ContextBuilder::add_assistant_message(&mut messages, response.content.clone(), vec![]);
                     }
@@ -4801,6 +4826,14 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         // This is question-anchored (Task → Steps → Outcome) so the reply stays on-topic instead
         // of dumping hardcoded server status.
         let compact_exec = is_chat_app_channel(&msg.channel);
+        // A "final" response that is only reasoning is no answer. Treat it as
+        // none, so the person gets the account of what ran, not a dump of
+        // raw command output presented as the reply.
+        let ended_mid_reasoning =
+            final_content.as_deref().is_some_and(|c| visible_reply_text(c).is_empty());
+        if ended_mid_reasoning {
+            final_content = None;
+        }
         let used_autonomous_summary = final_content.is_none() && !task_steps.is_empty();
         let fallback = if used_autonomous_summary {
             build_task_summary(&msg.content, &task_steps, compact_exec)
@@ -4811,7 +4844,14 @@ Call the tool now to actually do it (or, if this was only a question, just answe
         };
         // Skip the reconcile banner when we already built a structured summary.
         let mut content = if used_autonomous_summary {
-            fallback
+            if ended_mid_reasoning {
+                format!(
+                    "⚠ The model stopped while still thinking and wrote no answer. This is what \
+                     actually ran - open \"Thinking\" to see where it got to, or say \"continue\".\n\n{fallback}"
+                )
+            } else {
+                fallback
+            }
         } else {
             reconcile_exec_with_reply(
                 final_content.unwrap_or(fallback),
@@ -7469,6 +7509,52 @@ Write-Output "hello"
         assert!(!reply.contains("Unverified"), "{reply}");
         assert_eq!(visible_reply_text("<think>a</think>\n<think>cut off"), "");
         assert_eq!(visible_reply_text("<think>a</think>Answer"), "Answer");
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_after_tool_work_still_gets_retried_and_answered() {
+        // The failing turn: two reasoning-only responses early, tool work,
+        // then a third at the end. The retries were spent, and the person
+        // got raw command output instead of an answer.
+        let dir = tempfile::tempdir().unwrap();
+        let think = || LlmResponse {
+            content: Some("<think>Let me look at the vc=0 records and try t".into()),
+            finish_reason: Some("length".into()),
+            ..Default::default()
+        };
+        let list = ToolCall::new("c1", "list_dir",
+            serde_json::json!({"path": dir.path().to_str().unwrap()}).to_string());
+        let provider = Arc::new(MockProvider::new(vec![
+            think(), think(),
+            LlmResponse { tool_calls: vec![list], ..Default::default() },
+            think(),
+            LlmResponse { content: Some("The .jpg records came from the attachments/ build.".into()), ..Default::default() },
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("how can a jpg be malware?").await.unwrap();
+        assert!(reply.contains("attachments/ build"), "{reply}");
+        assert!(!reply.contains("<<<EXEC_RESULT>>>"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_mid_reasoning_reports_what_ran_not_raw_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let think = || LlmResponse { content: Some("<think>still thinking about".into()), ..Default::default() };
+        let list = ToolCall::new("c1", "list_dir",
+            serde_json::json!({"path": dir.path().to_str().unwrap()}).to_string());
+        let provider = Arc::new(MockProvider::new(vec![
+            LlmResponse { tool_calls: vec![list], ..Default::default() },
+            think(), think(), think(),
+        ]));
+        let agent = AgentLoop::new(
+            Arc::new(MessageBus::new(8)), provider, dir.path().to_path_buf(),
+            None, None, None, Some(10), None, None, None, false, None, None, None,
+        );
+        let reply = agent.process_direct("check the folder").await.unwrap();
+        assert!(reply.contains("stopped while still thinking"), "{reply}");
     }
 
     #[tokio::test]

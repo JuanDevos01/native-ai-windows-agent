@@ -130,7 +130,7 @@ pub struct MetisDesktopApp {
 const MAX_ATTACHMENTS: usize = 10;
 /// Text files up to this size are pasted into the message so even a
 /// tool-less model can read them; larger ones are passed by path.
-const INLINE_TEXT_MAX_BYTES: u64 = 24 * 1024;
+const INLINE_TEXT_MAX_BYTES: u64 = 64 * 1024;
 
 /// Write a clipboard image to `<data>/media/paste-<time>.png`.
 fn save_clipboard_png(image: &arboard::ImageData) -> Result<std::path::PathBuf> {
@@ -152,6 +152,25 @@ fn is_image_file(p: &std::path::Path) -> bool {
     )
 }
 
+/// The start of a text file, cut at a line break - or None for binary data.
+fn read_text_prefix(p: &std::path::Path, max: usize) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(p).ok()?.take(max as u64).read_to_end(&mut buf).ok()?;
+    if buf.contains(&0) {
+        return None;
+    }
+    let full = buf.len() < max;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if full {
+        return Some(text);
+    }
+    Some(match text.rfind('\n') {
+        Some(i) => text[..=i].to_string(),
+        None => text,
+    })
+}
+
 /// Build the message text for a turn with attachments. Returns the text and
 /// the image paths (those travel as image parts; everything else is described
 /// in the text so the agent opens it with its file tools).
@@ -169,13 +188,21 @@ fn compose_with_attachments(typed: &str, files: &[std::path::PathBuf]) -> (Strin
             images.push(path);
             continue;
         }
-        let small = std::fs::metadata(p).map(|m| m.len() <= INLINE_TEXT_MAX_BYTES).unwrap_or(false);
-        let inline = if small { std::fs::read_to_string(p).ok() } else { None };
-        match inline {
-            Some(body) if !body.contains('\0') => {
+        // Text goes into the message itself - the agent cannot "not read" it.
+        // A large file is shown up to the limit, and the agent is told where
+        // the rest is, rather than getting only a path to open.
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX);
+        let body = if size == u64::MAX { None } else { read_text_prefix(p, INLINE_TEXT_MAX_BYTES as usize) };
+        match body {
+            Some(body) if size <= INLINE_TEXT_MAX_BYTES => {
                 text.push_str(&format!("\n\n[file: {path}]\n```\n{body}\n```"));
             }
-            _ => text.push_str(&format!("\n\n[file: {path}] (open it with your file tools)")),
+            Some(body) => text.push_str(&format!(
+                "\n\n[file: {path}] - {size} bytes; the first {} are below. Read the rest with \
+                 read_file before relying on anything past this point.\n```\n{body}\n```",
+                body.len()
+            )),
+            None => text.push_str(&format!("\n\n[file: {path}] (open it with your file tools)")),
         }
     }
     (text, images)
@@ -2459,6 +2486,24 @@ mod tests {
         assert!(text.contains("hello world"));
         assert_eq!(images, vec![img.display().to_string()]);
         assert!(text.contains("open it with your file tools"));
+    }
+
+    #[test]
+    fn a_large_text_attachment_is_shown_not_just_named() {
+        // A 30 KB scan-results CSV used to arrive as a bare path.
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("scan.csv");
+        let mut body = String::from("file,md5,in_db\n");
+        for i in 0..4000 {
+            body.push_str(&format!("{i:040}.jpg,5168845E7BA0C65FDFBEC80628161080,YES\n"));
+        }
+        std::fs::write(&csv, &body).unwrap();
+        let (text, _) = compose_with_attachments("see attached", &[csv]);
+        assert!(text.contains("file,md5,in_db"), "header must be inline");
+        assert!(text.contains("Read the rest with read_file"), "must say it is partial");
+        assert!(text.len() < 70 * 1024, "bounded: {}", text.len());
+        // Cut at a line break, never mid-row.
+        assert!(text.ends_with(",YES\n\n```"), "{}", &text[text.len().saturating_sub(60)..]);
     }
 
     #[test]
